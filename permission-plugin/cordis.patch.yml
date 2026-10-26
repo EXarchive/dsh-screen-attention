@@ -1,0 +1,4 @@
+# dsh-screen-attention-perm bundle patch：挂载插件自身
+- insert:
+    - id: sa-perm
+      name: 'dsh-screen-attention-perm'

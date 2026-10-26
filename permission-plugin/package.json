@@ -1,0 +1,39 @@
+{
+  "name": "dsh-screen-attention-perm",
+  "version": "1.0.0",
+  "description": "DSH 屏幕注意力插件 · 权限模块：会话级输入授权（L2）、高危逐次审批（L3）、急停锁、恢复需用户确认。全部走 DSH 原生 tools/pre-execute ask 审批链并自动审计。",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "permission",
+    "approval",
+    "input-injection",
+    "emergency-stop"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.5"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh": ">=0.1.0-rc.6"
+  }
+}

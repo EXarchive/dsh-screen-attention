@@ -1,0 +1,24 @@
+# Build artifacts
+helper/bin/
+helper/obj/
+node_modules/
+*.tmp
+*.old
+*.bak*
+
+# Runtime logs and dynamic view captures (keep pinned test fixtures)
+out/logs/
+out/sa-view/*
+!out/sa-view/glance-1792733333431-3.jpg
+!out/sa-view/glance-1792734281648-5.jpg
+!out/sa-view/glance-1792733014102-2.jpg
+!out/sa-view/task-1788460279425-1.jpg
+!out/sa-view/glance-1792676987464-0.jpg
+!out/sa-view/task-1787945408781-0.jpg
+
+# Large model weights (>50MB, exceed GitHub 100MB single-file limit; see README.md)
+helper/models/chinese-clip/image_encoder.onnx
+helper/models/chinese-clip-large/image_encoder.onnx
+helper/models/yolov8m.onnx
+*.pt
+*.bin
