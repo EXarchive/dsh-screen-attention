@@ -336,6 +336,7 @@ export function apply(ctx) {
     interpretInject: null,     // 连续解读 → 会话注入配置（inject/minInjectMs/kinds + 轮询游标）
     inferInject: null,         // 逐帧识别 → 会话注入配置（inject/injectChanges/minInjectMs + seq 游标）
     obsMode: null,             // 当前长时观察模式：'infer' | 'interpret' | null（互斥，防并发降级）
+    approvalPolicy: null,      // 最近一次门控观测到的全局审批策略（'ask' | 'never'），仅用于诊断展示
     obsConfig: null,           // 看门狗恢复配置：{ mode, cmd, args }
     watchConfig: null,         // 看门狗 watch 恢复配置：{ active, intervalMs, focus }
   }
@@ -681,6 +682,24 @@ export function apply(ctx) {
     releaseHelper()
   })
 
+  // ---- 读取 DSH 全局审批策略 ----
+  // 'never' 表示用户已在全局预设中选择「不审批 / 全权（danger-full-access 等）」。
+  // 此时 DSH 会把任何 { kind: 'ask' } 直接判定为 rejected（见 dsh-user-approval decide()），
+  // 若插件仍然 ask，鼠标/键盘注入就会永久不可用 —— 必须识别该策略并直接放行。
+  function approvalPolicyOf(agent) {
+    try {
+      const approval = ctx.get ? ctx.get('approval') : undefined
+      if (!approval) return 'ask'
+      const session = agent && agent.session
+      if (session && typeof approval.effectivePolicy === 'function') {
+        const p = approval.effectivePolicy(session)
+        if (p) return String(p)
+      }
+      if (approval.config && approval.config.policy) return String(approval.config.policy)
+    } catch {}
+    return 'ask'
+  }
+
   // ---- 统一门：pre-execute waterfall（急停锁 + L2/L3/resume 审批） ----
   ctx.on('tools/pre-execute', (exec, next) => {
     if (exec.agent === undefined) return next()
@@ -689,8 +708,19 @@ export function apply(ctx) {
     if (exec.name === 'saperm_observe_task') {
       state.taskAgentId = agentId
     }
+    // 急停锁最高优先级：任何策略下都拦截注入
     if (state.paused && INPUT_TOOLS.includes(exec.name)) {
       return { kind: 'deny', reason: `急停已激活（${state.pausedBy || 'unknown'}），注入已锁定；用 saperm_resume 恢复（需用户确认）` }
+    }
+    // 全局 never（全权）模式：不再 ask（ask 必被自动拒绝），直接放行并留审计
+    const policy = approvalPolicyOf(exec.agent)
+    state.approvalPolicy = policy
+    if (policy === 'never') {
+      if (INPUT_TOOLS.includes(exec.name)) state.l2.set(agentId, 'granted')
+      if (INPUT_TOOLS.includes(exec.name) || exec.name === 'saperm_resume') {
+        try { appendObservationLog({ type: 'auto_grant', tool: exec.name, policy }) } catch {}
+      }
+      return next()
     }
     if (exec.name === 'saperm_resume') {
       return { kind: 'ask', reason: '恢复输入注入需要用户明确确认（AI 不能自行解除急停）' }
@@ -701,7 +731,8 @@ export function apply(ctx) {
     if (L2_TOOLS.includes(exec.name)) {
       const g = state.l2.get(agentId)
       if (g === 'granted') return next()
-      if (g === 'denied') return { kind: 'deny', reason: '用户已拒绝本会话的普通输入授权' }
+      // 曾经的 'denied' 不再永久封锁：拒绝可能来自应答者不可用（unavailable）或策略切换，
+      // 允许下一次重新发起审批，避免会话被永久卡成「不能用鼠标」。
       state.pending.set(agentId, true)
       return { kind: 'ask', reason: '首次普通鼠标输入：批准本次执行并授权本会话内后续普通点击/滚轮/文本输入（拖拽、连击等高危动作仍逐次审批）' }
     }
@@ -724,9 +755,11 @@ export function apply(ctx) {
         state.l2.set(agentId, 'granted')
         console.log('[sa-perm] L2 会话级授权已授予 agent=' + agentId)
       } else if (isApprovalRejection(result)) {
+        // 仅做可观测标记，不再永久封锁（下一次调用会重新审批）
         state.l2.set(agentId, 'denied')
-        console.log('[sa-perm] 审批被拒，L2 fail-closed agent=' + agentId)
+        console.log('[sa-perm] 审批被拒（下次调用会重新发起审批）agent=' + agentId)
       } else {
+        state.l2.delete(agentId)
         console.log('[sa-perm] L2 执行期错误（保持未决，可重试）agent=' + agentId + ': ' + String((result && (result.error || result.message)) || '').slice(0, 120))
       }
     }
@@ -764,6 +797,7 @@ export function apply(ctx) {
       return {
         paused: state.paused,
         pausedBy: state.pausedBy,
+        approvalPolicy: state.approvalPolicy || null,
         l2ByAgent: l2,
         interruptProtect: state.interruptProtect,
         observeTask: state.observeTask ? { startedAt: state.observeTask.startedAt, seconds: state.observeTask.seconds, elapsedMs: Date.now() - state.observeTask.startedAt } : null,

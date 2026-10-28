@@ -6,6 +6,11 @@ node_modules/
 *.old
 *.bak*
 
+# Runtime artifacts at out/ root (test screenshots/dumps)
+out/*.jpg
+out/*.json
+out/full-suite-screenshot.jpg
+
 # Runtime logs and dynamic view captures (keep pinned test fixtures)
 out/logs/
 out/sa-view/*

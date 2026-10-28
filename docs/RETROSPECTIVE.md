@@ -117,3 +117,18 @@
 12. **经验 12（高分屏 Per-Monitor DPI V2 物理分辨率对齐）**：2560x1600 (150% 缩放) 下须开启 `SetProcessDpiAwarenessContext(-4)` 并结合 `GetDeviceCaps(118/117)` 获取真实物理分辨率，避免 `BitBlt` 仅截取左上角 1707x1067。
 13. **经验 13（DirectML 全局串行化与 Lossless JSON 防护）**：所有 ONNX 会话创建与 `Run` 统一加 `lock (Providers.Gate)` 杜绝 D3D12 并发崩溃；插件注册层统一做 Lossless JSON 清洗，RPC 协议确保 `id/cmd` 不被业务参数覆盖。
 14. **经验 14（对标 DSH 原生工具的用完即净生命周期）**：停止观察自动联动关闭悬浮小窗，且支持 `ttlSec` 无操作超时自动回收（自动停 infer/interpret/watch + 关 overlay + 释放 hold），杜绝任务结束后残留窗口或后台空转。
+
+### 经验 15（审批策略与插件门控的冲突，2026-10-28）
+
+- **现象**：鼠标/键盘注入工具（saperm_click / scroll / type / hotkey / drag / doubleclick）全部返回 `the user rejected tool`，但 helper 在线、未急停、模型正常。
+- **根因**：DSH 的审批策略为 `never`（`danger-full-access` 预设里 `approval: never`）时，`dsh-user-approval` 的 `decide()` 会把任何 `{ kind: 'ask' }` **确定性地判定为 rejected**（源码：`if (this.effectivePolicy(session) === "never") return "rejected"`）。插件在 `tools/pre-execute` 里对 L2/L3 一律 `ask`，于是全部注入被自动拒绝；而 `state.l2` 还会把该会话标记为 `denied`，形成永久不可用。急停（saperm_stop）在此策略下也**无法恢复**，因为 saperm_resume 同样走 ask。
+- **修复**：插件先读取全局有效审批策略（`ctx.get('approval').effectivePolicy(agent.session)`）。策略为 `never` 时**不再 ask**，直接放行并写 `auto_grant` 审计日志；急停锁仍是最高优先级拦截，`saperm_resume` 在 never 下放行以免死锁。`saperm_status` 暴露 `approvalPolicy` 便于诊断。
+- **回归**：`tests/approval-policy-test.mjs`（11 项：never 放行 L2/L3/resume、ask 仍要求审批、never+急停仍拦截）。
+- **教训**：插件自建的审批门必须**尊重宿主的全局审批策略**，否则"用户选了全权模式反而什么都做不了"。
+
+### 经验 16（DSH 插件热加载的真实语义，2026-10-28）
+
+- 之前认为"插件改动必须重启 DSH"，实为**误判**：DSH profile 的 `patchReload: "live"` 确实会重载插件图。
+- 关键区别在 **diff**：仅重写文件（mtime 变化、内容相同）**不会**触发重载；必须产生**真实内容变更**（我们在 `cordis.patch.yml` 追加一行注释）才会重新 `import` 插件模块并重建插件实例。
+- 因此插件改动可以**免重启**上线：改完源码 → 对补丁文件做一次真实内容变更 → 等待约 5s → 用 `saperm_status` 是否出现新字段来确认新代码已生效。
+- 附带发现：插件里访问未 `inject` 的服务（如 `ctx.agents`）会在 Cordis 抛 `cannot get property "agents" without inject`，诊断信息必须只依赖已注册状态（`state.approvalPolicy`），不要临时读宿主服务。
