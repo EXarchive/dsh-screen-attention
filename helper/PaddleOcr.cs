@@ -17,7 +17,7 @@ using Microsoft.ML.OnnxRuntime.Tensors;
 static class PaddleOcr
 {
     // ---- det 参数（RapidOCR 默认，short-side 放大到 736 的 32 倍数）----
-    const int DetLimitSide = 736;
+    const int DetLimitSide = 320;
     const float DetThresh = 0.3f;
     const float DetBoxThresh = 0.5f;
     const float DetUnclipRatio = 2.0f;
@@ -27,7 +27,7 @@ static class PaddleOcr
 
     // ---- rec 固定形状 ----
     const int RecImgH = 48;
-    const int RecImgW = 320;
+    const int RecImgW = 160;   // 320 → 160：单框 rec 时间约减半（屏幕 UI 多为短文本）
     const int NumClasses = 6625;
 
     static InferenceSession _det;
@@ -69,11 +69,16 @@ static class PaddleOcr
             {
                 string dir = ModelDir();
 
-                // det session（优先 DirectML，失败降级 CPU）
-                string detPath = Path.Combine(dir, "ch_PP-OCRv4_det_infer.onnx");
+                // det/rec session：优先 fp16 模型（DirectML 对 fp16 有硬件加速），缺失则回退 fp32
+                string Pick(string name)
+                {
+                    // fp16 在 DirectML 上实测推理失败（0 次成功），回退 fp32；保留 fp16 文件供 CPU EP 使用
+                    return Path.Combine(dir, name);
+                }
+                string detPath = Pick("ch_PP-OCRv4_det_infer.onnx");
                 (_det, _detDml) = CreateSession(detPath);
 
-                string recPath = Path.Combine(dir, "ch_PP-OCRv4_rec_infer.onnx");
+                string recPath = Pick("ch_PP-OCRv4_rec_infer.onnx");
                 (_rec, _recDml) = CreateSession(recPath);
 
                 // 字典 6623 字符（UTF-8，无 BOM）
@@ -108,6 +113,7 @@ static class PaddleOcr
         try
         {
             var (s, backend) = Providers.CreateSession(path);
+
             return (s, backend != "cpu");
         }
         catch
@@ -144,6 +150,32 @@ static class PaddleOcr
             }
             return RunOnce(_rec, input);
         }
+    }
+
+    // 批量 rec：N 个 [1,3,48,320] 拼成 [N,3,48,320] 一次推理，
+    // 把 N 次 DirectML dispatch 压成 1 次（每次 dispatch 约 5ms 固定开销）。
+    static float[][] RunRecBatch(List<DenseTensor<float>> items)
+    {
+        int n = items.Count;
+        if (n == 0) return Array.Empty<float[]>();
+        int per = 3 * RecImgH * RecImgW;
+        var data = new float[n * per];
+        for (int i = 0; i < n; i++)
+        {
+            var arr = items[i].ToArray();
+            Array.Copy(arr, 0, data, i * per, Math.Min(arr.Length, per));
+        }
+        var t = new DenseTensor<float>(new[] { n, 3, RecImgH, RecImgW });
+        data.CopyTo(t.Buffer.Span);
+        var flat = RunRec(t);
+        int each = flat.Length / n;
+        var res = new float[n][];
+        for (int i = 0; i < n; i++)
+        {
+            res[i] = new float[each];
+            Array.Copy(flat, i * each, res[i], 0, each);
+        }
+        return res;
     }
 
     static float[] RunOnce(InferenceSession s, DenseTensor<float> input)
@@ -192,7 +224,10 @@ static class PaddleOcr
     {
         double ratio;
         int m = Math.Min(sw, sh);
-        ratio = m < DetLimitSide ? (double)DetLimitSide / m : 1.0;
+        // 标准 limit_type=max：任意一边超过阈值就整体缩小；否则放大到阈值。
+        // 原实现写成 m < limit ? limit/m : 1.0，导致 1600px 高的屏永远按 1.0 全尺寸跑 det（4M 像素），
+        // 单帧 det 就要 200ms+，识别速率被压到 4Hz。
+        ratio = m > DetLimitSide ? (double)DetLimitSide / m : 1.0;   // 只缩不放：小 ROI 保持原尺寸
         int dw = Math.Max(32, (int)(Math.Round(sw * ratio / 32.0) * 32));
         int dh = Math.Max(32, (int)(Math.Round(sh * ratio / 32.0) * 32));
 
@@ -393,13 +428,25 @@ static class PaddleOcr
         }
     }
 
-    public static Dictionary<string, object> RunStreaming(byte[] frame, int fw, int fh, int maxBoxes = 0)
+    static List<Box> _lastBoxes = new List<Box>();
+    static long _detRuns, _detSkips;
+
+    // skipDet=true 时复用上次检测框，只做 rec —— det 是最大固定开销（~35ms），
+    // 屏幕文字布局帧间几乎不变，没必要每帧重检。
+    public static Dictionary<string, object> RunStreaming(byte[] frame, int fw, int fh, int maxBoxes = 0, bool skipDet = false)
     {
         EnsureInit();
         var sw = System.Diagnostics.Stopwatch.StartNew();
-        var (detIn, dw, dh) = DetPreprocess(frame, fw, fh);
-        float[] prob = RunDet(detIn);
-        var boxes = DetPostprocess(prob, dw, dh, fw, fh);
+        List<Box> boxes;
+        if (skipDet && _lastBoxes.Count > 0) { boxes = _lastBoxes; _detSkips++; }
+        else
+        {
+            var (detIn, dw, dh) = DetPreprocess(frame, fw, fh);
+            float[] prob = RunDet(detIn);
+            boxes = DetPostprocess(prob, dw, dh, fw, fh);
+            _lastBoxes = boxes;
+            _detRuns++;
+        }
         var items = new List<Dictionary<string, object>>();
         int chars = 0, hits = 0, miss = 0;
         foreach (var box in boxes)
@@ -440,6 +487,7 @@ static class PaddleOcr
             { "ms", Math.Round(sw.Elapsed.TotalMilliseconds, 1) },
             { "stripes", 1 }, { "scale", 1.0 }, { "engine", "paddleocr-stream-" + Backend },
             { "recHits", hits }, { "recMiss", miss },
+            { "detRuns", _detRuns }, { "detSkips", _detSkips },
         };
     }
 

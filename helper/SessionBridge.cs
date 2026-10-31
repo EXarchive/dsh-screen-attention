@@ -109,12 +109,36 @@ static class SessionBridge
     }
 
     // Worker 端：在 Session 1 中运行，连接父进程传入的命名管道或 TCP 回环端口重定向 Console.In / Out
+    static Mutex _workerMutex;
+    public static volatile bool DegradedToSession0;
+
+    // 同一会话只允许一个 worker：重复的 bridge 拉起会撞上已有 Mutex 而立即退出，
+    // 避免多实例各自加载 ONNX 模型、叠加 CPU / 内存占用。
+    static bool TryClaimWorkerSlot()
+    {
+        try
+        {
+            int sid = Process.GetCurrentProcess().SessionId;
+            bool createdNew;
+            _workerMutex = new Mutex(true, "Local\\SaHelperWorker_S" + sid, out createdNew);
+            if (!createdNew)
+            {
+                Console.Error.WriteLine("[bridge] duplicate worker in session " + sid + " detected, exiting");
+                try { _workerMutex.Dispose(); } catch { }
+                return false;
+            }
+            return true;
+        }
+        catch { return true; }
+    }
+
     public static bool AttachWorkerTransport(string[] args)
     {
         for (int i = 0; i < args.Length - 1; i++)
         {
             if (args[i] == "--bridge-port" && int.TryParse(args[i + 1], out int port))
             {
+                if (!TryClaimWorkerSlot()) Environment.Exit(0);
                 var client = new System.Net.Sockets.TcpClient();
                 client.NoDelay = true;
                 client.Connect(System.Net.IPAddress.Loopback, port);
@@ -147,6 +171,8 @@ static class SessionBridge
 
         int mySession = Process.GetCurrentProcess().SessionId;
         if (mySession != 0) return false;
+        // 若桥接最终失败，Main 会继续在 Session0 运行；标记出来供预热跳过。
+        DegradedToSession0 = true;
 
         uint activeSession = WTSGetActiveConsoleSessionId();
         if (activeSession == 0 || activeSession == 0xFFFFFFFF) return false;
@@ -219,8 +245,11 @@ static class SessionBridge
         try
         {
             var acceptTask = listener.AcceptTcpClientAsync();
-            if (!acceptTask.Wait(4000))
+            // 原来只等 4s：机器繁忙时 Session1 worker 启动（.NET 运行时 + 首帧初始化）
+            // 容易超时被误杀，随后降级到 Session0 自己跑全模型 → 既看不到桌面又白吃 ~2GB 内存。
+            if (!acceptTask.Wait(20000))
             {
+                Console.Error.WriteLine("[bridge] worker 未在 20s 内连回，降级到 Session0（将无法操作用户桌面）");
                 try { TerminateProcess(pi.hProcess, 1); } catch { }
                 return false;
             }

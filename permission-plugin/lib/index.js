@@ -335,6 +335,7 @@ export function apply(ctx) {
     taskAgentId: null,         // 发起观察任务的 agent（会话）id：汇报定向注入到该会话，而非依赖 currentInitiator
     interpretInject: null,     // 连续解读 → 会话注入配置（inject/minInjectMs/kinds + 轮询游标）
     inferInject: null,         // 逐帧识别 → 会话注入配置（inject/injectChanges/minInjectMs + seq 游标）
+    stream: null,              // AI 可读数据流：帧 → 紧凑行 → JSONL/latest.txt
     obsMode: null,             // 当前长时观察模式：'infer' | 'interpret' | null（互斥，防并发降级）
     approvalPolicy: null,      // 最近一次门控观测到的全局审批策略（'ask' | 'never'），仅用于诊断展示
     obsConfig: null,           // 看门狗恢复配置：{ mode, cmd, args }
@@ -354,6 +355,7 @@ export function apply(ctx) {
         try { await helperCall('watch_stop', {}) } catch {}
         try { await helperCall('overlay_close', {}) } catch {}
         state.obsMode = null; state.overlayOpen = false
+        stopStream()
         state.obsTtlTimer = null; state.obsTtlMs = 0
         clearAllHolds()
         appendObservationLog({ type: 'auto_cleanup', reason: 'ttl_expired', ttlMs: ms })
@@ -669,6 +671,173 @@ export function apply(ctx) {
     state.inferInject = c
     if (c.inject) c.timer = setInterval(() => { pollInferInject().catch(() => {}) }, 1000)
     return c
+  }
+
+  // ===== AI 可读数据流（图片流 → 紧凑文本行 → JSONL / latest.txt） =====
+  // 目标：每帧识别结果压成一行（~100-160 字节），AI 直接读行即可理解屏幕，
+  // 无需解析 infer_status 的大 JSON；文本变体走增量（= 相同 / +尾部新增）。
+  const STREAM_MAX_RING = 600
+  const STREAM_LATEST_KEEP = 200
+  const STREAM_TX_MAX = 140
+  const streamDay = (ts) => new Date(ts).toISOString().slice(0, 10)
+  const streamFile = (d) => join(LOGS_DIR, 'stream-' + d + '.jsonl')
+  const streamLatest = () => join(LOGS_DIR, 'stream-latest.txt')
+
+  // 2s 预算守门：区域越大，OCR 越容易超时 → 自动降采样（调用方可用 scale 显式覆盖下限）
+  function pickScale(rect, requested) {
+    const base = Number.isFinite(requested) ? Number(requested) : 1
+    if (!rect) return Math.min(base, 0.7)          // 无区域=全屏
+    const area = Math.max(1, (rect.w || 0) * (rect.h || 0))
+    if (area > 2500000) return Math.min(base, 0.7)
+    if (area > 1200000) return Math.min(base, 0.85)
+    return base
+  }
+
+  function compactText(s0, max) {
+    let t = String(s0 == null ? '' : s0).replace(/\s+/g, ' ').trim()
+    if (!t) return ''
+    const parts = t.split('|').map((x) => x.trim()).filter(Boolean)
+    const uniq = []
+    const seen = new Set()
+    for (const p of parts) { if (!seen.has(p)) { seen.add(p); uniq.push(p) } }
+    t = uniq.join(' | ')
+    return t.length > max ? t.slice(0, max - 1) + '…' : t
+  }
+
+  function objSummary(objects) {
+    if (!Array.isArray(objects) || !objects.length) return ''
+    const agg = new Map()
+    for (const o of objects) {
+      if (!o) continue
+      const label = String(o.labelZh || o.label || '?')
+      const tag = o.identity ? '(' + o.identity + ')' : (o.unknownId ? '(未登记)' : '')
+      const key = label + tag
+      agg.set(key, (agg.get(key) || 0) + 1)
+    }
+    const out = []
+    for (const [k, n] of agg) out.push(n > 1 ? k + '×' + n : k)
+    const joined = out.join(',')
+    return joined.length > 80 ? joined.slice(0, 79) + '…' : joined
+  }
+
+  function textDelta(prev, cur) {
+    if (!cur) return ''
+    if (cur === prev) return '='
+    if (prev && cur.startsWith(prev)) return '+' + cur.slice(prev.length)
+    return cur
+  }
+
+  function formatStreamLine(r) {
+    let out = r.t + ' #' + r.s + ' W=' + (r.w || '-') + ' SC=' + (r.sc || '-')
+    if (r.ob) out += ' OB=' + r.ob
+    if (r.fa) out += ' F=' + r.fa
+    if (r.tx) out += ' TX=' + r.tx
+    if (Array.isArray(r.ch) && r.ch.length) out += ' CH=' + r.ch.join(';')
+    out += ' ' + r.fps + 'fps ' + r.ocr + 'ms'
+    return out
+  }
+
+  function flushStreamLatest() {
+    const st = state.stream
+    if (!st) return
+    try {
+      mkdirSync(LOGS_DIR, { recursive: true })
+      const lines = st.ring.slice(-STREAM_LATEST_KEEP).map(formatStreamLine)
+      writeFileSync(streamLatest(), lines.join('\n') + (lines.length ? '\n' : ''), 'utf8')
+    } catch {}
+  }
+
+  async function pollStream() {
+    const st = state.stream
+    if (!st || !st.timer || st.busy) return
+    if (!helperSingleton.online || helperSingleton.recovering || helperSingleton.needsRecovery) return
+    st.busy = true
+    try {
+      let r
+      try { r = await helperCall('infer_status', { limit: 1 }) } catch { return }
+      if (!r || !r.latest) return
+      const L = r.latest
+      const seq = Number(L.seq || 0)
+      if (!seq) return
+      st.polls++
+      if (seq === st.lastSeq) { st.dups++; return }
+      st.lastSeq = seq
+      const now = Date.now()
+      const tx = compactText(L.text, STREAM_TX_MAX)
+      const row = {
+        t: new Date(now).toTimeString().slice(0, 8),
+        s: seq,
+        w: String(L.fgTitle || '').slice(0, 40),
+        sc: String(L.scene || ''),
+        ob: objSummary(L.objects),
+        fa: Number(L.faceCount || 0),
+        tx: textDelta(st.lastText, tx),
+        ch: [...new Set((Array.isArray(L.changes) ? L.changes : []).map((x) => oneLine(x)).filter(Boolean))].slice(0, 3),
+        fps: Number(r.fps || 0),
+        ocr: Number(L.ocrMs || 0),
+      }
+      st.lastText = tx
+      // 静止节流：与上一行实质相同（窗口/场景/物体/脸/文本均未变且无变化事件）时，
+      // 每 5s 才落一行心跳，避免静止画面把日志和带宽刷满。
+      const sameAsLast = st.lastRow
+        && st.lastRow.w === row.w && st.lastRow.sc === row.sc && st.lastRow.ob === row.ob
+        && st.lastRow.fa === row.fa && row.tx === '=' && row.ch.length === 0
+      if (sameAsLast && (now - (st.lastWriteAt || 0)) < (st.idleWriteMs || 5000)) {
+        st.idleSkips = (st.idleSkips || 0) + 1
+        return
+      }
+      // CH 去重：与上一行完全相同的变化事件不再重复携带，避免每行都背 3 条陈旧 CH
+      const chKey = row.ch.join('|')
+      if (chKey && chKey === (st.lastChKey || '')) row.ch = []
+      st.lastChKey = chKey
+      if (row.ch.length === 0) st.lastChKey = ''
+      st.lastRow = row
+      st.lastWriteAt = now
+      st.rows++
+      st.ring.push(row)
+      if (st.ring.length > STREAM_MAX_RING) st.ring.splice(0, st.ring.length - STREAM_MAX_RING)
+      try {
+        mkdirSync(LOGS_DIR, { recursive: true })
+        appendFileSync(streamFile(streamDay(now)), JSON.stringify(row) + '\n', 'utf8')
+      } catch {}
+      st.sinceFlush = (st.sinceFlush || 0) + 1
+      if (st.sinceFlush >= 15) { st.sinceFlush = 0; flushStreamLatest() }
+    } finally { st.busy = false }
+  }
+
+  function startStream(opts) {
+    const intervalMs = clampInt(opts && opts.intervalMs, 1000, 200, 10000)
+    if (state.stream && state.stream.timer) {
+      if (state.stream.intervalMs === intervalMs) return state.stream
+      stopStream()
+    }
+    const st = {
+      timer: null, intervalMs, ring: [], lastSeq: 0, lastText: '',
+      rows: 0, polls: 0, dups: 0, busy: false, sinceFlush: 0, startedAt: Date.now(),
+    }
+    state.stream = st
+    st.timer = setInterval(() => { pollStream().catch(() => {}) }, intervalMs)
+    if (st.timer.unref) st.timer.unref()
+    pollStream().catch(() => {})
+    return st
+  }
+
+  function stopStream() {
+    const st = state.stream
+    if (!st) return null
+    if (st.timer) { clearInterval(st.timer); st.timer = null }
+    flushStreamLatest()
+    const summary = { rows: st.rows, polls: st.polls, dups: st.dups }
+    return summary
+  }
+
+  function streamStatus() {
+    const st = state.stream
+    if (!st) return { running: false, rows: 0, lastSeq: 0, file: streamLatest() }
+    return {
+      running: !!st.timer, intervalMs: st.intervalMs, rows: st.rows,
+      polls: st.polls, dups: st.dups, idleSkips: st.idleSkips || 0, lastSeq: st.lastSeq, file: streamLatest(),
+    }
   }
 
   helperSingleton.listeners.add(onHelperEvent)
@@ -1133,21 +1302,34 @@ export function apply(ctx) {
     description: '按文字定位屏幕元素：本地 OCR 全屏扫描，返回含 keyword 的文字词与坐标{text,x,y,w,h}。用于找到屏幕上的文字/按钮/图标名（如"哔哩哔哩"）。本地 Windows 识别，不受外部 vision 限流影响。观察类，无需审批',
     parameters: {
       type: 'object',
-      properties: { keyword: { type: 'string', description: '要查找的文字（必填）' } },
+      properties: {
+        keyword: { type: 'string', description: '要查找的文字（必填）' },
+        scale: { type: 'number', description: 'OCR 放大倍数（默认 1；2 更清晰但更慢）' },
+        full: { type: 'boolean', description: 'true=全屏扫描；默认只扫前台窗口（快 3~10 倍）' },
+        ocrOnly: { type: 'boolean', description: 'true=跳过 UIA 通道，只做 OCR' },
+        maxMs: { type: 'integer', description: '耗时预算毫秒（默认 1900）' },
+      },
       required: ['keyword'],
     },
     execute: async (args) => {
+      const t0 = Date.now()
       const kw = String(args.keyword || '').trim()
-      if (!kw) return { found: 0, keyword: '', items: [] }
+      if (!kw) return { found: 0, keyword: '', items: [], elapsedMs: 0 }
       const k = kw.replace(/\s+/g, '')
+      const budgetMs = clampInt(args.maxMs, 1900, 300, 8000)
+      const scale = Number.isFinite(args.scale) ? Number(args.scale) : 1
       const results = []
       const seen = new Set()
       const push = (it) => { const key = it.text + '@' + it.x + ',' + it.y; if (!seen.has(key)) { seen.add(key); results.push(it) } }
+      const stages = {}
+      let winList = []
+      try { const w = await helperCall('windows'); winList = (w && w.windows) || [] } catch {}
+      const fg = winList.find((x) => x.fg)
+      const pg = winList.find((x) => x.cls === 'Progman')
       try {
-        // 通道1：UIA 元素（桌面图标 + 前台窗口控件，精确坐标，中文图标可靠）
-        try {
-          const w = await helperCall('windows')
-          const pg = (w && w.windows || []).find(x => x.cls === 'Progman')
+        // 通道1：UIA（最快；桌面图标 + 前台控件）
+        const tU = Date.now()
+        if (!args.ocrOnly) {
           const hwnds = pg ? [pg.hwnd, 0] : [0]
           for (const hw of hwnds) {
             try {
@@ -1159,20 +1341,27 @@ export function apply(ctx) {
               }
             } catch {}
           }
-        } catch {}
-        // 通道2：OCR 文字（2x 放大预处理，中文/数字文字）
-        try {
-          const o = await helperCall('ocr', { scale: 2 })
-          for (const it of (o && o.items) || []) {
-            if (String(it.text || '').replace(/\s+/g, '').includes(k)) {
-              push({ text: it.text, x: it.rect.x, y: it.rect.y, w: it.rect.w, h: it.rect.h, source: 'ocr' })
-            }
+        }
+        stages.uia = Date.now() - tU
+        // 通道2：OCR —— 只扫前台窗口区域（原来全屏 + scale=2 要 3s）
+        const tO = Date.now()
+        let rect = null
+        if (!args.full && fg && fg.w >= 160 && fg.h >= 120) rect = { x: fg.x, y: fg.y, w: fg.w, h: fg.h }
+        const effScale = pickScale(rect, scale)
+        stages.scale = effScale
+        const o = rect ? await helperCall('ocr', { x: rect.x, y: rect.y, w: rect.w, h: rect.h, scale: effScale }) : await helperCall('ocr', { scale: effScale })
+        const dx = rect ? rect.x : 0, dy = rect ? rect.y : 0
+        for (const it of (o && o.items) || []) {
+          if (String(it.text || '').replace(/\s+/g, '').includes(k)) {
+            push({ text: it.text, x: dx + it.rect.x, y: dy + it.rect.y, w: it.rect.w, h: it.rect.h, source: 'ocr' })
           }
-        } catch {}
-        return { found: results.length, keyword: kw, items: results }
+        }
+        stages.ocr = Date.now() - tO
+        stages.region = rect
       } catch (e) {
-        return { found: 0, keyword: kw, error: ((e && e.message) || String(e)).slice(0, 120) }
+        return { found: 0, keyword: kw, error: ((e && e.message) || String(e)).slice(0, 120), elapsedMs: Date.now() - t0 }
       }
+      return { found: results.length, keyword: kw, items: results, elapsedMs: Date.now() - t0, budgetMs, stages }
     },
   })
 
@@ -1222,15 +1411,38 @@ export function apply(ctx) {
 
   register({
     name: 'saperm_scroll',
-    description: '滚轮滚动（L2 普通输入，会话级授权；正=上，负=下）',
+    description: '滚轮滚动（L2 普通输入，会话级授权；正=上，负=下）。滚轮只作用于光标下方窗口，因此会自动先把光标移到前台窗口中心（或传入的 x,y），保证滚的是目标页面',
     parameters: {
       type: 'object',
-      properties: { amount: { type: 'integer', description: '滚动量，正=上，负=下' } },
+      properties: {
+        amount: { type: 'integer', description: '滚动量，正=上，负=下' },
+        x: { type: 'integer', description: '可选：先移到该屏幕 x 再滚动' },
+        y: { type: 'integer', description: '可选：先移到该屏幕 y 再滚动' },
+      },
       required: ['amount'],
     },
     execute: async (args) => {
-      await helperCall('scroll', { amount: args.amount })
-      return { injected: true, helper: true, amount: args.amount }
+      const r = await helperCall('scroll', args.x != null && args.y != null
+        ? { amount: args.amount, x: args.x, y: args.y }
+        : { amount: args.amount })
+      return { injected: true, helper: true, amount: args.amount, cursor: (r && r.cursor) || null }
+    },
+  })
+
+  register({
+    name: 'saperm_topmost',
+    description: '临时把窗口抬到最高层（或复原）：当目标网页被最大化窗口/置顶窗口遮挡、导致截图截到别的窗口时使用。on=true 置顶并激活，on=false 复原。L2 输入，会话级授权',
+    parameters: {
+      type: 'object',
+      properties: {
+        hwnd: { type: 'integer', description: '目标窗口句柄' },
+        on: { type: 'boolean', description: 'true=置顶（默认），false=取消置顶' },
+      },
+      required: ['hwnd'],
+    },
+    execute: async (args) => {
+      const r = await helperCall('topmost', { hwnd: args.hwnd, on: args.on !== false })
+      return { injected: true, helper: true, hwnd: args.hwnd, topmost: args.on !== false, ok: (r && r.ok) === true }
     },
   })
 
@@ -1459,22 +1671,130 @@ export function apply(ctx) {
     parameters: {
       type: 'object',
       properties: {
-        maxTexts: { type: 'integer', description: '最多返回文字条数（默认 80）' },
-        maxElements: { type: 'integer', description: '最多返回 UIA 元素条数（默认 60）' },
+        maxTexts: { type: 'integer', description: '最多返回文字条数（默认 60）' },
+        maxElements: { type: 'integer', description: '最多返回 UIA 元素条数（默认 40）' },
+        full: { type: 'boolean', description: 'true=全屏 OCR；默认只扫前台窗口（快 3~10 倍）' },
+        x: { type: 'integer' }, y: { type: 'integer' }, w: { type: 'integer' }, h: { type: 'integer' },
       },
     },
     execute: async (args) => {
-      const out = { texts: [], elements: [] }
+      const t0 = Date.now()
+      const out = { texts: [], elements: [], stages: {} }
+      let rect = null
       try {
-        const o = await helperCall('ocr', {})
-        out.texts = ((o && o.items) || []).slice(0, args.maxTexts || 80).map(h => ({ text: h.text, x: h.rect.x, y: h.rect.y, w: h.rect.w, h: h.rect.h }))
+        if (args.x != null) rect = { x: args.x, y: args.y, w: args.w, h: args.h }
+        else if (!args.full) {
+          const w = await helperCall('windows')
+          const fg = ((w && w.windows) || []).find((x) => x.fg)
+          if (fg && fg.w >= 160 && fg.h >= 120) rect = { x: fg.x, y: fg.y, w: fg.w, h: fg.h }
+        }
+      } catch {}
+      try {
+        const tO = Date.now()
+        const effScale = pickScale(rect, undefined)
+        const o = rect ? await helperCall('ocr', { ...rect, scale: effScale }) : await helperCall('ocr', { scale: effScale })
+        out.stages.scale = effScale
+        const dx = rect ? rect.x : 0, dy = rect ? rect.y : 0
+        out.texts = ((o && o.items) || []).slice(0, args.maxTexts || 60).map(h => ({ text: h.text, x: dx + h.rect.x, y: dy + h.rect.y, w: h.rect.w, h: h.rect.h }))
+        out.stages.ocr = Date.now() - tO
       } catch (e) { out.ocrError = ((e && e.message) || String(e)).slice(0, 100) }
       try {
+        const tU = Date.now()
         const u = await helperCall('uia', {})
-        out.elements = ((u && u.items) || []).filter(x => x.text).slice(0, args.maxElements || 60)
+        out.elements = ((u && u.items) || []).filter(x => x.text).slice(0, args.maxElements || 40)
           .map(x => ({ text: x.text, role: x.role, x: x.rect.x, y: x.rect.y, w: x.rect.w, h: x.rect.h }))
+        out.stages.uia = Date.now() - tU
       } catch (e) { out.uiaError = ((e && e.message) || String(e)).slice(0, 100) }
+      out.region = rect
+      out.elapsedMs = Date.now() - t0
       return out
+    },
+  })
+
+  register({
+    name: 'saperm_frames',
+    description: '连续帧流水线：以目标帧率（默认 60fps）持续采集屏幕，逐帧记录时间戳/采集耗时/空洞(gap)，保证信息流不丢帧（60fps × 60s = 3600 帧）。action=start 开始、stats 查看、stop 结束并返回统计。观察类，无需审批',
+    parameters: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', description: 'start | stats | stop（默认 stats）' },
+        fps: { type: 'integer', description: '目标帧率（默认 60，范围 1~240）' },
+        path: { type: 'string', description: '可选：逐帧日志路径（默认 out/logs/frames-<时间>.jsonl）' },
+      },
+    },
+    execute: async (args) => {
+      const action = String(args.action || 'stats')
+      if (action === 'start') {
+        const fps = clampInt(args.fps, 60, 1, 240)
+        try { mkdirSync(LOGS_DIR, { recursive: true }) } catch {}
+        const path = args.path || join(LOGS_DIR, 'frames-' + Date.now() + '.jsonl')
+        const r = await helperCall('frames_start', { fps, path })
+        return { ...(r || {}), action, fps, path, hint: '用 action=stats 查看进度，action=stop 结束' }
+      }
+      if (action === 'stop') {
+        const r = await helperCall('frames_stop')
+        return { ...(r || {}), action }
+      }
+      const s = await helperCall('frames_stats')
+      return { ...(s || {}), action: 'stats' }
+    },
+  })
+
+  register({
+    name: 'saperm_scan',
+    description: '一次识别调用完成多路感知（2s 预算内）：只截一张图 → OCR 文字+坐标，可选 scene 场景 / objects 物体，返回合并结果与分阶段耗时 elapsedMs/withinBudget。默认扫前台窗口（快 3~10 倍），full=true 全屏。观察类，无需审批',
+    parameters: {
+      type: 'object',
+      properties: {
+        x: { type: 'integer' }, y: { type: 'integer' }, w: { type: 'integer' }, h: { type: 'integer' },
+        full: { type: 'boolean', description: 'true=整屏识别；默认只扫前台窗口' },
+        scene: { type: 'boolean', description: '附带 CLIP 场景分类（约 +50ms）' },
+        objects: { type: 'boolean', description: '附带 YOLO 物体检测（约 +100~500ms）' },
+        maxTexts: { type: 'integer', description: '返回文字条数（默认 80，最大 200）' },
+        scale: { type: 'number', description: 'OCR 放大倍数（默认 1）' },
+      },
+    },
+    execute: async (args) => {
+      const t0 = Date.now()
+      const budget = 1900
+      const stages = {}
+      let rect = null
+      if (args.x != null) rect = { x: args.x, y: args.y, w: args.w, h: args.h }
+      else if (!args.full) {
+        try {
+          const w = await helperCall('windows')
+          const fg = ((w && w.windows) || []).find((x) => x.fg)
+          if (fg && fg.w >= 160 && fg.h >= 120) rect = { x: fg.x, y: fg.y, w: fg.w, h: fg.h }
+        } catch {}
+      }
+      const tShot = Date.now()
+      const shot = await helperCall('screenshot', rect ? { ...rect } : {})
+      const path = saveShot(shot.jpegB64, 'scan')
+      stages.shot = Date.now() - tShot
+      const tOcr = Date.now()
+      let texts = []
+      try {
+        const effScale = pickScale(rect, args.scale)
+        const o = await helperCall('ocr_file', { path, scale: effScale })
+        stages.scale = effScale
+        const dx = rect ? rect.x : 0, dy = rect ? rect.y : 0
+        texts = ((o && o.items) || []).slice(0, clampInt(args.maxTexts, 80, 1, 200))
+          .map((it) => ({ text: it.text, x: dx + (it.x || 0), y: dy + (it.y || 0), w: it.w || 0, h: it.h || 0 }))
+      } catch (e) { stages.ocrError = ((e && e.message) || String(e)).slice(0, 80) }
+      stages.ocr = Date.now() - tOcr
+      let scene = null, objects = null
+      if (args.scene) {
+        const t = Date.now()
+        try { const r = await helperCall('scene', { path, topK: 3 }); scene = { top: r.top, labels: r.labels } } catch {}
+        stages.scene = Date.now() - t
+      }
+      if (args.objects) {
+        const t = Date.now()
+        try { const r = await helperCall('detect', { path, model: 'n' }); objects = { count: r.count, items: (r.items || []).slice(0, 10) } } catch {}
+        stages.detect = Date.now() - t
+      }
+      const elapsedMs = Date.now() - t0
+      return { elapsedMs, withinBudget: elapsedMs < budget, budgetMs: budget, region: rect, path, count: texts.length, texts, scene, objects, stages }
     },
   })
 
@@ -1737,6 +2057,8 @@ export function apply(ctx) {
         injectChanges: { type: 'boolean', description: '注入角色出现/消失变化（默认 true；false=不注入变化）' },
         minInjectMs: { type: 'integer', description: '注入最小间隔毫秒（默认 2000，范围 200-60000）' },
         ttlSec: { type: 'integer', description: '无操作自动关闭秒数（默认 120 秒，到期自动停止观察并关闭小窗）' },
+        streamMs: { type: 'integer', description: 'AI 可读数据流采样间隔毫秒（默认 1000，范围 200-10000）' },
+        fullRate: { type: 'boolean', description: 'true=不做静止节流，每帧都识别（追 30fps 高速识别）；默认 false 省电' },
       },
     },
     execute: async (args) => {
@@ -1745,7 +2067,7 @@ export function apply(ctx) {
         try { stopInject('interpret'); await helperCall('interpret_stop', {}); releaseHold('obs'); autoStopped = 'interpret' } catch {}
       }
       armAutoCleanup(args.ttlSec || 120)
-      const inferArgs = { maxBoxes: args.maxBoxes || 60, objects: !!args.objects, scene: !!args.scene, accurate: !!args.accurate, animeface: !!args.animeface, sceneEvery: args.sceneEvery || 8, faceEvery: args.faceEvery || 4 }
+      const inferArgs = { maxBoxes: args.maxBoxes || 60, objects: !!args.objects, scene: !!args.scene, accurate: !!args.accurate, animeface: !!args.animeface, sceneEvery: args.sceneEvery || 8, faceEvery: args.faceEvery || 4, fullRate: args.fullRate === true }
       const r = await helperCall('infer_start', inferArgs)
       if (r && r.running) {
         holdHelper('obs')
@@ -1753,7 +2075,8 @@ export function apply(ctx) {
         state.obsConfig = { mode: 'infer', cmd: 'infer_start', args: inferArgs }
       }
       const c = startInferInject({ inject: args.inject, injectChanges: args.injectChanges, minInjectMs: args.minInjectMs })
-      const out = { ...r, injection: injectSummary(c) }
+      if (r && r.running) startStream({ intervalMs: args.streamMs || 1000 })
+      const out = { ...r, injection: injectSummary(c), stream: streamStatus() }
       if (autoStopped) out.autoStopped = autoStopped
       if (c.inject && !args.objects) out.injectionNote = '角色变化依赖 objects=true 的目标检测/身份；当前 objects=false 时不会产生出现/消失事件'
       return out
@@ -1770,7 +2093,68 @@ export function apply(ctx) {
     execute: async (args) => {
       refreshAutoCleanup()
       const r = await helperCall('infer_status', { limit: args.limit || 10 })
-      return { ...r, injection: injectSummary(state.inferInject) }
+      return { ...r, injection: injectSummary(state.inferInject), stream: streamStatus() }
+    },
+  })
+
+  register({
+    name: 'saperm_stream',
+    description: '读取 AI 可读数据流：每帧识别结果已压成一行紧凑文本（W=前台窗口 SC=场景 OB=物体 F=动漫脸 TX=文本,增量语义 =相同/\u002B新增 CH=变化事件 fps/ms）。默认返回 text 多行，token 极省；file=true 返回 latest.txt 路径（可用 read 工具分页读）。L0 观察',
+    parameters: {
+      type: 'object',
+      properties: {
+        limit: { type: 'integer', description: '返回最近行数（默认 40，最大 600）' },
+        sinceSeq: { type: 'integer', description: '只返回帧号 seq 大于该值的行（增量拉取）' },
+        format: { type: 'string', description: 'lines=紧凑文本(默认) | json=结构化数组' },
+        file: { type: 'boolean', description: 'true=只返回 latest.txt 路径与状态' },
+      },
+    },
+    execute: async (args) => {
+      const limit = clampInt(args.limit, 40, 1, 600)
+      if (args.file) return { file: streamLatest(), status: streamStatus() }
+      const st = state.stream
+      let rows = []
+      if (st && st.ring.length) rows = st.ring.slice()
+      else {
+        try {
+          const f = streamFile(streamDay(Date.now()))
+          if (existsSync(f)) {
+            const lines = readFileSync(f, 'utf8').split('\n').filter(Boolean)
+            for (const ln of lines.slice(-limit)) { try { rows.push(JSON.parse(ln)) } catch {} }
+          }
+        } catch {}
+      }
+      if (args.sinceSeq) rows = rows.filter((r) => Number(r.s) > Number(args.sinceSeq))
+      rows = rows.slice(-limit)
+      if (String(args.format || 'lines') === 'json') return { count: rows.length, status: streamStatus(), rows }
+      return { count: rows.length, status: streamStatus(), text: rows.map(formatStreamLine).join('\n') }
+    },
+  })
+
+  register({
+    name: 'saperm_stream_start',
+    description: '单独开启 AI 可读数据流（需 infer 在跑才有数据）。默认 1000ms 采样，带 ttlSec 时到期自动停止。L0 观察',
+    parameters: {
+      type: 'object',
+      properties: {
+        intervalMs: { type: 'integer', description: '采样间隔毫秒（默认 1000，范围 200-10000）' },
+        ttlSec: { type: 'integer', description: '无操作自动停止秒数（可选）' },
+      },
+    },
+    execute: async (args) => {
+      const st = startStream({ intervalMs: args.intervalMs || 1000 })
+      if (args.ttlSec) { try { armAutoCleanup(args.ttlSec) } catch {} }
+      return { running: !!st.timer, intervalMs: st.intervalMs, file: streamLatest() }
+    },
+  })
+
+  register({
+    name: 'saperm_stream_stop',
+    description: '停止 AI 可读数据流（saperm_infer_stop 会自动停止，通常无需手动调用）。L0 观察',
+    parameters: empty,
+    execute: async () => {
+      const summary = stopStream()
+      return { stopped: true, ...(summary || {}), file: streamLatest() }
     },
   })
 
@@ -1785,6 +2169,7 @@ export function apply(ctx) {
     },
     execute: async (args) => {
       stopInject('infer')
+      stopStream()
       state.obsConfig = null
       const r = await helperCall('infer_stop', {})
       releaseHold('obs')
@@ -2040,6 +2425,8 @@ export function apply(ctx) {
           viewFiles: existsSync(VIEW_DIR) ? readdirSync(VIEW_DIR).filter((f) => f.endsWith('.jpg') || f.endsWith('.png')).length : 0,
           logFiles: existsSync(LOGS_DIR) ? readdirSync(LOGS_DIR).filter((f) => f.endsWith('.jsonl')).length : 0,
         },
+        stream: streamStatus(),
+        warm: { warming: (h && h.warming) === true, done: (h && h.warmDone) === true, ms: (h && h.warmMs) || null },
         watchdog: {
           crashes: helperSingleton.crashes,
           recoveries: helperSingleton.recoveries,

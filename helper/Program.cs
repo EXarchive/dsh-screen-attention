@@ -132,20 +132,35 @@ static class Gdi
     }
 
     // capture virtual screen region into top-down BGRA buffer (with C10 SecureDesktop tolerance & B14 Privacy Mask)
+    // ==== 采集资源复用（60fps 关键）：DC / 位图 / 输出缓冲按尺寸缓存，避免每帧 ~16MB 的分配与 GDI 重建 ====
+    static IntPtr _capMem = IntPtr.Zero, _capBmp = IntPtr.Zero, _capOld = IntPtr.Zero;
+    static int _capW, _capH;
+    static byte[] _capBuf = Array.Empty<byte>();
+
+    static readonly object CapLock = new object();
+
     public static (byte[] buf, int w, int h) Capture(int x, int y, int w, int h)
     {
+        lock (CapLock)
+        {
         w = Math.Max(1, w); h = Math.Max(1, h);
-        var buf = new byte[w * h * 4];
         IntPtr dc = GetDC(IntPtr.Zero);
-        if (dc == IntPtr.Zero) { LastSecureDesktop = true; return (buf, w, h); }
-        IntPtr mem = CreateCompatibleDC(dc);
-        IntPtr bmp = CreateCompatibleBitmap(dc, w, h);
-        IntPtr old = SelectObject(mem, bmp);
-        bool ok = BitBlt(mem, 0, 0, w, h, dc, x, y, 0x00CC0020); // SRCCOPY
+        if (dc == IntPtr.Zero) { LastSecureDesktop = true; return (new byte[w * h * 4], w, h); }
+        if (_capMem == IntPtr.Zero || _capW != w || _capH != h)
+        {
+            if (_capBmp != IntPtr.Zero) { try { SelectObject(_capMem, _capOld); } catch { } DeleteObject(_capBmp); _capBmp = IntPtr.Zero; }
+            if (_capMem != IntPtr.Zero) { DeleteDC(_capMem); _capMem = IntPtr.Zero; }
+            _capMem = CreateCompatibleDC(dc);
+            _capBmp = CreateCompatibleBitmap(dc, w, h);
+            _capOld = SelectObject(_capMem, _capBmp);
+            _capW = w; _capH = h;
+            _capBuf = new byte[w * h * 4];
+        }
+        bool ok = BitBlt(_capMem, 0, 0, w, h, dc, x, y, 0x00CC0020); // SRCCOPY
         var bi = new BITMAPINFOHEADER { biSize = 40, biWidth = w, biHeight = -h, biPlanes = 1, biBitCount = 32, biCompression = 0 };
-        int lines = ok ? GetDIBits(mem, bmp, 0, (uint)h, buf, ref bi, 0) : 0;
-        SelectObject(mem, old);
-        DeleteObject(bmp); DeleteDC(mem); ReleaseDC(IntPtr.Zero, dc);
+        int lines = ok ? GetDIBits(_capMem, _capBmp, 0, (uint)h, _capBuf, ref bi, 0) : 0;
+        ReleaseDC(IntPtr.Zero, dc);
+        var buf = _capBuf;
         LastSecureDesktop = !ok || lines <= 0;
         if (!LastSecureDesktop)
         {
@@ -153,6 +168,95 @@ static class Gdi
             for (int i = 0; i < privRects.Count; i++) RedactRect(buf, w, h, x, y, privRects[i]);
         }
         return (buf, w, h);
+        }
+    }
+
+    // ==== 高速采集：StretchBlt 直接从屏幕 DC 缩放到小位图，跳过 16MB 全屏中间缓冲 ====
+    static IntPtr _sMem = IntPtr.Zero, _sBmp = IntPtr.Zero, _sOld = IntPtr.Zero;
+    static int _sW, _sH;
+    static byte[] _sBuf = Array.Empty<byte>();
+
+    static readonly object SmallLock = new object();
+
+    public static (byte[] buf, int w, int h) CaptureSmall(int x, int y, int w, int h, double scale)
+    {
+        lock (SmallLock)
+        {
+            int dw = Math.Max(1, (int)Math.Round(w * scale));
+            int dh = Math.Max(1, (int)Math.Round(h * scale));
+            IntPtr dc = GetDC(IntPtr.Zero);
+            if (dc == IntPtr.Zero) { LastSecureDesktop = true; return (new byte[dw * dh * 4], dw, dh); }
+            if (_sMem == IntPtr.Zero || _sW != dw || _sH != dh)
+            {
+                if (_sBmp != IntPtr.Zero) { try { SelectObject(_sMem, _sOld); } catch { } DeleteObject(_sBmp); _sBmp = IntPtr.Zero; }
+                if (_sMem != IntPtr.Zero) { DeleteDC(_sMem); _sMem = IntPtr.Zero; }
+                _sMem = CreateCompatibleDC(dc);
+                _sBmp = CreateCompatibleBitmap(dc, dw, dh);
+                _sOld = SelectObject(_sMem, _sBmp);
+                _sW = dw; _sH = dh;
+                _sBuf = new byte[dw * dh * 4];
+            }
+            SetStretchBltMode(_sMem, 3); // COLORONCOLOR：最近邻缩放，比 HALFTONE 快数倍
+            bool ok = StretchBlt(_sMem, 0, 0, dw, dh, dc, x, y, w, h, 0x00CC0020);
+            var bi = new BITMAPINFOHEADER { biSize = 40, biWidth = dw, biHeight = -dh, biPlanes = 1, biBitCount = 32, biCompression = 0 };
+            int lines = ok ? GetDIBits(_sMem, _sBmp, 0, (uint)dh, _sBuf, ref bi, 0) : 0;
+            ReleaseDC(IntPtr.Zero, dc);
+            LastSecureDesktop = !ok || lines <= 0;
+            return (_sBuf, dw, dh);
+        }
+    }
+
+    // ==== 并行采集：上下半屏两条流各用独立 DC/位图/锁，接近翻倍吞吐 ====
+    static readonly object SL0 = new object(), SL1 = new object();
+    static readonly IntPtr[] _slotMem = new IntPtr[2];
+    static readonly IntPtr[] _slotBmp = new IntPtr[2];
+    static readonly IntPtr[] _slotOld = new IntPtr[2];
+    static readonly int[] _slotW = new int[2];
+    static readonly int[] _slotH = new int[2];
+    static readonly byte[][] _slotBuf = new byte[2][];
+    static byte[] _parBuf;
+
+    static (byte[] buf, int w, int h) CaptureSmallSlot(int slot, int x, int y, int w, int h, double scale)
+    {
+        lock (slot == 0 ? SL0 : SL1)
+        {
+            int dw = Math.Max(1, (int)Math.Round(w * scale));
+            int dh = Math.Max(1, (int)Math.Round(h * scale));
+            IntPtr dc = GetDC(IntPtr.Zero);
+            if (dc == IntPtr.Zero) { LastSecureDesktop = true; return (new byte[dw * dh * 4], dw, dh); }
+            if (_slotMem[slot] == IntPtr.Zero || _slotW[slot] != dw || _slotH[slot] != dh)
+            {
+                if (_slotBmp[slot] != IntPtr.Zero) { try { SelectObject(_slotMem[slot], _slotOld[slot]); } catch { } DeleteObject(_slotBmp[slot]); _slotBmp[slot] = IntPtr.Zero; }
+                if (_slotMem[slot] != IntPtr.Zero) { DeleteDC(_slotMem[slot]); _slotMem[slot] = IntPtr.Zero; }
+                _slotMem[slot] = CreateCompatibleDC(dc);
+                _slotBmp[slot] = CreateCompatibleBitmap(dc, dw, dh);
+                _slotOld[slot] = SelectObject(_slotMem[slot], _slotBmp[slot]);
+                _slotW[slot] = dw; _slotH[slot] = dh;
+                _slotBuf[slot] = new byte[dw * dh * 4];
+            }
+            SetStretchBltMode(_slotMem[slot], 3);
+            bool ok = StretchBlt(_slotMem[slot], 0, 0, dw, dh, dc, x, y, w, h, 0x00CC0020);
+            var bi = new BITMAPINFOHEADER { biSize = 40, biWidth = dw, biHeight = -dh, biPlanes = 1, biBitCount = 32, biCompression = 0 };
+            int lines = ok ? GetDIBits(_slotMem[slot], _slotBmp[slot], 0, (uint)dh, _slotBuf[slot], ref bi, 0) : 0;
+            ReleaseDC(IntPtr.Zero, dc);
+            LastSecureDesktop = !ok || lines <= 0;
+            return (_slotBuf[slot], dw, dh);
+        }
+    }
+
+    public static (byte[] buf, int w, int h) CaptureSmallParallel(int w, int h, double scale)
+    {
+        int half = h / 2;
+        byte[] b0 = null, b1 = null; int w0 = 0, h0 = 0, w1 = 0, h1 = 0;
+        var t0 = System.Threading.Tasks.Task.Run(() => { var r = CaptureSmallSlot(0, 0, 0, w, half, scale); b0 = r.buf; w0 = r.w; h0 = r.h; });
+        var t1 = System.Threading.Tasks.Task.Run(() => { var r = CaptureSmallSlot(1, 0, half, w, h - half, scale); b1 = r.buf; w1 = r.w; h1 = r.h; });
+        System.Threading.Tasks.Task.WaitAll(t0, t1);
+        if (b0 == null || b1 == null) return (new byte[w * h * 4], w, h);
+        int total = b0.Length + b1.Length;
+        if (_parBuf == null || _parBuf.Length != total) _parBuf = new byte[total];
+        Buffer.BlockCopy(b0, 0, _parBuf, 0, b0.Length);
+        Buffer.BlockCopy(b1, 0, _parBuf, b0.Length, b1.Length);
+        return (_parBuf, w0, h0 + h1);
     }
 
     // capture + optional scale (StretchBlt HALFTONE), returns top-down BGRA
@@ -247,6 +351,8 @@ static class Win
     [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT p);
     [DllImport("user32.dll")] public static extern bool GetLastInputInfo(ref LASTINPUTINFO p);
     [DllImport("kernel32.dll")] public static extern uint GetTickCount();
+    [DllImport("winmm.dll")] public static extern uint timeBeginPeriod(uint p);
+    [DllImport("winmm.dll")] public static extern uint timeEndPeriod(uint p);
     [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr p);
     [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
@@ -451,11 +557,24 @@ static class Win
             if (n == "CTRL" || n == "SHIFT" || n == "ALT" || n == "WIN" || n == "LWIN") mods.Add(VkOf(n));
             else main = VkOf(n);
         }
-        var list = new List<INPUT>();
-        foreach (var m in mods) list.Add(KeyInput(m, false));
-        if (main != 0) { list.Add(KeyInput(main, false)); list.Add(KeyInput(main, true)); }
-        for (int i = mods.Count - 1; i >= 0; i--) list.Add(KeyInput(mods[i], true));
-        if (list.Count > 0) Send(list.ToArray());
+        // 分段发送 + 帧间延迟：一次性同时间戳发送时，部分应用（如 Notepad）会忽略 Alt+F4 等组合键。
+        if (mods.Count > 0)
+        {
+            Send(mods.Select(m => KeyInput(m, false)).ToArray());
+            Thread.Sleep(28);
+        }
+        if (main != 0)
+        {
+            Send(new[] { KeyInput(main, false) });
+            Thread.Sleep(38);
+            Send(new[] { KeyInput(main, true) });
+            Thread.Sleep(22);
+        }
+        for (int i = mods.Count - 1; i >= 0; i--)
+        {
+            Send(new[] { KeyInput(mods[i], true) });
+            Thread.Sleep(12);
+        }
     }
 
     // 激活窗口（按 hwnd；含还原最小化、AttachThreadInput 绕过前台锁）
@@ -829,7 +948,63 @@ static class FrameHub
 {
     static Thread thread;
     static volatile bool running;
-    static int intervalMs = 100;
+    static volatile int intervalMs = 100;
+    // ==== 连续帧指标（60fps × 60s = 3600 帧，要求零空洞）====
+    public static long Gaps;              // 超过 1.5×间隔的空洞次数
+    public static long MaxGapMs;          // 最长空洞
+    public static long StartTicks;
+    public static int TargetFps = 100;
+    static byte[] hubBufA, hubBufB;
+    static bool hubFlip;
+    static StreamWriter frameLog;
+    static readonly object LogLock = new object();
+    static long lastTs;
+    static int motionCells;
+
+    public static void OpenFrameLog(string path)
+    {
+        lock (LogLock)
+        {
+            try { frameLog?.Flush(); frameLog?.Dispose(); } catch { }
+            frameLog = null;
+            try
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(path));
+                frameLog = new StreamWriter(new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.Read, 1 << 16), new System.Text.UTF8Encoding(false));
+                frameLog.AutoFlush = false;
+            }
+            catch { frameLog = null; }
+        }
+    }
+
+    public static void CloseFrameLog()
+    {
+        lock (LogLock)
+        {
+            try { frameLog?.Flush(); frameLog?.Dispose(); } catch { }
+            frameLog = null;
+        }
+    }
+    public const int ActiveMs = 16;   // 画面一动立刻拉满 60fps（16.6ms/帧）
+    public const int IdleMs = 220;
+
+    // 采集间隔自适应：静止时降低全屏 GDI 抓取频率（省 CPU），
+    // 但 watch / 注意力小窗需要流畅画面时保持活跃频率。
+    static long lastMotionAt;
+    public const int SettleMs = 1200;   // 动作结束后保持 60fps 的粘滞时间，避免抖动来回切档
+
+    public static void SetLoad(bool idle)
+    {
+        try
+        {
+            long now = Environment.TickCount64;
+            if (!idle) lastMotionAt = now;
+            if (Watch.IsWatching || Overlay.IsOpen) { intervalMs = ActiveMs; return; }
+            // 一旦有动作，立即拉满 60fps；静止后要静置 SettleMs 才降档（滞回）
+            intervalMs = (now - lastMotionAt) < SettleMs ? ActiveMs : IdleMs;
+        }
+        catch { intervalMs = ActiveMs; }
+    }
     static readonly object L = new object();
     static byte[] buf; static int bw, bh;
     static long seq, tsTicks;
@@ -848,6 +1023,8 @@ static class FrameHub
     public static double AvgCaptureMs { get { lock (L) return frames > 0 ? (double)totalCaptureMs / frames : 0; } }
 
     // 引用计数：无人订阅时停止采集，避免空转
+    public static void SetInterval(int ms) { intervalMs = Math.Max(4, Math.Min(2000, ms)); }
+
     public static void Acquire()
     {
         lock (L)
@@ -887,6 +1064,44 @@ static class FrameHub
         }
     }
 
+    public static void ResetStats()
+    {
+        lock (L) { frames = 0; totalCaptureMs = 0; Gaps = 0; MaxGapMs = 0; fpsFrames0 = frames; }
+        StartTicks = Environment.TickCount64;
+        lastTs = 0;
+    }
+    static long fpsFrames0;
+
+    public static object Stats()
+    {
+        lock (L)
+        {
+            long el = Math.Max(1, Environment.TickCount64 - StartTicks);
+            return new
+            {
+                running,
+                targetFps = TargetFps,
+                intervalMs,
+                frames,
+                seq,
+                fps = Math.Round(frames * 1000.0 / el, 2),
+                elapsedMs = Environment.TickCount64 - StartTicks,
+                lastCaptureMs,
+                avgCaptureMs = frames > 0 ? Math.Round((double)totalCaptureMs / frames, 2) : 0,
+                gaps = Gaps,
+                maxGapMs = MaxGapMs,
+                dropped = Gaps,
+                expectedFrames = (long)Math.Round(el * TargetFps / 1000.0)
+            };
+        }
+    }
+
+    public static void Stop()
+    {
+        running = false;
+        lock (L) { System.Threading.Monitor.PulseAll(L); }
+    }
+
     static void Loop()
     {
         int sw = Gdi.ScreenW(), sh = Gdi.ScreenH();
@@ -894,10 +1109,31 @@ static class FrameHub
         while (running)
         {
             var t0 = Stopwatch.StartNew();
+            long dt = 0; int ms = 0;
             try
             {
-                var (b, w, h) = Gdi.Capture(0, 0, sw, sh);
-                int ms = (int)t0.ElapsedMilliseconds;
+                // 高速档（60fps 目标）用半分辨率采集：数据量 1/4，跳过全屏回读瓶颈；
+                // 识别帧需要全分辨率时由 Infer 自己补抓。
+                var (b, w, h) = intervalMs <= 20
+                    ? Gdi.CaptureSmallParallel(sw, sh, 0.4)
+                    : Gdi.Capture(0, 0, sw, sh);
+                // 双缓冲：Capture 复用内部数组，这里拷贝到轮换缓冲，避免消费者读到撕裂帧且不产生分配
+                int needBytes = b.Length;
+                if (hubBufA == null || hubBufA.Length != needBytes) { hubBufA = new byte[needBytes]; hubBufB = new byte[needBytes]; }
+                var dstBuf = hubFlip ? hubBufA : hubBufB;
+                hubFlip = !hubFlip;
+                Buffer.BlockCopy(b, 0, dstBuf, 0, needBytes);
+                b = dstBuf;
+                ms = (int)t0.ElapsedMilliseconds;
+                long nowTicks = Environment.TickCount64;
+                dt = lastTs == 0 ? 0 : nowTicks - lastTs;
+                lastTs = nowTicks;
+                // 空洞判定：两帧间隔超过 1.5 倍目标间隔即视为丢帧
+                if (dt > 0 && TargetFps > 0)
+                {
+                    long limit = (long)(1500.0 / TargetFps);
+                    if (dt > limit) { Gaps++; if (dt > MaxGapMs) MaxGapMs = dt; }
+                }
                 lock (L)
                 {
                     buf = b; bw = w; bh = h; seq++; tsTicks = DateTime.UtcNow.Ticks;
@@ -912,8 +1148,29 @@ static class FrameHub
                 }
             }
             catch { }
+            lock (LogLock)
+            {
+                if (frameLog != null)
+                {
+                    try
+                    {
+                        frameLog.Write("{\"s\":");
+                        frameLog.Write(seq);
+                        frameLog.Write(",\"t\":");
+                        frameLog.Write(Environment.TickCount64 - StartTicks);
+                        frameLog.Write(",\"dt\":");
+                        frameLog.Write(dt);
+                        frameLog.Write(",\"cap\":");
+                        frameLog.Write(ms);
+                        frameLog.Write("}\n");
+                        if (seq % 60 == 0) frameLog.Flush();
+                    }
+                    catch { }
+                }
+            }
             int sleep = intervalMs - (int)t0.ElapsedMilliseconds;
             if (sleep > 0) Thread.Sleep(sleep);
+            else if (sleep < -2) { /* 落后于目标帧率：记一次欠帧 */ }
         }
     }
 }
@@ -943,7 +1200,7 @@ static class Watch
 
     public static void Start(int intervalMs)
     {
-        IntervalMs = Math.Max(100, intervalMs);
+        IntervalMs = Math.Max(10, intervalMs);
         if (watching) return;
         watching = true;
         FrameHub.Acquire();
@@ -1304,14 +1561,24 @@ static class Infer
     static long frameNo;
     static readonly object L = new object();
     static string latestText = "", latestErr = "";
-    static long latestSeq; static int latestOcrMs, latestBoxes, latestHits, latestMiss;
+    static long latestSeq;
+    // ==== 帧账本：识别速率跟随实际产出帧率，不静默丢帧 ====
+    static long lastRecognizeAt;
+    static long ledgerStaticSkips;   // 静止时按省电策略主动跳过的帧（已记账）
+    static long ledgerBusySkips;     // 识别跟不上时落后的帧（已记账）
+    static long recognizeCount;      // 真正执行识别的帧数
+    static long recognizeStartTicks;
+    public const int RecognizeIntervalStaticMs = 250;   // 静止：4fps 兜底（活跃/全速模式下不节流）
+    static volatile bool fullRateMode;                  // true=不做静止节流，每帧都识别（追 30fps）
+    public static void SetFullRate(bool on) { fullRateMode = on; }
+    static int latestOcrMs, latestBoxes, latestHits, latestMiss;
     static int latestObjMs, latestObjCount;
     static string latestScene; static int latestSceneMs; static List<Dictionary<string, object>> latestSceneLabels;
     static List<Dictionary<string, object>> latestFaces = new List<Dictionary<string, object>>();
     static int latestFaceMs, latestFaceCount;
     static string latestUnderstanding = "", latestFgTitle = "", prevFgTitle = "";
     static List<Dictionary<string, object>> latestObjects = new List<Dictionary<string, object>>();
-    static long seen, processed, dropped, staticSkipped, totalOcrMs;
+    static long seen, processed, dropped, staticSkipped, staticHeartbeats, totalOcrMs;
     static readonly List<long> samples = new List<long>();
     static readonly List<Dictionary<string, object>> history = new List<Dictionary<string, object>>();
     static double fps;
@@ -1378,7 +1645,7 @@ static class Infer
                 latestFaces = new List<Dictionary<string, object>>();
                 latestFaceMs = 0; latestFaceCount = 0; latestUnderstanding = ""; latestFgTitle = ""; prevFgTitle = "";
                 history.Clear(); samples.Clear();
-                seen = processed = dropped = staticSkipped = totalOcrMs = 0;
+                seen = processed = dropped = staticSkipped = staticHeartbeats = totalOcrMs = 0;
                 latestText = ""; latestErr = ""; fps = 0;
                 changeLog.Clear(); tracks.Clear(); nextTrackId = 1; latestChanges = new List<string>();
                 prevInferBuf = null; piw = pih = 0; staticCount = 0; lastChanges = 0; isMotionActive = true;
@@ -1464,6 +1731,128 @@ static class Infer
         return (outList, changes);
     }
 
+    // ===== 高速识别：ROI 增量 =====
+    // 只在"画面真正变化的矩形"内做 det+rec，未变区域复用上一次的文本框。
+    static byte[] _prevFrame; static int _prevW, _prevH;
+    static List<Dictionary<string, object>> _prevItems = new List<Dictionary<string, object>>();
+    static long roiReuse, roiPartial, roiFull;
+
+    struct Rect { public int X, Y, W, H; }
+
+    // 网格采样帧差 → 变化包围盒（null 表示无变化）
+    static Rect? DiffRect(byte[] a, byte[] b, int w, int h)
+    {
+        if (a == null || _prevW != w || _prevH != h) return null;
+        const int step = 16; const int th = 24;
+        int minX = int.MaxValue, minY = int.MaxValue, maxX = -1, maxY = -1;
+        int stride = w * 4;
+        for (int y = 0; y < h; y += step)
+        {
+            int rowOff = y * stride;
+            for (int x = 0; x < w; x += step)
+            {
+                int off = rowOff + x * 4;
+                if (off + 2 >= b.Length || off + 2 >= a.Length) continue;
+                int db = Math.Abs(b[off] - a[off]);
+                int dg = Math.Abs(b[off + 1] - a[off + 1]);
+                int dr = Math.Abs(b[off + 2] - a[off + 2]);
+                if (db > th || dg > th || dr > th)
+                {
+                    if (x < minX) minX = x; if (y < minY) minY = y;
+                    if (x > maxX) maxX = x; if (y > maxY) maxY = y;
+                }
+            }
+        }
+        if (maxX < 0) return new Rect { X = 0, Y = 0, W = 0, H = 0 };  // 无变化
+        return new Rect { X = minX, Y = minY, W = Math.Min(w - minX, maxX - minX + step), H = Math.Min(h - minY, maxY - minY + step) };
+    }
+
+    static byte[] CropBgra(byte[] src, int sw, int sh, Rect r)
+    {
+        var dst = new byte[r.W * r.H * 4];
+        int sStride = sw * 4, dStride = r.W * 4;
+        for (int y = 0; y < r.H; y++)
+        {
+            int sy = r.Y + y; if (sy < 0 || sy >= sh) continue;
+            Buffer.BlockCopy(src, sy * sStride + r.X * 4, dst, y * dStride, dStride);
+        }
+        return dst;
+    }
+
+    // 合并：ROI 外沿用旧框，ROI 内用新框（新框坐标 + ROI 偏移）
+    static List<Dictionary<string, object>> MergeItems(List<Dictionary<string, object>> prevItems, List<Dictionary<string, object>> newItems, Rect roi)
+    {
+        var outList = new List<Dictionary<string, object>>();
+        foreach (var it in prevItems)
+        {
+            var rr = it["rect"] as Dictionary<string, object>;
+            if (rr == null) continue;
+            int cx = Convert.ToInt32(rr["x"]) + Convert.ToInt32(rr["w"]) / 2;
+            int cy = Convert.ToInt32(rr["y"]) + Convert.ToInt32(rr["h"]) / 2;
+            bool inside = cx >= roi.X && cx < roi.X + roi.W && cy >= roi.Y && cy < roi.Y + roi.H;
+            if (!inside) outList.Add(it);
+        }
+        foreach (var it in newItems)
+        {
+            var rr = it["rect"] as Dictionary<string, object>;
+            if (rr == null) continue;
+            rr["x"] = Convert.ToInt32(rr["x"]) + roi.X;
+            rr["y"] = Convert.ToInt32(rr["y"]) + roi.Y;
+            outList.Add(it);
+        }
+        outList.Sort((p, q) =>
+        {
+            var a1 = p["rect"] as Dictionary<string, object>; var b1 = q["rect"] as Dictionary<string, object>;
+            int ay = a1 != null ? Convert.ToInt32(a1["y"]) : 0; int by = b1 != null ? Convert.ToInt32(b1["y"]) : 0;
+            if (ay != by) return ay - by;
+            int ax = a1 != null ? Convert.ToInt32(a1["x"]) : 0; int bx = b1 != null ? Convert.ToInt32(b1["x"]) : 0;
+            return ax - bx;
+        });
+        return outList;
+    }
+
+    // ===== 分块轮转识别：30fps 预算下，每帧只识别一块（优先变化最大的块）=====
+    const int TileCols = 8, TileRows = 6;
+    static readonly long[] TileScore = new long[TileCols * TileRows];
+    static readonly long[] TileLastAt = new long[TileCols * TileRows];
+    static int TileCursor;
+    static long TileRounds;
+
+    // 统计每块的变化采样点数（16px 网格，开销 ~1-2ms）
+    static void UpdateTileScores(byte[] prev, byte[] cur, int w, int h)
+    {
+        for (int i = 0; i < TileScore.Length; i++) TileScore[i] = 0;
+        if (prev == null) return;
+        const int step = 16, th = 24;
+        int stride = w * 4;
+        int tw = Math.Max(1, w / TileCols), thh = Math.Max(1, h / TileRows);
+        for (int y = 0; y < h; y += step)
+        {
+            int rowOff = y * stride;
+            int ty = Math.Min(TileRows - 1, y / thh);
+            for (int x = 0; x < w; x += step)
+            {
+                int off = rowOff + x * 4;
+                if (off + 2 >= cur.Length || off + 2 >= prev.Length) continue;
+                if (Math.Abs(cur[off] - prev[off]) > th || Math.Abs(cur[off + 1] - prev[off + 1]) > th || Math.Abs(cur[off + 2] - prev[off + 2]) > th)
+                    TileScore[ty * TileCols + Math.Min(TileCols - 1, x / tw)]++;
+            }
+        }
+    }
+
+    // 选块：变化最大者优先；都无变化则轮转（保证全屏最终覆盖）
+    static int PickTile(long now)
+    {
+        int best = -1; long bestScore = 0;
+        for (int i = 0; i < TileScore.Length; i++)
+        {
+            if (TileScore[i] > bestScore) { bestScore = TileScore[i]; best = i; }
+        }
+        if (best >= 0 && bestScore > 3) return best;
+        TileCursor = (TileCursor + 1) % (TileCols * TileRows);
+        return TileCursor;
+    }
+
     static long Pct(int p)
     {
         if (samples.Count == 0) return 0;
@@ -1481,7 +1870,16 @@ static class Infer
             var hist = history.GetRange(history.Count - n, n);
             return new Dictionary<string, object> {
                 { "running", running }, { "fps", Math.Round(fps, 1) }, { "motion", isMotionActive }, { "motionChanges", lastChanges },
-                { "framesSeen", seen }, { "framesProcessed", processed }, { "framesDropped", dropped }, { "staticSkipped", staticSkipped },
+                { "framesSeen", seen }, { "framesProcessed", processed }, { "framesDropped", dropped }, { "staticSkipped", staticSkipped }, { "staticHeartbeats", staticHeartbeats },
+                { "ledger", new Dictionary<string, object> {
+                    { "framesConsumed", seen }, { "recognized", recognizeCount },
+                    { "skippedStatic", ledgerStaticSkips }, { "skippedBusy", ledgerBusySkips },
+                    { "staticRecognizeIntervalMs", RecognizeIntervalStaticMs },
+                    { "recognizeHz", recognizeStartTicks > 0 ? Math.Round(recognizeCount * 1000.0 / Math.Max(1, Environment.TickCount64 - recognizeStartTicks), 2) : 0 },
+                    { "ledgerBalanced", seen == recognizeCount + ledgerStaticSkips + ledgerBusySkips },
+                    { "mode", isMotionActive ? "active" : "static" }, { "fullRate", fullRateMode },
+                    { "roiReuse", roiReuse }, { "roiPartial", roiPartial }, { "roiFull", roiFull },
+                    { "tiles", TileCols * TileRows }, { "tileRounds", TileRounds } } },
                 { "avgOcrMs", processed > 0 ? Math.Round((double)totalOcrMs / processed, 1) : 0 },
                 { "ocrP50Ms", Pct(50) }, { "ocrP90Ms", Pct(90) },
                 { "latest", new Dictionary<string, object> {
@@ -1517,16 +1915,20 @@ static class Infer
             bool needInitialScene = sceneMode && string.IsNullOrEmpty(latestScene) && ClipScene.IsReady;
             bool isStatic = changes <= 2 && !needInitialScene;
             lock (L) { lastChanges = changes; isMotionActive = !isStatic; }
+            long nowTick = Environment.TickCount64;
             if (isStatic)
             {
                 staticCount++;
-                // 静止降频：每 10 帧(~1s)跑一次兜底心跳更新；其余静止帧跳过全量推理，节省 DirectML 与算力
-                if (staticCount % 10 != 0)
+                // 自适应识别节奏：静止时只保证 1fps 识别（能力有限就按实际速度，不硬撑），
+                // 但采集继续运行，被跳过的帧全部记账，信息链不断裂。
+                if (!fullRateMode && (nowTick - lastRecognizeAt) < RecognizeIntervalStaticMs)
                 {
+                    FrameHub.SetLoad(true);
                     lock (L)
                     {
                         seen += skipped + 1;
                         staticSkipped++;
+                        ledgerStaticSkips += skipped + 1;
                         latestSeq = seq;
                         long nowSkip = Environment.TickCount64;
                         if (nowSkip - fpsTs >= 1000) { fps = fpsCount * 1000.0 / Math.Max(1, nowSkip - fpsTs); fpsTs = nowSkip; fpsCount = 0; }
@@ -1536,24 +1938,84 @@ static class Infer
             }
             else
             {
-                staticCount = 0;
+                staticCount = 0;      // 活跃：跟随全量帧，不节流
             }
+            lastRecognizeAt = nowTick;
+            FrameHub.SetLoad(isStatic);
+
+            // 高效利用硬件：走到这里的静止帧是「心跳帧」——只做小预算 OCR 维持最新文本，
+            // 跳过 YOLO / CLIP 场景 / 动漫脸等昂贵推理，避免静止画面空烧 GPU。
+            bool heartbeat = isStatic;
+            if (heartbeat) staticHeartbeats++;
+            int ocrBudget = heartbeat ? System.Math.Min(12, maxBoxes > 0 ? maxBoxes : 12) : maxBoxes;
 
             var t0 = Stopwatch.StartNew();
             try
             {
-                var res = PaddleOcr.RunStreaming(frame, w, h, maxBoxes);
+                // 高速档帧是半分辨率（用于连续性/变化检测）；识别需要全分辨率细节，这里补抓一次并本地化，
+                // 避免共享缓冲被采集线程覆盖。
+                int fullW = Gdi.ScreenW(), fullH = Gdi.ScreenH();
+                if (w != fullW || h != fullH)
+                {
+                    var (fb, fw2, fh2) = Gdi.Capture(0, 0, fullW, fullH);
+                    var local = new byte[fb.Length];
+                    Buffer.BlockCopy(fb, 0, local, 0, fb.Length);
+                    frame = local; w = fw2; h = fh2;
+                }
+                // ==== 高速识别：ROI 增量（det 是主要开销，只对变化区域跑）====
+                Dictionary<string, object> res = null;
+                List<Dictionary<string, object>> items;
+                int hits = 0, miss = 0;
+                UpdateTileScores(_prevFrame, frame, w, h);
+                int tileIdx = PickTile(Environment.TickCount64);
+                int tIdx = Math.Min(TileRows - 1, tileIdx / TileCols);
+                int tIdxX = tileIdx % TileCols;
+                int tw = Math.Max(1, w / TileCols), thh = Math.Max(1, h / TileRows);
+                var rr = new Rect { X = tIdxX * tw, Y = tIdx * thh, W = Math.Min(tw, w - tIdxX * tw), H = Math.Min(thh, h - tIdx * thh) };
+                const int tpad = 8;
+                rr.X = Math.Max(0, rr.X - tpad); rr.Y = Math.Max(0, rr.Y - tpad);
+                rr.W = Math.Min(w - rr.X, rr.W + tpad * 2);
+                rr.H = Math.Min(h - rr.Y, rr.H + tpad * 2);
+                {
+                    // 固定 320x320 输入：DirectML 对动态 shape 每帧重建 kernel，是当前最大的固定开销。
+                    // 统一尺寸后 kernel 复用，单帧成本显著下降。
+                    const int FIXW = 320, FIXH = 320;
+                    int cw = Math.Min(rr.W, FIXW), chh = Math.Min(rr.H, FIXH);
+                    var padded = new byte[FIXW * FIXH * 4];
+                    int srcStride = w * 4, dstStride = FIXW * 4;
+                    for (int yy = 0; yy < chh; yy++)
+                    {
+                        int sy = rr.Y + yy;
+                        if (sy < 0 || sy >= h) break;
+                        Buffer.BlockCopy(frame, sy * srcStride + rr.X * 4, padded, yy * dstStride, cw * 4);
+                    }
+                    bool skipDet = (frameNo % 10) != 0;     // 每 10 帧重检一次，其余帧只跑 rec（det 是大头）
+                    res = PaddleOcr.RunStreaming(padded, FIXW, FIXH, ocrBudget, skipDet);
+                    var subItems = (res.TryGetValue("items", out var iv2) && iv2 is List<Dictionary<string, object>> l2) ? l2 : new List<Dictionary<string, object>>();
+                    items = MergeItems(_prevItems, subItems, rr);   // 只替换该块区域内的框，其余沿用
+                    TileLastAt[tileIdx] = Environment.TickCount64;
+                    roiPartial++;
+                }
+                if (TileScore[tileIdx] == 0) roiReuse++;
+                if (++TileCursor >= TileScore.Length) TileCursor = 0;
+                TileRounds++;
+                if (res != null)
+                {
+                    hits = res.TryGetValue("recHits", out var hv) ? Convert.ToInt32(hv) : 0;
+                    miss = res.TryGetValue("recMiss", out var mv2) ? Convert.ToInt32(mv2) : 0;
+                }
+                // 保存本次全屏帧供下次差分（frame 可能是复用缓冲，必须拷贝）
+                if (_prevFrame == null || _prevW != w || _prevH != h) { _prevFrame = new byte[w * h * 4]; _prevW = w; _prevH = h; }
+                Buffer.BlockCopy(frame, 0, _prevFrame, 0, Math.Min(frame.Length, _prevFrame.Length));
+                _prevItems = items;
                 int ocrMs = (int)t0.ElapsedMilliseconds;
-                var items = (res.TryGetValue("items", out var iv) && iv is List<Dictionary<string, object>> list) ? list : new List<Dictionary<string, object>>();
                 var texts = items.Select(t => t.TryGetValue("text", out var tv) ? Convert.ToString(tv) : "").Where(t => !string.IsNullOrEmpty(t)).ToList();
                 string joined = string.Join(" | ", texts);
                 if (joined.Length > 1200) joined = joined.Substring(0, 1200);
-                int hits = res.TryGetValue("recHits", out var hv) ? Convert.ToInt32(hv) : 0;
-                int miss = res.TryGetValue("recMiss", out var mv2) ? Convert.ToInt32(mv2) : 0;
                 frameNo++;
                 string sceneTop = null; int sceneMs = 0; List<Dictionary<string, object>> sceneLabels = null;
                 bool ranScene = false;
-                if (sceneMode && ClipScene.IsReady && (frameNo == 1 || frameNo % sceneEvery == 0 || string.IsNullOrEmpty(latestScene)))
+                if ((!heartbeat || string.IsNullOrEmpty(latestScene)) && sceneMode && ClipScene.IsReady && (frameNo == 1 || frameNo % sceneEvery == 0 || string.IsNullOrEmpty(latestScene)))
                 {
                     try
                     {
@@ -1567,7 +2029,7 @@ static class Infer
                 }
                 List<Dictionary<string, object>> faces = null; int faceMs = 0;
                 bool ranFaces = false;
-                if (facesMode && (frameNo == 1 || frameNo % faceEvery == 0))
+                if (!heartbeat && facesMode && (frameNo == 1 || frameNo % faceEvery == 0))
                 {
                     try
                     {
@@ -1579,7 +2041,7 @@ static class Infer
                     catch { }
                 }
                 List<Dictionary<string, object>> objItems = null; int objMs = 0;
-                if (objects)
+                if (objects && !heartbeat)
                 {
                     try
                     {
@@ -1623,6 +2085,8 @@ static class Infer
                 lock (L)
                 {
                     seen += skipped + 1; processed++; dropped += Math.Max(0, skipped);
+                    ledgerBusySkips += Math.Max(0, skipped); recognizeCount++;
+                    if (recognizeStartTicks == 0) recognizeStartTicks = Environment.TickCount64;
                     totalOcrMs += ocrMs;
                     samples.Add(ocrMs); if (samples.Count > 200) samples.RemoveAt(0);
                     latestText = joined; latestSeq = seq; latestOcrMs = ocrMs; latestBoxes = items.Count;
@@ -1679,6 +2143,14 @@ static class Infer
             catch (Exception e) { lock (L) latestErr = e.Message; }
         }
     }
+}
+
+// ============ 预热状态（供 health 观测） ============
+static class WarmState
+{
+    public static volatile bool Warming;
+    public static volatile bool Done;
+    public static long OcrMs, YoloMs, FaceMs, ClipMs, CommandMs;
 }
 
 // ============ main ============
@@ -1858,6 +2330,45 @@ class Program
                     }
                     Win.MouseUp(0x0004); // 左键释放
                     return new { done = true };
+                }
+            case "topmost":
+                {
+                    // 浏览器被最大化窗口/置顶窗口遮挡时，临时把目标窗口抬到最上层，
+                    // 保证截图截到的是它，而不是盖在上面的其它窗口。
+                    long th = req.GetProperty("hwnd").GetInt64();
+                    bool on = !req.TryGetProperty("on", out var pon) || pon.GetBoolean();
+                    var hw = new IntPtr(th);
+                    bool ok = Win.SetWindowPos(hw, on ? Win.HWND_TOPMOST : Win.HWND_NOTOPMOST, 0, 0, 0, 0,
+                        Win.SWP_NOMOVE | Win.SWP_NOSIZE | Win.SWP_SHOWWINDOW);
+                    if (on)
+                    {
+                        Win.FocusWindow(th);
+                        Thread.Sleep(220);
+                    }
+                    return new { done = true, topmost = on, ok, hwnd = th };
+                }
+            case "frames_start":
+                {
+                    int fps = req.TryGetProperty("fps", out var pf) ? pf.GetInt32() : 60;
+                    if (fps < 1) fps = 1;
+                    if (fps > 240) fps = 240;
+                    int iv = Math.Max(4, (int)Math.Round(1000.0 / fps));
+                    FrameHub.TargetFps = fps;
+                    string lp = req.TryGetProperty("path", out var pp) ? pp.GetString() : null;
+                    if (!string.IsNullOrEmpty(lp)) FrameHub.OpenFrameLog(lp);
+                    FrameHub.ResetStats();
+                    FrameHub.SetInterval(iv);
+                    FrameHub.Acquire();
+                    return new { running = true, targetFps = fps, intervalMs = iv, logPath = lp ?? "" };
+                }
+            case "frames_stats":
+                return FrameHub.Stats();
+            case "frames_stop":
+                {
+                    var st = FrameHub.Stats();
+                    FrameHub.CloseFrameLog();
+                    FrameHub.Stop();
+                    return st;
                 }
             case "scroll":
                 {
@@ -2102,6 +2613,9 @@ class Program
                         privacyKeywords = Gdi.GetPrivacyKeywords(),
                         privacyRedactions = Gdi.PrivacyRedactedCount,
                         fgTitle = Win.ForegroundTitle(),
+                        warming = WarmState.Warming,
+                        warmDone = WarmState.Done,
+                        warmMs = new { ocr = WarmState.OcrMs, yolo = WarmState.YoloMs, face = WarmState.FaceMs, clip = WarmState.ClipMs, cmd = WarmState.CommandMs },
                         sessionId = Process.GetCurrentProcess().SessionId,
                     };
                 }
@@ -2160,8 +2674,10 @@ class Program
                     bool withFaces = req.TryGetProperty("animeface", out var paf) && paf.GetBoolean();
                     int sceneEvery = req.TryGetProperty("sceneEvery", out var pse) ? pse.GetInt32() : 8;
                     int faceEvery = req.TryGetProperty("faceEvery", out var pfe) ? pfe.GetInt32() : 4;
+                    bool fullRate = req.TryGetProperty("fullRate", out var pfr) && pfr.GetBoolean();
+                    Infer.SetFullRate(fullRate);
                     Infer.Start(boxes, withObjects, withScene, accurate, withFaces, sceneEvery, faceEvery);
-                    return new { running = true, maxBoxes = boxes, objects = withObjects, scene = withScene, accurate = accurate, animeface = withFaces, sceneEvery, faceEvery };
+                    return new { running = true, maxBoxes = boxes, objects = withObjects, scene = withScene, accurate = accurate, animeface = withFaces, sceneEvery, faceEvery, fullRate };
                 }
             case "infer_stop":
                 {
@@ -2232,7 +2748,48 @@ class Program
         var ht = new Thread(HotkeyThread) { IsBackground = true };
         ht.Start();
         // 后台预热 PaddleOCR 模型（DirectML/CPU 加载 ~1.6s），避免首次 ocr 调用冷启动
-        var warm = new Thread(() => { try { PaddleOcr.Warmup(); } catch { } }) { IsBackground = true };
+        // 全模型后台预热：让「第一次识别」也落在 2s 预算内（否则首次 scan 会撞冷启动 6~8s）。
+        try { Win.timeBeginPeriod(1); } catch { }   // 1ms 定时精度：60fps 采集的前提
+        var warm = new Thread(() =>
+        {
+            // Session0 说明没能桥接到用户桌面：这时跑全模型既看不见画面，又白占 ~2GB 内存，直接跳过。
+            if (SessionBridge.DegradedToSession0)
+            {
+                WarmState.Done = true;
+                WarmState.Warming = false;
+                return;
+            }
+            WarmState.Warming = true;
+            var sw = Stopwatch.StartNew();
+            try { PaddleOcr.Warmup(); } catch { }
+            WarmState.OcrMs = sw.ElapsedMilliseconds; sw.Restart();
+            try { YoloDetect.Warmup(); } catch { }
+            WarmState.YoloMs = sw.ElapsedMilliseconds; sw.Restart();
+            try { AnimeFaceDetect.Warmup(); } catch { }
+            WarmState.FaceMs = sw.ElapsedMilliseconds; sw.Restart();
+            try { ClipScene.Warmup(); } catch { }
+            WarmState.ClipMs = sw.ElapsedMilliseconds;
+            sw.Restart();
+            // 命令级预热：把每条识别路径的首次 JIT / 输入尺寸重建 / 内存分配都提前吃掉，
+            // 否则"第一次 scan / locate"仍会超 2s（实测 1.7~5.5s），第二次才 100~400ms。
+            try
+            {
+                int sw2 = Gdi.ScreenW(), sh2 = Gdi.ScreenH();
+                var (buf, bw, bh) = Gdi.Capture(0, 0, sw2, sh2);
+                try { Ocr.Run(buf, bw, bh, 1.0); } catch { }
+                try { Ocr.Run(buf, bw, bh, 0.7); } catch { }
+                try { YoloDetect.Run(buf, bw, bh, false); } catch { }
+                try { AnimeFaceDetect.Run(buf, bw, bh); } catch { }
+                try { ClipScene.Run(buf, bw, bh, 3); } catch { }
+                var (buf2, bw2, bh2) = Gdi.Capture(0, 0, Math.Min(1200, sw2), Math.Min(800, sh2));
+                try { Ocr.Run(buf2, bw2, bh2, 1.0); } catch { }
+                try { Uia.Run(0); } catch { }
+            }
+            catch { }
+            WarmState.CommandMs = sw.ElapsedMilliseconds;
+            WarmState.Warming = false;
+            WarmState.Done = true;
+        }) { IsBackground = true };
         warm.Start();
         Event("ready");
 

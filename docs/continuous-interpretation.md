@@ -574,3 +574,53 @@ while infer: {mode:"infer", holds:1} → after stop: {mode:null, holds:0}  ← h
    - 修复 `helperCall` 中 `{ id, cmd, ...args }` 被 `args.id` 覆盖导致 `saperm_char_ignore` 超时的协议缺陷。
    - 注册表/未知库/备注库支持基于文件 `mtime` 自动热重载，`char_rename` / `char_delete` 自动同步备注。
 5. **投产回归套件 `tests/prod-readiness.mjs`（16/16 全绿）+ `tests/char-multi.mjs`（26/26 全绿）**。
+
+
+---
+
+## 25. AI 可读数据流 + 硬件效率（2026-10-31）
+
+### 目标
+把「图片流」实时压成 AI 能直接读的**紧凑文本行**，落盘为日志，并提供低成本读取接口；
+同时让"屏幕没变"时几乎不烧 CPU/GPU。
+
+### 数据流（stream）
+- 每帧识别结果压成一行（实测 **111~117 字节/行**，对比 `saperm_infer_status` 全量 JSON **2574 字节/帧** → 约 **22× 压缩**）：
+  ```
+  19:14:29 #151 W=SA 注意力 SC=视觉小说界面 OB=人(DeepSeek娘)×2 F=2 TX== CH=窗口切换 -> ... 1.9fps 277ms
+  ```
+  - `W=` 前台窗口 / `SC=` 场景 / `OB=` 物体(含角色身份) / `F=` 动漫脸 / `CH=` 变化事件
+  - `TX=` 文本摘要，**增量语义**：`=`(与上帧相同) / `+…`(尾部新增) / 全文(其它情况)
+  - **CH 去重**：与上一行相同的变化事件不再重复携带
+- 落盘：`out/logs/stream-YYYY-MM-DD.jsonl`（逐行 JSON）+ `out/logs/stream-latest.txt`（滚动最近 200 行，AI 可直接 read）
+- 工具：`saperm_stream {limit,sinceSeq,format:lines|json,file}`、`saperm_stream_start/stop`
+  - `sinceSeq` 支持增量拉取；`file:true` 返回 latest.txt 路径
+
+### 硬件效率（实测同一 worker 单核百分比）
+| 项 | 优化前 | 优化后 |
+|---|---|---|
+| 静止 CPU | 21.7% | **10.0%** |
+| 活跃 CPU（全模型） | ~89% | 95.8%（把算力花在真有变化时） |
+| 静止日志量 | 每帧一行 | 21 次采样仅落 3~4 行（`idleSkips` 记录节流数） |
+
+实现要点：
+1. **心跳零推理**：静止帧不再跑 YOLO/CLIP/人脸，仅每 6 次心跳（≈6s）刷新一次小预算 OCR（`staticHeartbeats` 计数）。
+2. **采集自适应**：静止 ≥3s 时 FrameHub 采集从 100ms 降到 220ms；一旦有变化立刻回到 100ms；watch/小窗打开时恒为 100ms（保流畅）。
+3. **worker 单实例互斥**：`Local\\SaHelperWorker_S{sessionId}` Mutex，重复 bridge 拉起的 worker 立即退出，杜绝多实例各自加载 ONNX 叠加 CPU/内存（曾实测出现 2 个 worker、各自 ~0.9/1.3GB）。
+4. **流静止节流**：内容实质未变时每 5s 才落一行心跳。
+
+
+### 25.1 闭环自测（操作 → 识别，2026-10-31）
+
+全流程仅用插件自身能力完成（无外部 shell 干预）：
+
+| 步骤 | 手段 | 识别侧记录 |
+|---|---|---|
+| 打开运行框 | `saperm_hotkey(["WIN","R"])` | `CH=窗口切换 -> 运行` |
+| 输入并执行 | `saperm_type("notepad")` + `ENTER` | `CH=窗口切换 -> 记事本` → `-> 无标题 - Notepad` |
+| 聚焦并输入 | `saperm_click(600,520)` + `saperm_type(中文)` | OCR 回读 **`屏幕闭环自测中文验证`**（一字不差） |
+| 关闭 | `saperm_hotkey(["ALT","F4"])` | 窗口消失 |
+
+两个真实缺陷被发现并修复：
+1. **组合键无效**：`Hotkey()` 原先一次性发送所有 INPUT（同一时间戳），Notepad 等应用不响应 Alt+F4。改为**分段发送 + 28/38/22ms 帧间延迟**后生效。
+2. **OCR 等宽小字退化**：记事本极窄等宽字体下 `DSH 2026 AB12` 被识别成 `2222222`（scale=1/2/3 均无效，非分辨率问题）；中文与常规 UI 文本识别正常。这是 PaddleOCR rec 在窄字形上的已知局限。
