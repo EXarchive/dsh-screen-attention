@@ -27,3 +27,4 @@ helper/models/chinese-clip-large/image_encoder.onnx
 helper/models/yolov8m.onnx
 *.pt
 *.bin
+.commitmsg.txt
