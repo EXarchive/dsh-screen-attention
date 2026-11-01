@@ -1,6 +1,6 @@
 {
   "name": "dsh-screen-attention-perm",
-  "version": "1.0.0",
+  "version": "1.1.1",
   "description": "DSH 屏幕注意力插件 · 权限模块：会话级输入授权（L2）、高危逐次审批（L3）、急停锁、恢复需用户确认。全部走 DSH 原生 tools/pre-execute ask 审批链并自动审计。",
   "type": "module",
   "main": "lib/index.js",

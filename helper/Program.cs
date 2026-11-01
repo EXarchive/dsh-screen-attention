@@ -419,15 +419,17 @@ static class Win
         a[0].type = 0; a[0].mi.dx = dx; a[0].mi.dy = dy; a[0].mi.flags = 0x8001; // ABSOLUTE|MOVE
         Send(a);
     }
-    public static void MouseButton(uint down, uint up, int clicks = 1)
+    // holdMs：按下与抬起之间的保持时间。0 → 使用默认 25ms（真实点击约 80~120ms，过快会被 DirectInput 类应用忽略）
+    public static void MouseButton(uint down, uint up, int clicks = 1, int holdMs = 0)
     {
-        var a = new INPUT[clicks * 2];
+        int hold = holdMs > 0 ? Math.Min(holdMs, 10000) : 25;
         for (int i = 0; i < clicks; i++)
         {
-            a[i * 2].type = 0; a[i * 2].mi.flags = down;
-            a[i * 2 + 1].type = 0; a[i * 2 + 1].mi.flags = up;
+            MouseDown(down);
+            Thread.Sleep(hold);
+            MouseUp(up);
+            if (clicks > 1 && i < clicks - 1) Thread.Sleep(30);
         }
-        Send(a);
     }
     // 单次按下/释放：拖拽用，避免 MouseButton 成对 down+up 造成双击
     public static void MouseDown(uint flags)
@@ -458,12 +460,25 @@ static class Win
         }
         Send(a);
     }
-    public static void KeyPress(ushort vk)
+    public static void KeyDown(ushort vk)
     {
-        var a = new INPUT[2];
+        var a = new INPUT[1];
         a[0].type = 1; a[0].ki.vk = vk;
-        a[1].type = 1; a[1].ki.vk = vk; a[1].ki.flags = 0x0002;
         Send(a);
+    }
+    public static void KeyUp(ushort vk)
+    {
+        var a = new INPUT[1];
+        a[0].type = 1; a[0].ki.vk = vk; a[0].ki.flags = 0x0002;
+        Send(a);
+    }
+    // holdMs>0 时按住不放，用于长按（游戏移动、连续输入、长按菜单）
+    public static void KeyPress(ushort vk, int holdMs = 0)
+    {
+        KeyDown(vk);
+        if (holdMs > 0) Thread.Sleep(Math.Min(holdMs, 10000));
+        else Thread.Sleep(12);
+        KeyUp(vk);
     }
 
     public static string ForegroundTitle()
@@ -2284,7 +2299,10 @@ class Program
                     Win.SetCursorPos(x, y);
                     uint down = button == "right" ? 0x0008u : button == "middle" ? 0x0020u : 0x0002u;
                     uint up = button == "right" ? 0x0010u : button == "middle" ? 0x0040u : 0x0004u;
-                    Win.MouseButton(down, up);
+                    int holdMs = req.TryGetProperty("holdMs", out var phm) ? phm.GetInt32() : 0;
+                    var swc = System.Diagnostics.Stopwatch.StartNew();
+                    Win.MouseButton(down, up, 1, holdMs);
+                    long clickMs = swc.ElapsedMilliseconds;
                     Thread.Sleep(90);
                     var (afterBuf, _, _) = Gdi.Capture(px, py, 96, 64);
                     int diffPixels = 0, totalPixels = Math.Max(1, pw * ph);
@@ -2296,7 +2314,39 @@ class Program
                             diffPixels++;
                     }
                     double diffRatio = (double)diffPixels / totalPixels;
-                    return new { done = true, x, y, verified = diffRatio >= 0.005, diffRatio = Math.Round(diffRatio, 4) };
+                    return new { done = true, x, y, holdMs = holdMs > 0 ? holdMs : 25, clickMs, verified = diffRatio >= 0.005, diffRatio = Math.Round(diffRatio, 4) };
+                }
+            case "press":
+                {
+                    // 长按：target=mouse（默认）或 key。按下 → 保持 holdMs → 抬起。
+                    GuardInject();
+                    string target = req.TryGetProperty("target", out var ptg) ? ptg.GetString() : "mouse";
+                    int hold = req.TryGetProperty("holdMs", out var ph) ? ph.GetInt32() : 500;
+                    hold = Math.Clamp(hold, 10, 10000);
+                    var swp = System.Diagnostics.Stopwatch.StartNew();
+                    if (target == "key")
+                    {
+                        string kname = req.GetProperty("key").GetString();
+                        ushort vk = Win.VkOf(kname);
+                        Win.KeyDown(vk);
+                        Thread.Sleep(hold);
+                        Win.KeyUp(vk);
+                        swp.Stop();
+                        return new { done = true, target, key = kname, holdMs = hold, elapsedMs = swp.ElapsedMilliseconds };
+                    }
+                    int mx = req.GetProperty("x").GetInt32(), my = req.GetProperty("y").GetInt32();
+                    string btn = req.TryGetProperty("button", out var pb) ? pb.GetString() : "left";
+                    int sw2 = Gdi.ScreenW(), sh2 = Gdi.ScreenH();
+                    mx = Math.Max(0, Math.Min(sw2 - 1, mx)); my = Math.Max(0, Math.Min(sh2 - 1, my));
+                    Win.SetCursorPos(mx, my);
+                    Thread.Sleep(30);
+                    uint mdown = btn == "right" ? 0x0008u : btn == "middle" ? 0x0020u : 0x0002u;
+                    uint mup = btn == "right" ? 0x0010u : btn == "middle" ? 0x0040u : 0x0004u;
+                    Win.MouseDown(mdown);
+                    Thread.Sleep(hold);
+                    Win.MouseUp(mup);
+                    swp.Stop();
+                    return new { done = true, target = "mouse", x = mx, y = my, button = btn, holdMs = hold, elapsedMs = swp.ElapsedMilliseconds };
                 }
             case "doubleclick":
                 {

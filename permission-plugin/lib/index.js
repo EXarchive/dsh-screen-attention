@@ -1,5 +1,5 @@
 // dsh-screen-attention-perm v0.2
-// 权限模块：L2 会话级输入授权 / L3 高危逐次审批 / 急停锁 / 恢复需用户确认。
+// 权限模块：L2/L3 均会话级一次性授权（L3 独立于 L2）/ 急停锁 / 恢复需用户确认。
 // 门控全部走 DSH 原生审批链（tools/pre-execute ask）；注入执行接 SaHelper 进程。
 // 审计对 approval/asked + approval/decided 由框架自动落会话日志。
 
@@ -318,6 +318,7 @@ export function sanitizeJson(v) {
 export function apply(ctx) {
   const state = {
     l2: new Map(),
+  l3: new Map(),
     pending: new Map(),
     paused: false,
     pausedBy: null,
@@ -886,6 +887,7 @@ export function apply(ctx) {
     state.approvalPolicy = policy
     if (policy === 'never') {
       if (INPUT_TOOLS.includes(exec.name)) state.l2.set(agentId, 'granted')
+      if (L3_TOOLS.includes(exec.name)) state.l3.set(agentId, 'granted')
       if (INPUT_TOOLS.includes(exec.name) || exec.name === 'saperm_resume') {
         try { appendObservationLog({ type: 'auto_grant', tool: exec.name, policy }) } catch {}
       }
@@ -895,7 +897,10 @@ export function apply(ctx) {
       return { kind: 'ask', reason: '恢复输入注入需要用户明确确认（AI 不能自行解除急停）' }
     }
     if (L3_TOOLS.includes(exec.name)) {
-      return { kind: 'ask', reason: '高危动作（拖拽/连击），每次执行单独审批' }
+      // L3 高危：本会话首次审批一次，通过后本会话内免审（与 L2 授权相互独立，L2 通过不连带放开 L3）
+      if (state.l3.get(agentId) === 'granted') return next()
+      state.pending.set(agentId, true)
+      return { kind: 'ask', reason: '高危动作（拖拽/双击）：批准本次执行并授权本会话内后续高危操作（急停 saperm_stop 仍可随时锁定）' }
     }
     if (L2_TOOLS.includes(exec.name)) {
       const g = state.l2.get(agentId)
@@ -918,18 +923,21 @@ export function apply(ctx) {
   ctx.on('tools/result', (exec, result) => {
     if (exec.agent === undefined) return
     const agentId = exec.agent.id
-    if (L2_TOOLS.includes(exec.name) && state.pending.get(agentId)) {
+    if ((L2_TOOLS.includes(exec.name) || L3_TOOLS.includes(exec.name)) && state.pending.get(agentId)) {
+      const isL3 = L3_TOOLS.includes(exec.name)
+      const bucket = isL3 ? state.l3 : state.l2
+      const tag = isL3 ? 'L3' : 'L2'
       state.pending.delete(agentId)
       if (result.isError === false) {
-        state.l2.set(agentId, 'granted')
-        console.log('[sa-perm] L2 会话级授权已授予 agent=' + agentId)
+        bucket.set(agentId, 'granted')
+        console.log('[sa-perm] ' + tag + ' 会话级授权已授予 agent=' + agentId)
       } else if (isApprovalRejection(result)) {
         // 仅做可观测标记，不再永久封锁（下一次调用会重新审批）
-        state.l2.set(agentId, 'denied')
+        bucket.set(agentId, 'denied')
         console.log('[sa-perm] 审批被拒（下次调用会重新发起审批）agent=' + agentId)
       } else {
-        state.l2.delete(agentId)
-        console.log('[sa-perm] L2 执行期错误（保持未决，可重试）agent=' + agentId + ': ' + String((result && (result.error || result.message)) || '').slice(0, 120))
+        bucket.delete(agentId)
+        console.log('[sa-perm] ' + tag + ' 执行期错误（保持未决，可重试）agent=' + agentId + ': ' + String((result && (result.error || result.message)) || '').slice(0, 120))
       }
     }
   })
@@ -963,11 +971,14 @@ export function apply(ctx) {
     execute: async () => {
       const l2 = {}
       for (const k of state.l2.keys()) l2[k] = state.l2.get(k)
+      const l3 = {}
+      for (const k of state.l3.keys()) l3[k] = state.l3.get(k)
       return {
         paused: state.paused,
         pausedBy: state.pausedBy,
         approvalPolicy: state.approvalPolicy || null,
         l2ByAgent: l2,
+        l3ByAgent: l3,
         interruptProtect: state.interruptProtect,
         observeTask: state.observeTask ? { startedAt: state.observeTask.startedAt, seconds: state.observeTask.seconds, elapsedMs: Date.now() - state.observeTask.startedAt } : null,
         injection: { interpret: injectSummary(state.interpretInject), infer: injectSummary(state.inferInject) },
@@ -1401,11 +1412,50 @@ export function apply(ctx) {
 
   register({
     name: 'saperm_click',
-    description: '点击屏幕坐标（L2 普通输入：本会话首次调用需用户授权，之后免审；真实鼠标注入）',
-    parameters: point(),
+    description: '点击屏幕坐标（L2 普通输入：本会话首次调用需用户授权，之后免审）。holdMs 可控制按住时长（默认 25ms，长按菜单/拖拽起点用）',
+    parameters: {
+      type: 'object',
+      properties: {
+        x: { type: 'integer', description: '屏幕 x 坐标' },
+        y: { type: 'integer', description: '屏幕 y 坐标' },
+        button: { type: 'string', description: 'left（默认）| right | middle' },
+        holdMs: { type: 'integer', description: '按下到抬起的保持时间（默认 25，范围 0~10000）' },
+      },
+      required: ['x', 'y'],
+    },
     execute: async (args) => {
-      await helperCall('click', { x: args.x, y: args.y })
-      return { injected: true, helper: true, x: args.x, y: args.y }
+      const r = await helperCall('click', { x: args.x, y: args.y, button: args.button || 'left', holdMs: clampInt(args.holdMs, 0, 0, 10000) })
+      return { injected: true, helper: true, x: args.x, y: args.y, button: args.button || 'left', holdMs: (r && r.holdMs) ?? 25, clickMs: (r && r.clickMs) ?? null, verified: (r && r.verified) ?? null }
+    },
+  })
+
+  register({
+    name: 'saperm_press',
+    description: '长按（按住不放）：target=mouse 长按鼠标按钮，target=key 长按按键（游戏移动/连续输入/长按菜单）。holdMs 默认 500，范围 10~10000。L2 输入，会话级授权',
+    parameters: {
+      type: 'object',
+      properties: {
+        target: { type: 'string', description: 'mouse（默认）| key' },
+        holdMs: { type: 'integer', description: '按住时长毫秒（默认 500，范围 10~10000）' },
+        x: { type: 'integer', description: 'target=mouse 时必填：屏幕 x' },
+        y: { type: 'integer', description: 'target=mouse 时必填：屏幕 y' },
+        button: { type: 'string', description: 'left（默认）| right | middle' },
+        key: { type: 'string', description: 'target=key 时必填：按键名，如 SHIFT / A / F5 / LEFT' },
+      },
+    },
+    execute: async (args) => {
+      const target = String(args.target || 'mouse')
+      const holdMs = clampInt(args.holdMs, 500, 10, 10000)
+      if (target === 'key') {
+        const key = String(args.key || 'SHIFT')
+        const r = await helperCall('press', { target: 'key', key, holdMs })
+        return { injected: true, helper: true, target: 'key', key, holdMs, elapsedMs: (r && r.elapsedMs) ?? null }
+      }
+      const x = Number(args.x), y = Number(args.y)
+      if (!Number.isFinite(x) || !Number.isFinite(y)) throw new Error('target=mouse 需要 x 与 y 坐标')
+      const button = String(args.button || 'left')
+      const r2 = await helperCall('press', { target: 'mouse', x, y, button, holdMs })
+      return { injected: true, helper: true, target: 'mouse', x, y, button, holdMs, elapsedMs: (r2 && r2.elapsedMs) ?? null }
     },
   })
 
@@ -1462,7 +1512,7 @@ export function apply(ctx) {
 
   register({
     name: 'saperm_drag',
-    description: '从 (x1,y1) 拖拽到 (x2,y2)（L3 高危：每次执行单独审批）',
+    description: '从 (x1,y1) 拖拽到 (x2,y2)（L3 高危：本会话首次需授权，之后免审）',
     parameters: {
       type: 'object',
       properties: {
@@ -1479,7 +1529,7 @@ export function apply(ctx) {
 
   register({
     name: 'saperm_doubleclick',
-    description: '双击屏幕坐标（L3 高危：每次执行单独审批）',
+    description: '双击屏幕坐标（L3 高危：本会话首次需授权，之后免审）',
     parameters: point(),
     execute: async (args) => {
       await helperCall('doubleclick', { x: args.x, y: args.y })
@@ -2406,6 +2456,8 @@ export function apply(ctx) {
       return {
         helper: { online: !!helperSingleton.online, pid: helperSingleton.pid || null, sessionId: (h && typeof h.sessionId === 'number') ? h.sessionId : null },
         paused: !!state.paused,
+        l3: Array.from(state.l3.entries()).map(([agent, st]) => ({ agent, status: st })),
+        l2: Array.from(state.l2.entries()).map(([agent, st]) => ({ agent, status: st })),
         overlayOpen: !!state.overlayOpen,
         autoCleanupTtlMs: state.obsTtlMs || 0,
         observation: { mode: state.obsMode || null, holds: Number(observationHolds) || 0, overlayOpen: !!state.overlayOpen, autoCleanupTtlMs: state.obsTtlMs || 0 },

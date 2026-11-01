@@ -1,5 +1,27 @@
 # Changelog (dsh-screen-attention)
 
+## v1.1.1 (2026-11-01) — L3 一次性审批 / 长按输入
+
+### 新增
+- **`saperm_press`（长按）**：`target=mouse` 按住鼠标按钮、`target=key` 按住按键，`holdMs` 默认 500（10~10000）。用于长按菜单、游戏移动、连续输入、拖拽起点。helper 新增 `press` 命令与 `KeyDown`/`KeyUp` 分离原语。
+- **`saperm_click` 支持 `holdMs`**：按下到抬起的保持时间（默认 25ms，范围 0~10000），返回 `clickMs` 实测按住耗时。
+
+### 变更
+- **L3 高危操作改为一次性审批**：`saperm_drag` / `saperm_doubleclick` 由「每次执行单独审批」改为「本会话首次审批一次，通过后免审」。
+  - L3 授权独立存储（`state.l3`），**与 L2 授权解耦**：批准普通点击不会连带放开拖拽/双击，反之亦然。
+  - 仅在执行成功时授予；审批被拒记 `denied`（下次重新发起），执行期错误保持未决。
+  - 全局 `never` 策略下同时点亮 L2 与 L3 并留审计。
+  - `saperm_status` 新增 `l3ByAgent`、`saperm_health` 新增 `l2`/`l3` 观测字段。
+  - 急停（`saperm_stop`）仍在所有审批之前拦截，恢复仍需用户确认。
+
+### 修复
+- 鼠标 `MouseButton` 原先把 down/up 放在同一批 `SendInput` 内（间隔≈0μs），过快会被 DirectInput 类应用忽略；改为分段发送并保证最小按住时长 25ms。
+- 键盘 `KeyPress` 同样瞬时完成，改为 `KeyDown` → 12ms → `KeyUp`（`holdMs` 可覆盖）。
+
+### 实测
+- `click holdMs=400` → `clickMs=404`；默认点击 → `29ms`；`press key SHIFT holdMs=300` → `elapsedMs=302`。
+- L3 连续调用：`doubleclick` → `granted` → 第二次 `doubleclick` 免审 → `drag` 复用同一 L3 授权，三次全部 `injected=true`。
+
 ## v1.1.0 (2026-10-31) — AI 可读数据流 / 帧账本 / 高速识别
 
 ### 新增
