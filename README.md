@@ -1,5 +1,11 @@
 # dsh-screen-attention (屏幕感知与智能注意力插件)
 
+[![Release](https://img.shields.io/github/v/release/EXarchive/dsh-screen-attention?label=release)](https://github.com/EXarchive/dsh-screen-attention/releases)
+[![Platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-0078d4)](#)
+[![.NET](https://img.shields.io/badge/.NET-9.0-512bd4)](#)
+[![Node](https://img.shields.io/badge/Node.js-%E2%89%A5%2020-339933)](#)
+[![License](https://img.shields.io/badge/license-see%20repo-lightgrey)](#)
+
 > DeepSeek Harness (DSH) 原生屏幕持续感知、ACG 角色识别与自动化操作插件。
 > 架构设计：Node.js DSH 插件门控（60+ 工具） + C# .NET 9 高性能原生推理辅助进程（SaHelper）。
 
@@ -79,6 +85,22 @@ dsh-screen-attention/
 ---
 
 ## 三、快速开始
+
+### 0. 安装插件
+```powershell
+dsh plugin add dsh-screen-attention
+```
+开发模式可在 profile 的 `cordis.patch.yml` 中指向本地 `permission-plugin` 目录；`patchReload: live` 支持热加载（需对 yml 做出真实内容变更才会触发重载）。
+
+### 0.5 准备模型
+`helper/models/` 下超过 50MB 的权重未纳入仓库（GitHub 单文件限制），需自行放置：
+
+| 文件 | 大小 | 用途 |
+|---|---|---|
+| `helper/models/chinese-clip*/image_encoder.onnx` | ~1.16 GB | CLIP 场景分类 / 角色特征嵌入 |
+| `helper/models/yolov8m.onnx` | ~50 MB | 精确物体检测（`saperm_detect model=m`） |
+
+PP-OCRv4 det/rec、YOLOv8n、动漫脸检测模型已随仓库提供。
 
 ### 1. 编译 C# Helper
 ```powershell
