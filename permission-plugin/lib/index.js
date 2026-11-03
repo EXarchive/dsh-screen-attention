@@ -16,7 +16,7 @@ const HELPER_EXE =
   process.env.SA_HELPER_EXE ||
   join(PACKAGE_ROOT, '..', 'helper', 'bin', 'Release', 'net9.0-windows10.0.19041.0', 'SaHelper.exe')
 
-const L2_TOOLS = ['saperm_click', 'saperm_scroll', 'saperm_type', 'saperm_hotkey', 'saperm_clipboard', 'saperm_focus', 'saperm_excel_goto', 'saperm_excel_write', 'saperm_excel_read', 'saperm_fill_write']
+const L2_TOOLS = ['saperm_press', 'saperm_click', 'saperm_scroll', 'saperm_type', 'saperm_hotkey', 'saperm_clipboard', 'saperm_focus', 'saperm_excel_goto', 'saperm_excel_write', 'saperm_excel_read', 'saperm_fill_write']
 const L3_TOOLS = ['saperm_drag', 'saperm_doubleclick']
 const INPUT_TOOLS = [...L2_TOOLS, ...L3_TOOLS]
 
