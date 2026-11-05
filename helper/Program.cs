@@ -906,6 +906,32 @@ static class Overlay
         form = null; bar = null;
     }
 
+    /// <summary>运行时改小窗尺寸（手机竖屏画面用竖窗，画面才不被压成细条）。</summary>
+    public static bool Resize(int w, int h, int aspect = 0)
+    {
+        var f = form;
+        if (f == null) return false;
+        try
+        {
+            f.Invoke(new Action(() =>
+            {
+                try
+                {
+                    var b = f.Bounds;
+                    // 保持左上角不动；贴住屏幕右/下边时改为反向扩展，避免跑出屏幕
+                    int x = b.X, y = b.Y;
+                    var scr = Screen.FromControl(f).WorkingArea;
+                    if (x + w > scr.Right) x = Math.Max(scr.Left, scr.Right - w);
+                    if (y + h > scr.Bottom) y = Math.Max(scr.Top, scr.Bottom - h);
+                    f.Bounds = new Rectangle(x, y, w, h);
+                }
+                catch { }
+            }));
+            return true;
+        }
+        catch { return false; }
+    }
+
     // UI 线程：绘制最新帧 + 注意力标注 + 底部信息条
     static void PaintFrame(Graphics g, Size client)
     {
@@ -2235,6 +2261,20 @@ class Program
             case "ping": return new { pong = true };
             case "screen_bounds": return new { x = 0, y = 0, w = Gdi.ScreenW(), h = Gdi.ScreenH() };
             case "windows": return new { windows = Win.ListWindows() };
+            case "audio_level":
+                {
+                    int ms = req.TryGetProperty("ms", out var pms2) ? pms2.GetInt32() : 600;
+                    var lv = AudioCapture.Measure(Math.Clamp(ms, 80, 5000));
+                    return new
+                    {
+                        ok = lv.Ok, error = lv.Error,
+                        deviceId = lv.DeviceId,
+                        rms = Math.Round(lv.Rms, 4), peak = Math.Round(lv.Peak, 4),
+                        db = Math.Round(lv.Db, 1), zcr = Math.Round(lv.Zcr, 4),
+                        silent = lv.Silent, voice = lv.SoundsLikeVoice,
+                        samples = lv.Samples, channels = lv.Channels, sampleRate = lv.SampleRate,
+                    };
+                }
             case "idle": return new { idleMs = Win.IdleMs() };
 
             case "screenshot":
@@ -2286,9 +2326,20 @@ class Program
 
                     // 先按目标帧数算格子尺寸（用最大帧数定格子，实际帧少时格子不会被撑大）
                     int cols = frames <= 1 ? 1 : frames == 2 ? 2 : frames <= 4 ? 2 : frames <= 6 ? 3 : 4;
+                    // 手机适配：竖屏画面（9:16）按横屏排法会把画布撑成好几千像素高，字反而更糊。
+                    // 改成一行并肩铺开 —— 总高就是单格高度，对比也更直观。
+                    bool portrait = (double)sh2 / sw2 > 1.2;
+                    if (portrait && frames >= 3) cols = frames;
                     int rowsMax = (int)Math.Ceiling((double)frames / cols);
                     int cellW = Math.Max(1, (maxW - gap * (cols - 1)) / cols);
                     int cellH = Math.Max(1, (int)Math.Round(cellW * (double)sh2 / sw2));
+                    // 兜底：总高超过 maxH 就缩格子（竖屏极端比例保护）
+                    int maxH = Math.Clamp(req.TryGetProperty("maxH", out var pmh2) ? pmh2.GetInt32() : 1600, 200, 4000);
+                    if (cellH * rowsMax > maxH)
+                    {
+                        cellH = Math.Max(1, maxH / rowsMax);
+                        cellW = Math.Max(1, (int)Math.Round(cellH * (double)sw2 / sh2));
+                    }
                     double fscale = (double)cellW / sw2;
 
                     var picked = new List<(byte[] buf, int w, int h, int at, double score)>();
@@ -2602,6 +2653,14 @@ class Program
                     Overlay.Open(x, y, w, h);
                     bool visible = Overlay.WaitReady(3000);
                     return new { open = true, visible, rect = new { x, y, w, h } };
+                }
+            case "overlay_resize":
+                {
+                    int nw = Math.Clamp(req.TryGetProperty("w", out var pw2) ? pw2.GetInt32() : 480, 120, 2000);
+                    int nh = Math.Clamp(req.TryGetProperty("h", out var ph2) ? ph2.GetInt32() : 270, 120, 2000);
+                    int force = req.TryGetProperty("aspect", out var pas) ? pas.GetInt32() : 0;  // 1=横 2=竖 3=方
+                    bool ok2 = Overlay.Resize(nw, nh, force);
+                    return new { resized = ok2, w = nw, h = nh, aspect = force == 1 ? "landscape" : force == 2 ? "portrait" : force == 3 ? "square" : "custom" };
                 }
             case "overlay_close": Overlay.Close(); return new { open = false };
             case "overlay_set":
