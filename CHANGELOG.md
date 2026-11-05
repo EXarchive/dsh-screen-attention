@@ -1,5 +1,44 @@
 # Changelog (dsh-screen-attention)
 
+## v1.10.5 (2026-11-05) — 注入链路的第五道闸门：注入器本身在 throw
+
+### 决定性证据（diag 探针）
+在 `onHelperEvent` 第一行写独立文件，绕过 `appendObservationLog`：
+```text
+15:25:46 kind=change link=true idx=25
+15:25:49 kind=change link=true idx=26
+15:25:52 kind=change link=true idx=27
+```
+**事件确实到达、`link` 确实为 true** —— 前面四道闸门都已拆掉。
+
+### 第五道闸门：`injectToSession` 抛错被吞
+```js
+} catch (e) {
+  console.log('[sa-perm] 注入失败: ' + ...)   // 只打控制台，不留痕
+}
+```
+抛的是什么：**`ctx.agents` 访问失败**——插件的 `inject` 只声明了 `['tools']`，
+而 Cordis 对未 inject 的服务会直接抛 `cannot get property "agents" without inject`。
+
+**这条仓库 docs/RETROSPECTIVE.md 的经验 16 早就写过**，我改注入器时没回头看。
+
+### 本轮改动
+1. `export const inject = ['tools', 'agents']` ← **关键**
+2. catch 不再吞异常，写 `inject-skip/inject-throw`
+3. **去掉 `watch_snapshot` 依赖**：事件已带 `ratio`/`rect`，快照只补 OCR 文本，
+   而它在这条回调链里会挂住（RPC 从 stdout reader 回调发起，响应回不来）
+4. `screenshot` 改抓**变化区域**（非全屏）+ 1.5s 超时，拿不到图也继续注入文字
+5. `onHelperEvent` 改 async（去掉外层 `.then` 后 `await` 需要它）
+
+### 状态
+**以上 5 项均未通过热加载验证**：`inject` 是模块级声明，热加载改不动它。
+需要重启 DSH 才能验证。验证判据：
+```text
+开 watch_link → 制造变化 → 读 jsonl 尾部
+看到 type: "inject"            → 链路彻底闭合
+看到 inject-skip/inject-throw  → catch 里会带出真实异常信息
+```
+
 ## v1.10.4 (2026-11-05) — 注入链路的第三、四道闸门
 
 重启后事件通道已完全正常（日志 15:10 实测），注入了三道闸门，逐层拆掉：

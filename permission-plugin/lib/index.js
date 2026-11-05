@@ -9,7 +9,7 @@ import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 export const name = 'dsh-screen-attention-perm'
-export const inject = ['tools']
+export const inject = ['tools', 'agents']
 
 const PACKAGE_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..')
 const HELPER_EXE =
@@ -498,7 +498,7 @@ export function apply(ctx) {
     }
   }
 
-  const onHelperEvent = (kind, data) => {
+  const onHelperEvent = async (kind, data) => {
     if (kind === 'hotkey' && data && typeof data.locked === 'boolean') {
       state.paused = data.locked
       state.pausedBy = data.locked ? 'hotkey' : null
@@ -514,26 +514,26 @@ export function apply(ctx) {
       // 于是每条事件都被判成 no-motion-no-text 丢弃（实测踩过）。
       const evRatio = Number(data && data.ratio) || 0
       const evRect = (data && data.rect) || {}
-      helperCall('watch_snapshot').then(async (snap) => {
-        const text = String((snap && snap.text) || '').trim()
-        const added = String((snap && snap.added) || '').trim()
-        // 事件本身已由 helper 的 m 判定（含 windowSum>=12 细粒度累计），此处不再二次判 ratio ——
-        // 细粒度变化时 ratio 可能接近 0，再做 evRatio<=0 会把它们全丢掉（实测踩过）。
-        // 刷屏由下面的 1.2s 节流 + 30 次/分钟配额控制。
-        const body = '[屏幕变化通知] 屏幕运动区域 (' + (evRect.x ?? 0) + ',' + (evRect.y ?? 0) + ' ' + (evRect.w ?? 0) + 'x' + (evRect.h ?? 0) + ')，变化率 ' + evRatio + '，变化文本: ' + (added ? added : (text ? text : '(无文本)')) + '。若与当前任务相关可继续处理；无关则忽略。'
-        if (text === state.lastLinkText && text !== '') { appendObservationLog({ type: 'inject-skip', reason: 'dup-text' }); return }
-        state.lastLinkText = text
-        if (!linkBudgetOk()) { appendObservationLog({ type: 'inject-skip', reason: 'budget', count: state.linkBudget.count, windowMs: Date.now() - state.linkBudget.windowStart }); return }
-        // 画面也要给：只发文字等于"蒙着眼睛描述"，模型只能说"屏幕变了"
-        let shot = null
-        if (state.linkShot) {
-          try {
-            const s = await helperCall('screenshot', { maxW: 900 })
-            if (s && s.jpegB64) shot = s.jpegB64
-          } catch {}
-        }
-        injectToSession(body, shot).catch(e => appendObservationLog({ type: 'inject-skip', reason: 'inject-throw:' + ((e && e.message) || e) }))
-      }).catch(e => appendObservationLog({ type: 'inject-skip', reason: 'snapshot-throw:' + ((e && e.message) || e) }))
+      // 不再调 watch_snapshot：事件已带 ratio/rect，快照只补 OCR 文本，
+      // 而它在这条回调链里会挂住（RPC 从 stdout reader 回调发起，响应回不来）。
+      // 需要文本时用 saperm_observe 单独取，注入这条路径必须自给自足。
+      const body = '[屏幕变化通知] 屏幕运动区域 (' + (evRect.x ?? 0) + ',' + (evRect.y ?? 0) + ' ' + (evRect.w ?? 0) + 'x' + (evRect.h ?? 0) + ')，变化率 ' + evRatio + '。若与当前任务相关可继续处理；无关则忽略。'
+      state.lastLinkText = ''
+      if (!linkBudgetOk()) { appendObservationLog({ type: 'inject-skip', reason: 'budget', count: state.linkBudget.count }); return }
+      let shot = null
+      if (state.linkShot) {
+        try {
+          const shotOpts = (evRect.w > 0 && evRect.h > 0)
+            ? { x: evRect.x, y: evRect.y, w: evRect.w, h: evRect.h, maxW: 640 }
+            : { maxW: 640 }
+          const sh = await Promise.race([
+            helperCall('screenshot', shotOpts),
+            new Promise(res => setTimeout(() => res(null), 1500)),
+          ])
+          if (sh && sh.jpegB64) shot = sh.jpegB64
+        } catch (e) { appendObservationLog({ type: 'inject-skip', reason: 'shot-fail:' + ((e && e.message) || e) }) }
+      }
+      injectToSession(body, shot).catch(e => appendObservationLog({ type: 'inject-skip', reason: 'inject-throw:' + ((e && e.message) || e) }))
     }
   }
 
