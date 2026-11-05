@@ -248,10 +248,10 @@ function spawnHelper() {
             Promise.resolve().then(() => onHelperReady()).catch(() => {})
           }
         }
-        if (msg.event === 'hotkey') {
-          for (const fn of helperSingleton.listeners) {
-            try { fn('hotkey', msg.data) } catch {}
-          }
+        // 所有事件都转发给监听者（原来只转发 hotkey，change 被 continue 直接丢弃，
+        // 导致「屏幕变化 → 注入会话」这条链路从实现起就没通过）
+        for (const fn of helperSingleton.listeners) {
+          try { fn(msg.event, msg.data) } catch (e) { console.log('[sa-perm] listener 异常: ' + ((e && e.message) || e)) }
         }
         continue
       }
@@ -504,18 +504,18 @@ export function apply(ctx) {
     if (kind === 'change' && data && state.link) {
       // 变化事件 → 拉取 OCR 摘要 → 注入会话（节流 2s + 文本去重）
       const now = Date.now()
-      if (now - state.lastLinkAt < 2000) return
+      if (now - state.lastLinkAt < 2000) { appendObservationLog({ type: 'inject-skip', reason: 'throttle' }); return }
       state.lastLinkAt = now
       helperCall('watch_snapshot').then(async (snap) => {
         if (!snap) return
         const rect = snap.rect || {}
         const text = String(snap.text || '').trim()
         const added = String(snap.added || '').trim()
-        if (!snap.motion && !text) return
+        if (!snap.motion && !text) { appendObservationLog({ type: 'inject-skip', reason: 'no-motion-no-text' }); return }
         const body = '[屏幕变化通知] 屏幕运动区域 (' + rect.x + ',' + rect.y + ' ' + rect.w + 'x' + rect.h + ')，变化率 ' + (snap.ratio || 0) + '，变化文本: ' + (added ? added : (text ? text : '(无文本)')) + '。若与当前任务相关可继续处理；无关则忽略。'
-        if (text === state.lastLinkText && text !== '') return
+        if (text === state.lastLinkText && text !== '') { appendObservationLog({ type: 'inject-skip', reason: 'dup-text' }); return }
         state.lastLinkText = text
-        if (!linkBudgetOk()) return
+        if (!linkBudgetOk()) { appendObservationLog({ type: 'inject-skip', reason: 'budget', count: state.linkBudget.count, windowMs: Date.now() - state.linkBudget.windowStart }); return }
         // 画面也要给：只发文字等于"蒙着眼睛描述"，模型只能说"屏幕变了"
         let shot = null
         if (state.linkShot) {
@@ -524,18 +524,18 @@ export function apply(ctx) {
             if (s && s.jpegB64) shot = s.jpegB64
           } catch {}
         }
-        injectToSession(body, shot)
-      }).catch(() => {})
+        injectToSession(body, shot).catch(e => appendObservationLog({ type: 'inject-skip', reason: 'inject-throw:' + ((e && e.message) || e) }))
+      }).catch(e => appendObservationLog({ type: 'inject-skip', reason: 'snapshot-throw:' + ((e && e.message) || e) }))
     }
   }
 
-  // 联动分钟配额：60 秒窗口最多 6 次实际注入（预算防刷屏）
+  // 联动分钟配额：60 秒窗口最多 30 次实际注入（原来 6 次太紧，一次测试就耗光、后续全被 skip）
   function linkBudgetOk() {
     const now = Date.now()
     if (now - state.linkBudget.windowStart > 60000) {
       state.linkBudget = { count: 0, windowStart: now }
     }
-    if (state.linkBudget.count >= 6) return false
+    if (state.linkBudget.count >= 30) return false
     state.linkBudget.count++
     return true
   }
@@ -555,7 +555,7 @@ export function apply(ctx) {
         console.log('[sa-perm] 无发起方 agent，跳过变化注入:', body.slice(0, 60))
         return
       }
-      appendObservationLog({ type: 'inject', body })
+      appendObservationLog({ type: 'inject', body, withImage: !!jpegB64 })
       const content = [{ type: 'text', text: body }]
       // 关键：变化时把画面一起塞进消息 —— 模型才"看得见"，不然只有文字摘要
       if (jpegB64) {

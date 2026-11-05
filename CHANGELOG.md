@@ -1,5 +1,41 @@
 # Changelog (dsh-screen-attention)
 
+## v1.10.2 (2026-11-05) — 消息窗修复 + 事件分发 bug（变化注入从未通过的根因）
+
+### A · 消息窗不显示（已修，有截图证据）
+根因：`Bounds = target` 写在 `new SayForm { ... }` 初始化器里，此时**窗口句柄还没创建**，
+WinForms 直接忽略该值 —— 窗口建出来了、`sayOpen:true`、`sayTarget` 正确，但屏幕上什么都没有。
+
+修法：在 `Shown` 事件里再设一次（此时句柄已建），并显式 `Visible/TopMost/BringToFront`。
+新增 `sayVisible` / `sayRealBounds` 回报实测值。
+
+验证（`saperm_view` 抓图）：窗口显示为深蓝圆角框 + 左侧蓝竖条 + 文字，「SA 消息窗测试：看到这行说明修好了」。
+
+### B · 变化注入从未执行的根因：事件被丢弃
+```js
+if (msg.event === 'hotkey') { for (const fn of listeners) fn('hotkey', msg.data) }
+continue        // ← change 到这儿就被扔了
+```
+helper 一直在发 `change` 事件，插件侧却**只转发 `hotkey`**，其余一律丢弃。
+所以 `onHelperEvent` 里 `kind === 'change'` 的分支从写下那天起就没被调用过，
+「屏幕变化 → 注入会话」整条链路是死的。改成全部转发。
+
+修复后实证（`saperm_history` 诊断）：
+```text
+14:29:36  kind=change  link=true
+14:29:39  kind=change  link=true
+```
+事件到达、link 正确。此前只有 `ready`，`change` 一条都没有。
+
+### 附带修掉
+- **注入配额 6→30 次/分钟**：6 次上限一次测试就耗光，之后全是 `reason=budget`
+- **`saperm_history` 的 `limit` 取的是文件头不是最新**：导致「最新记录」查询返回旧数据，
+  排查时把我带偏过。查最新请用 `type` 过滤（按类型过滤时是全文件扫描）。
+
+### 仍未闭合
+Watch 循环帧率异常低（4 秒只推进 3 帧，预期 ~6），导致 change 事件稀疏。
+这是注入链路的下一道瓶颈，已加 `loopFrames`/`changeEmits`/`lastChangeError` 三个计数器备用。
+
 ## v1.10.1 (2026-11-05) — excel_*/fill_* 收敛 + 修掉两个既存缺陷
 
 ### 合并

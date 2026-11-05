@@ -972,6 +972,10 @@ static class SayWindow
     static readonly object gate = new object();
     static readonly Font bodyFont = new Font("Microsoft YaHei UI", 11f, FontStyle.Bold);
     public static bool IsOpen => form != null;
+    public static bool VisibleNow
+    {
+        get { var f = form; if (f == null || f.IsDisposed) return false; try { return f.Visible; } catch { return false; } }
+    }
 
     static int MeasureH(string t, int w)
     {
@@ -1040,7 +1044,20 @@ static class SayWindow
                     };
                     timer.Start();
                     form.FormClosed += (s, e) => { try { timer.Stop(); } catch { } };
-                    form.Shown += (s, e) => sig.TrySetResult(true);
+                    // 关键：Bounds 在构造时设置会被 WinForms 忽略（句柄还没建）。
+                    // 必须在 Shown 里再设一次，并显式 Show + 抬高 z-order。
+                    form.Shown += (s, e) =>
+                    {
+                        try
+                        {
+                            form.Bounds = target;
+                            form.TopMost = true;
+                            form.Visible = true;
+                            form.BringToFront();
+                        }
+                        catch (Exception ex2) { LastError = "shown: " + ex2.Message; }
+                        sig.TrySetResult(true);
+                    };
                     Application.Run(form);
                 }
                 catch (Exception ex) { LastError = ex.GetType().Name + ": " + ex.Message; sig.TrySetResult(false); }
@@ -1618,6 +1635,8 @@ static class Watch
     static Thread thread;
     static volatile bool watching;
     static volatile int curMs = 0;        // 当前实际采样间隔（自适应浮动，不是固定值）
+    static volatile int loopFrames = 0;    // 循环帧计数（诊断：确认 Watch.Loop 真的在跑）
+    static volatile int changeEmits = 0;   // change 事件发出次数
     static readonly object SyncLock = new object();
     public static bool IsWatching => watching;
     public static int EffectiveMs => curMs > 0 ? curMs : IntervalMs;
@@ -1629,6 +1648,9 @@ static class Watch
     static long motionSince;
     static bool everDetected;
     static long lastChangeEventAt;
+    public static string LastChangeError;   // 发事件失败留痕
+    public static int LoopFrames => loopFrames;
+    public static int ChangeEmits => changeEmits;
     static Rectangle focusRect = Rectangle.Empty;   // 焦点区域（空=全屏）。用于"感知对话输出"式定向观察
     static string lastOcrText = "";                 // 上次 OCR 摘要（增量 diff 基准）
     static readonly int[] LastSamples = new int[(3840 / 16 + 1) * (2160 / 16 + 1)];
@@ -1719,7 +1741,7 @@ static class Watch
             {
                 lastChangeEventAt = now;
                 everDetected = true;
-                try { Program.Event("change", new { ratio = Math.Round(ratio, 4), rect = new { x = motionRect.X, y = motionRect.Y, w = motionRect.Width, h = motionRect.Height } }); } catch { }
+                try { Program.Event("change", new { ratio = Math.Round(ratio, 4), rect = new { x = motionRect.X, y = motionRect.Y, w = motionRect.Width, h = motionRect.Height } }); Interlocked.Increment(ref changeEmits); } catch (Exception exEv) { LastChangeError = exEv.GetType().Name + ": " + exEv.Message; }
             }
         }
         return changes;
@@ -1753,6 +1775,7 @@ static class Watch
                     lastTick = now;
                 }
                 bool before = motion;
+                loopFrames++;
                 DetectMotion(buf, w, h);
                 // 迟滞调速：连续运动→快模式；连续静止→慢模式
                 if (motion) { active++; steady = 0; } else { steady++; active = 0; }
@@ -2746,6 +2769,8 @@ class Program
                         ok = true,
                         imageOpen = Overlay.IsOpen,
                         sayOpen = SayWindow.IsOpen,
+                        sayVisible = SayWindow.VisibleNow,
+                        sayRealBounds = SayWindow.Bounds,
                         sayError = SayWindow.LastError,
                         sayTarget = SayWindow.LastTarget,
                         sayBounds = SayWindow.Bounds,
@@ -3282,6 +3307,9 @@ class Program
                         watching = Watch.IsWatching,
                         intervalMs = Watch.IntervalMs,
                         effectiveMs = Watch.EffectiveMs,   // 自适应后的实际间隔（自己浮动，不是固定值）
+                        loopFrames = Watch.LoopFrames,
+                        changeEmits = Watch.ChangeEmits,
+                        lastChangeError = Watch.LastChangeError,
                         motion = Watch.Motion,
                         motionRatio = Math.Round(Watch.MotionRatio, 4),
                         motionRect = mr.IsEmpty ? null : new { x = mr.X, y = mr.Y, w = mr.Width, h = mr.Height },
