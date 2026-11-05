@@ -1783,11 +1783,13 @@ static class Watch
                 // 不绑死任何一个值：实测同一场景 120ms 有效、500/900ms 反而 0（内容节拍，
                 // 某些间隔正好踩在同一姿态），所以固定间隔必然有"盲区"，让它自己浮动。
                 const int MinMs = 120;    // 实测再快只会重复读旧帧
+                const int MinMs2 = 200;   // 与 change 事件联动时的下限（防自身界面刷满 CPU）
                 const int MaxMs = 1600;   // 再慢就跟不上内容切换
-                // 加速要"实质变化"才算：光标闪烁/文字流式输出这类小 motion（ratio<0.005）
-                // 不值得拉满帧率，否则全屏观察时会被自身界面刷成 120ms 白烧 CPU。
-                bool substantial = motion && motionRatio >= 0.005;
-                if (substantial) curMs = (int)Math.Max(MinMs, curMs * 0.7);
+                // 加速判据必须与 change 事件同源，否则会出现「motion=true 却一直减速到 1600ms，
+                // 于是 change 事件 4 秒才一个」的矛盾（实测踩过）。
+                // motion 本身已包含 windowSum>=12 的细粒度判定，直接用它；
+                // 下限提到 200ms 防 CPU（120ms 时全屏观察会被自身界面刷满）。
+                if (motion) curMs = (int)Math.Max(MinMs2, curMs * 0.7);
                 else if (steady >= 2) curMs = (int)Math.Min(MaxMs, curMs * 1.4);
                 int sleep = curMs - (int)t0.ElapsedMilliseconds;
                 Thread.Sleep(Math.Max(10, sleep));

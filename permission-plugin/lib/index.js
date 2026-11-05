@@ -178,7 +178,9 @@ const helperSingleton = {
   nextId: 1,
   pending: new Map(),
   buf: '',
-  listeners: new Set(),
+  // listeners 必须跨模块实例共享：热加载会创建新实例，但旧的 helper 进程和它的 stdout reader
+  // 仍属于旧实例，用旧实例的 Set 转发事件 —— 新实例的 onHelperEvent 就永远收不到（实测踩过）。
+  listeners: (globalThis.__saPermListeners || (globalThis.__saPermListeners = new Set())),
   restarting: false,
   expectedShutdown: false,
   needsRecovery: false,
@@ -229,6 +231,7 @@ function spawnHelper() {
   const proc = spawn(HELPER_EXE, [], { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true })
   helperSingleton.proc = proc
   helperSingleton.pid = proc.pid
+  globalThis.__saPermHelperPid = proc.pid   // 供热加载后的新实例接管（旧实例的 reader/看门狗不会自己退场）
 
   proc.stdout.on('data', (d) => {
     helperSingleton.buf += d.toString('utf8')
@@ -504,10 +507,10 @@ export function apply(ctx) {
     if (kind === 'change' && data && state.link) {
       // 变化事件 → 拉取 OCR 摘要 → 注入会话（节流 2s + 文本去重）
       const now = Date.now()
-      if (now - state.lastLinkAt < 2000) { appendObservationLog({ type: 'inject-skip', reason: 'throttle' }); return }
+      if (now - state.lastLinkAt < 1200) { appendObservationLog({ type: 'inject-skip', reason: 'throttle' }); return }
       state.lastLinkAt = now
       helperCall('watch_snapshot').then(async (snap) => {
-        if (!snap) return
+        if (!snap) { appendObservationLog({ type: 'inject-skip', reason: 'snap-null' }); return }
         const rect = snap.rect || {}
         const text = String(snap.text || '').trim()
         const added = String(snap.added || '').trim()
@@ -923,6 +926,15 @@ export function apply(ctx) {
     }
   }
 
+  // 热加载会创建新模块实例，但旧实例的 helper 进程 / stdout reader / 看门狗定时器都还在跑，
+  // 旧 reader 遍历的是旧实例那个已经空掉的 listeners —— 新实例永远收不到事件（实测）。
+  // 所以新实例主动接管：杀掉上一代 helper，让 ensureHelper/acquireHelper 重新 spawn 并绑定新 reader。
+  {
+    const oldPid = globalThis.__saPermHelperPid
+    if (oldPid && oldPid !== process.pid) {
+      try { process.kill(oldPid); console.log('[sa-perm] 接管：已终止上一代 helper ' + oldPid) } catch {}
+    }
+  }
   helperSingleton.listeners.add(onHelperEvent)
   acquireHelper()
   ctx.effect(() => () => {

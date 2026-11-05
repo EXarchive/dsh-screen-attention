@@ -1,5 +1,45 @@
 # Changelog (dsh-screen-attention)
 
+## v1.10.3 (2026-11-05) — 热加载实例叠加的两个真 bug
+
+### 本轮确证的修复
+
+**1. 事件分发只转发 hotkey**（v1.10.2 已修，本轮补实证）
+helper 一直发 `change`，插件侧 `if (msg.event === 'hotkey') {...} continue` 把其余全丢。
+改成全部转发后，日志实证 5 秒内 4 个 `change link=true` 到达。
+
+**2. 热加载后事件通道整体失效** ⚠️
+这是本轮新发现的、比 1 更隐蔽的问题：
+
+热加载会**创建新的模块实例**，但**旧实例的 helper 进程、stdout reader、看门狗定时器都还在跑**。
+旧 reader 闭包遍历的是**旧实例那个已经空掉的 `listeners` Set`** —— 新实例的 `onHelperEvent` 永远收不到事件。
+RPC 却照常可用（走 pending/response 通路），所以表面一切正常，只有事件静默丢失。
+
+修法（两层）：
+```js
+// listeners 跨实例共享
+listeners: (globalThis.__saPermListeners || (globalThis.__saPermListeners = new Set()))
+// 新实例接管：杀掉上一代 helper，强制重新 spawn 以绑定新 reader
+const oldPid = globalThis.__saPermHelperPid; if (oldPid) process.kill(oldPid)
+```
+
+**3. Watch 循环帧率 0.75 → 5 fps**
+加速判据用 `motionRatio >= 0.005`，而 change 事件用 `m`（含 `windowSum >= 12` 细粒度）——
+两套判据打架，导致 `motion=true` 却一直减速到 1600ms，change 事件 4 秒才一个。
+统一为 `if (motion)` 加速，下限从 120 提到 200（防自身界面刷满 CPU）。
+
+### 仍未闭合
+**变化注入最后一个环节（`injectToSession`）未验证通过。**
+事件已确认到达（日志 72 条 `change link=true`），节流也放行了一部分，
+但从没有一条 `inject` 或 `inject-skip/no-initiator` 落盘 —— 卡在 `.then` 回调内部。
+
+**诊断受阻的原因**：反复热加载后实例状态叠加，删掉的诊断代码仍在写日志（`ev2` 明明删了却持续产出），
+说明运行的是旧实例的闭包。**这种情况下任何验证结果都不可信，必须重启 DSH 或整套 kill helper 才能验准。**
+
+### 教训（写进 RETROSPECTIVE）
+对有**长生命周期状态**的插件（进程、reader、定时器、全局缓存），
+热加载 ≠ 干净重载。改完先 kill 全套再验，否则会像本轮一样在“改了没生效”和“改了生效但被旧实例干扰”之间反复误判。
+
 ## v1.10.2 (2026-11-05) — 消息窗修复 + 事件分发 bug（变化注入从未通过的根因）
 
 ### A · 消息窗不显示（已修，有截图证据）

@@ -132,3 +132,15 @@
 - 关键区别在 **diff**：仅重写文件（mtime 变化、内容相同）**不会**触发重载；必须产生**真实内容变更**（我们在 `cordis.patch.yml` 追加一行注释）才会重新 `import` 插件模块并重建插件实例。
 - 因此插件改动可以**免重启**上线：改完源码 → 对补丁文件做一次真实内容变更 → 等待约 5s → 用 `saperm_status` 是否出现新字段来确认新代码已生效。
 - 附带发现：插件里访问未 `inject` 的服务（如 `ctx.agents`）会在 Cordis 抛 `cannot get property "agents" without inject`，诊断信息必须只依赖已注册状态（`state.approvalPolicy`），不要临时读宿主服务。
+### 经验 17（热加载对长生命周期插件不安全，2026-11-05）
+
+- **现象**：改了插件代码，热加载后工具能用、RPC 正常，但 helper 发来的 `change` 事件永远收不到；日志里诊断代码明明删了却还在产出。
+- **根因**：热加载创建**新的模块实例**，旧实例的 helper 进程、`proc.stdout.on('data')` reader、看门狗定时器**都不会退场**。旧 reader 闭包遍历的是旧实例那个已空的 `listeners` Set，新实例的 `onHelperEvent` 加在新 Set 上，两者永不相交。RPC 走 pending/response 通路所以照常工作，掩盖了问题。
+- **修法**：①`listeners` 用 `globalThis` 跨实例共享；②新实例在 apply 时 kill 上一代 helper（pid 记在 `globalThis`），强制重新 spawn 以绑定新 reader。
+- **诊断判据**：出现「删掉的诊断代码还在写日志」= 运行的是旧实例闭包，此时**任何验证结果都不可信**，必须重启 DSH 或整套 kill 才能验准。
+- **教训**：对有长生命周期状态的插件，热加载 ≠ 干净重载。改动后先确认状态已换新，再谈验证。
+
+### 经验 18（`saperm_history` 的 limit 语义，2026-11-05）
+
+- `limit` 取的是**文件头部 N 条**，不是最新 N 条。排查“最新记录”时会拿到旧数据，曾把我带偏两轮。
+- 查最新请直接读 `out/logs/observation-<date>.jsonl` 尾部，或按 `type` 过滤后自行取尾部。
