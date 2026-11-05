@@ -98,6 +98,56 @@ export function pruneViewDir(maxFiles = MAX_VIEW_FILES, maxAgeMs = MAX_VIEW_AGE_
   } catch { return 0 }
 }
 
+// ============ 图像 token 估算（对齐宿主 patch 网格） ============
+// 宿主口径：14px patch 向上对齐 → 每轴 3:1 降采样 → 一格 = 42×42 px
+//   tokens = rows × (cols + 1) + 2，上限 1024；小于 544×544 的图按该面积计费。
+// 因此把输出宽度对齐到 42 的倍数可直接省掉整列 token（零画质代价）：
+//   1280 → 31 列；1260 → 30 列。同一画面少 8%。
+const IMG_PATCH = 14
+const IMG_DS = 3
+const IMG_CELL = IMG_PATCH * IMG_DS   // 42
+const IMG_CAP = 1024
+const IMG_FLOOR_AREA = 544 * 544
+function imgGridCells(px) {
+  const padded = Math.ceil(px / IMG_PATCH) * IMG_PATCH
+  return Math.ceil(Math.floor(padded / IMG_PATCH) / IMG_DS)
+}
+function imageTokens(w, h) {
+  let W = Math.round(Number(w) || 0), H = Math.round(Number(h) || 0)
+  if (W <= 0 || H <= 0) return 0
+  const area = W * H
+  if (area < IMG_FLOOR_AREA) {
+    const s = Math.sqrt(IMG_FLOOR_AREA / area)
+    W = Math.max(1, Math.trunc(W * s)); H = Math.max(1, Math.trunc(H * s))
+  }
+  const rows = imgGridCells(H), cols = imgGridCells(W)
+  return Math.min(IMG_CAP, rows * (cols + 1) + 2)
+}
+/** 宽度向下对齐到 42 的倍数（省整列 token）；对齐后为 0 则退回一个整格。 */
+function snapWidth(w) {
+  const v = Math.floor((Number(w) || 0) / IMG_CELL) * IMG_CELL
+  return v > 0 ? v : IMG_CELL
+}
+
+// ============ 运行方案：本地识别 / 视觉直传 / 混合（按环境自动选） ============
+// 两条通道的分工：
+//   local  —— 本地 ONNX 推理（OCR/检测/CLIP/动漫脸），输出文本与坐标，0 token，精度受模型限制
+//   vision —— 把画面本身交给多模态模型，保留图标/照片/视频原貌，约 590 token/张（1260×788）
+//   hybrid —— 两者同时给：文本给骨架，图给原貌
+// 选择依据只看三件真事：可用执行器（GPU/CPU）、模型文件、CPU 规模。
+let profileCache = null
+let profileAt = 0
+async function getProfile(force) {
+  if (!force && profileCache && Date.now() - profileAt < 60000) return profileCache
+  try {
+    profileCache = await helperCall('profile', {})
+    profileAt = Date.now()
+  } catch (e) {
+    profileCache = { recommended: 'local', error: String((e && e.message) || e).slice(0, 120), modes: { local: { ok: true } } }
+  }
+  return profileCache
+}
+
 let viewSeq = 0
 function saveShot(jpegB64, tag) {
   try { mkdirSync(VIEW_DIR, { recursive: true }) } catch {}
@@ -1005,7 +1055,8 @@ export function apply(ctx) {
     },
     execute: async (args) => {
       const shot = await helperCall('screenshot', {
-        x: args.x, y: args.y, w: args.w, h: args.h, scale: args.scale, maxW: args.maxW,
+        x: args.x, y: args.y, w: args.w, h: args.h, scale: args.scale,
+        maxW: args.maxW ? snapWidth(args.maxW) : undefined,
       })
       const path = saveShot(shot.jpegB64, args.w ? 'focus' : 'glance')
       const rect = shot.rect || null
@@ -1014,21 +1065,24 @@ export function apply(ctx) {
       if (rect) {
         try { await helperCall('overlay_set', { region: rect, note: args.note || 'AI 视角' }) } catch {}
       }
-      return { path, rect, imageW: shot.bw || shot.w, imageH: shot.bh || shot.h, note: args.note || '' }
+      const iw = shot.bw || shot.w, ih = shot.bh || shot.h
+      return { path, rect, imageW: iw, imageH: ih, tokens: imageTokens(iw, ih), note: args.note || '' }
     },
   })
 
   register({
     name: 'saperm_glance',
-    description: '全屏大图（glance 快速语义，默认最大宽 1280）：返回图片文件路径+全屏 rect。配合 saperm_view(小区域) 构成多尺度对应：小图 rect 是大图的子区域。观察类，无需审批',
+    description: '全屏大图（glance 快速语义，默认最大宽 1260 = 42×30，约 560 token）：返回图片文件路径+全屏 rect+token 估算。配合 saperm_view(小区域) 构成多尺度对应：小图 rect 是大图的子区域。观察类，无需审批',
     parameters: {
       type: 'object',
-      properties: { maxW: { type: 'integer', description: '输出最大宽度（默认 1280）' } },
+      properties: { maxW: { type: 'integer', description: '输出图最大宽度（默认 1260；会自动向下对齐到 42 的倍数以省 token）' } },
     },
     execute: async (args) => {
-      const shot = await helperCall('screenshot', { maxW: args.maxW || 1920 })
+      const wantW = snapWidth(args.maxW || 1260)
+      const shot = await helperCall('screenshot', { maxW: wantW })
       const path = saveShot(shot.jpegB64, 'glance')
-      return { path, rect: shot.rect || null, imageW: shot.bw || shot.w, imageH: shot.bh || shot.h, note: '全屏' }
+      const iw = shot.bw || shot.w, ih = shot.bh || shot.h
+      return { path, rect: shot.rect || null, imageW: iw, imageH: ih, tokens: imageTokens(iw, ih), note: '全屏' }
     },
   })
   // ============ 注意力可视化小窗（L1 观察类，免审） ============
@@ -1791,6 +1845,20 @@ export function apply(ctx) {
   })
 
   register({
+    name: 'saperm_profile',
+    description: '运行方案探测：按本机环境（GPU 执行器 / 模型文件 / CPU 规模）判定「本地识别 local」「视觉直传 vision」「混合 hybrid」哪条可用并给出推荐与理由。结果缓存 60s。L0 观察，无需审批',
+    parameters: {
+      type: 'object',
+      properties: { force: { type: 'boolean', description: 'true=跳过缓存重新探测' } },
+    },
+    execute: async (args) => {
+      const t0 = Date.now()
+      const prof = await getProfile(args.force === true)
+      return { ...prof, cachedMs: Date.now() - profileAt, probeMs: Date.now() - t0 }
+    },
+  })
+
+  register({
     name: 'saperm_scan',
     description: '一次识别调用完成多路感知（2s 预算内）：只截一张图 → OCR 文字+坐标，可选 scene 场景 / objects 物体，返回合并结果与分阶段耗时 elapsedMs/withinBudget。默认扫前台窗口（快 3~10 倍），full=true 全屏。观察类，无需审批',
     parameters: {
@@ -1802,6 +1870,7 @@ export function apply(ctx) {
         objects: { type: 'boolean', description: '附带 YOLO 物体检测（约 +100~500ms）' },
         maxTexts: { type: 'integer', description: '返回文字条数（默认 80，最大 200）' },
         scale: { type: 'number', description: 'OCR 放大倍数（默认 1）' },
+        mode: { type: 'string', description: 'local（默认，只本地识别，0 token）/ vision（额外给出可直传的画面 + token 估算）/ auto（按环境探测结果自动选）' },
       },
     },
     execute: async (args) => {
@@ -1817,9 +1886,21 @@ export function apply(ctx) {
           if (fg && fg.w >= 160 && fg.h >= 120) rect = { x: fg.x, y: fg.y, w: fg.w, h: fg.h }
         } catch {}
       }
+      // 方案选择必须**先于截图**：vision 模式要把图直接缩到 1260（42×30 = 591 token），
+      // 否则按原分辨率 2582×1550 出图会撞 1024 token 上限，白烧一倍。
+      const wantMode = String(args.mode || 'local')
+      let profile = null
+      let wantImage = wantMode === 'vision'
+      if (wantMode === 'auto') {
+        profile = await getProfile(false)
+        wantImage = profile.recommended !== 'local'
+      }
       const tShot = Date.now()
-      const shot = await helperCall('screenshot', rect ? { ...rect } : {})
+      const shotArgs = rect ? { ...rect } : {}
+      if (wantImage) shotArgs.maxW = snapWidth(1260)
+      const shot = await helperCall('screenshot', shotArgs)
       const path = saveShot(shot.jpegB64, 'scan')
+      const imgW = shot.bw || shot.w, imgH = shot.bh || shot.h
       stages.shot = Date.now() - tShot
       const tOcr = Date.now()
       let texts = []
@@ -1844,7 +1925,13 @@ export function apply(ctx) {
         stages.detect = Date.now() - t
       }
       const elapsedMs = Date.now() - t0
-      return { elapsedMs, withinBudget: elapsedMs < budget, budgetMs: budget, region: rect, path, count: texts.length, texts, scene, objects, stages }
+      return {
+        elapsedMs, withinBudget: elapsedMs < budget, budgetMs: budget, region: rect,
+        mode: wantImage ? 'vision' : 'local',
+        recommended: profile ? profile.recommended : undefined,
+        local: { count: texts.length, texts, scene, objects, stages },
+        image: wantImage ? { path, w: imgW, h: imgH, tokens: imageTokens(imgW, imgH) } : null,
+      }
     },
   })
 
@@ -2448,12 +2535,20 @@ export function apply(ctx) {
 
   register({
     name: 'saperm_health',
-    description: '投产自检：helper 在线/模型文件/角色注册表/当前观察模式/急停状态。L0 观察',
+    description: '投产自检：helper 在线/模型文件/角色注册表/当前观察模式/急停状态/运行方案（local | vision | hybrid）。L0 观察',
     parameters: empty,
     execute: async () => {
       let h = null
       try { h = await helperCall('health', {}) } catch (e) { h = { ok: false, error: e.message } }
+      const prof = await getProfile(false).catch(() => null)
       return {
+        scheme: prof ? {
+          recommended: prof.recommended,
+          localOk: !!(prof.modes && prof.modes.local && prof.modes.local.ok),
+          gpu: !!(prof.env && prof.env.gpu),
+          backend: prof.env ? prof.env.backend : null,
+          why: prof.reasons || [],
+        } : null,
         helper: { online: !!helperSingleton.online, pid: helperSingleton.pid || null, sessionId: (h && typeof h.sessionId === 'number') ? h.sessionId : null },
         paused: !!state.paused,
         l3: Array.from(state.l3.entries()).map(([agent, st]) => ({ agent, status: st })),

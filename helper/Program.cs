@@ -2669,6 +2669,51 @@ class Program
                         sessionId = Process.GetCurrentProcess().SessionId,
                     };
                 }
+            case "profile":
+                {
+                    // 环境探测：决定「本地识别」与「视觉直传」两条通道各自能否跑、推荐哪条。
+                    // 决策只看三件真事：可用执行器、模型文件、CPU 规模。
+                    string md = PaddleOcr.ModelDir();
+                    var eps = Providers.Available;
+                    bool hasDml = eps.Any(e => e.IndexOf("Dml", StringComparison.OrdinalIgnoreCase) >= 0);
+                    bool hasCuda = eps.Any(e => e.IndexOf("Cuda", StringComparison.OrdinalIgnoreCase) >= 0);
+                    bool hasTrt = eps.Any(e => e.IndexOf("Tensor", StringComparison.OrdinalIgnoreCase) >= 0);
+                    bool ocrOk = File.Exists(Path.Combine(md, "ch_PP-OCRv4_det_infer.onnx")) && File.Exists(Path.Combine(md, "ch_PP-OCRv4_rec_infer.onnx"));
+                    bool detOk = File.Exists(Path.Combine(md, "yolov8m.onnx")) || File.Exists(Path.Combine(md, "yolov8n.onnx"));
+                    bool faceOk = File.Exists(Path.Combine(md, "animeface", "model.onnx"));
+                    string clipLarge = Path.Combine(md, "chinese-clip-large", "image_encoder.onnx");
+                    string clipBase = Path.Combine(md, "chinese-clip", "image_encoder.onnx");
+                    string clip = File.Exists(clipLarge) ? "chinese-clip-large" : (File.Exists(clipBase) ? "chinese-clip" : null);
+                    int cores = Environment.ProcessorCount;
+                    long avail = GC.GetGCMemoryInfo().TotalAvailableMemoryBytes;
+                    long availMb = avail > 0 ? avail / 1048576 : 0;
+                    bool gpu = hasDml || hasCuda || hasTrt;
+                    string epName = hasTrt ? "TensorRT" : (hasCuda ? "CUDA" : (hasDml ? "DirectML" : "CPU"));
+                    // 本地识别可行性：OCR+检测必须有；没有 GPU 时至少要 8 线程才跑得动
+                    bool localOk = ocrOk && detOk && (gpu || cores >= 8);
+                    var reasons = new List<string>();
+                    reasons.Add(gpu
+                        ? epName + " 执行器可用 → 本地推理走 GPU（零 token）"
+                        : "无 GPU 执行器，本地推理只走 CPU（" + cores + " 线程）");
+                    if (!ocrOk) reasons.Add("OCR 模型缺失（ch_PP-OCRv4 det/rec）→ 文字识别不可用");
+                    if (!detOk) reasons.Add("检测模型缺失（yolov8m / yolov8n）→ 物体检测不可用");
+                    if (clip == null) reasons.Add("CLIP 模型缺失 → 场景与角色识别不可用");
+                    if (!gpu && cores < 8) reasons.Add("CPU 线程数 < 8 且无 GPU → 本地逐帧识别过慢，建议走视觉直传");
+                    if (localOk) reasons.Add("视觉直传每张图约 590 token（1260×788，42px 对齐后）");
+                    return new
+                    {
+                        recommended = localOk ? (gpu ? "hybrid" : "local") : "vision",
+                        modes = new
+                        {
+                            local = new { ok = localOk, cost = "0 token", speed = gpu ? "GPU 16Hz 级" : "CPU 低帧" },
+                            vision = new { ok = true, cost = "~590 token/张", speed = "取决于模型服务" },
+                            hybrid = new { ok = localOk, cost = "~590 token/张 + 0", speed = "识别本地 + 原貌直传" },
+                        },
+                        env = new { providers = eps, gpu, backend = PaddleOcr.Backend, cores, availMemMB = availMb, session = Process.GetCurrentProcess().SessionId },
+                        models = new { ocr = ocrOk, detect = detOk, face = faceOk, clip },
+                        reasons,
+                    };
+                }
             case "providers":
                 return new
                 {

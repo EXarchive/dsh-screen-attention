@@ -32,7 +32,13 @@
    - **逐帧融合（Infer）**：逐帧融合 OCR + 物体 + 角色身份 + 动漫脸 + 场景，单模式稳定帧率 6.7~6.9 fps。
    - **互斥守护**：启动任一长时观察模式时，插件自动停止另一模式（返回 `autoStopped`），避免 DirectML/算力资源争用降级。
 
-4. **审计与保活**
+4. **双运行方案（按环境自动选）**
+   - **local**：本地 ONNX 推理（OCR / 检测 / CLIP / 动漫脸）→ 文本与坐标，**0 token**，精度受模型限制；
+   - **vision**：画面本身交给多模态模型，保留图标/照片/视频原貌，**约 530~590 token/张**（1260 宽，42px 对齐）；
+   - **hybrid**：两者同时给 —— 文本给骨架，图给原貌；
+   - 选择依据只看三件真事：**可用执行器（TensorRT/CUDA/DirectML/CPU）、模型文件齐全度、CPU 线程数**。`saperm_profile` 返回推荐与理由（缓存 60s），`saperm_scan({mode:"auto"})` 按推荐自动路由，`saperm_health.scheme` 每次自检直接给出结论。
+
+5. **审计与保活**
    - **长时观察 Hold**：长时观察期间插件强制持有 Helper 引用，杜绝闲置被杀。
    - **空闲保活**：调用结束后空闲 60 秒才延迟释放 Helper，避免连续调用反复产生 2.5s 冷启动。
    - **看门狗崩溃告警与状态自愈**：Helper 异常退出时自动向会话注入告警、记录 `helper_crash` 审计日志，并在 ~800ms 内重启恢复原观察模式（`infer` / `interpret` / `watch`）与急停锁状态。
@@ -157,6 +163,8 @@ saperm_health {}
 |  | `saperm_char_note` | 更新角色知识 | 记录或丰富角色的百科描述与上下文 |
 |  | `saperm_char_unknowns` | 查看未知聚类 | 检视陌生人物出现统计并决定是否 promote |
 |  | `saperm_char_promote` | 晋升未知角色 | 将 `未知角色#1` 命名为正式角色名 |
+| **方案探测** | `saperm_profile` | 环境探测与推荐 | 首次接入或换机器时先跑一次，看 `recommended` 与 `reasons` |
+| **双方案识别** | `saperm_scan({mode})` | local / vision / auto | 文本够用走 local（0 token）；要看图标/照片/视频原貌走 vision |
 | **自动化输入** | `saperm_click` / `press` / `type` / `hotkey` | 鼠标键盘操作（含长按 holdMs） | 基于 OCR 坐标或 UIA 控件进行前台自动化交互 |
 | **急停** | `saperm_stop` | 立即急停 | 锁定输入注入；恢复需 `saperm_resume` 并经由用户明确授权 |
 

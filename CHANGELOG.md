@@ -1,5 +1,22 @@
 # Changelog (dsh-screen-attention)
 
+## v1.2.0 (2026-11-05) — 双运行方案（local / vision / hybrid）+ 环境自适应
+
+### 新增
+- **`saperm_profile`（环境探测）**：判定「本地识别 local」「视觉直传 vision」「混合 hybrid」哪条可用并给推荐。
+  只看三件真事：可用执行器（TensorRT → CUDA → DirectML → CPU）、模型文件齐全度、CPU 线程数。
+  返回 `modes`（各自 ok / 成本 / 速度）、`env`（providers / backend / cores / 可用内存）、`models`、`reasons`。结果缓存 60s，`force:true` 重新探测。
+- **`saperm_scan({mode})` 三档路由**：`local`（默认，只本地识别，0 token）/ `vision`（额外返回可直传画面 + token 估算）/ `auto`（按 profile 推荐）。
+  vision 模式的缩图**在截图阶段就做掉**（1260 宽 = 42×30），否则原分辨率 2582×1550 会撞 1024 token 上限。
+- **`saperm_health.scheme`**：自检里直接给出推荐方案、backend、GPU 与理由，不用额外调用。
+- **helper `profile` 命令**：输出执行器列表、GPU 布尔、backend、CPU 核数、可用内存、模型清单与决策理由。
+
+### 实测（本机 RTX 5070 Ti Laptop + Ultra 9 275HX 24核 / 31.5GB）
+- `saperm_profile` → `recommended: "hybrid"`，`providers: ["DmlExecutionProvider","CPUExecutionProvider"]`，`cores: 24`。
+- `saperm_scan({mode:"local"})` → **163ms**，`image: null`，0 token。
+- `saperm_scan({mode:"vision"})` → **200ms**，图 1260×681 = **529 token**（改前按原分辨率出图是 1024 token，省 48%）。
+- `saperm_scan({mode:"auto"})` → `recommended: "hybrid"` → 自动走 vision。
+
 ## v1.1.1 (2026-11-01) — L3 一次性审批 / 长按输入
 
 ### 新增
