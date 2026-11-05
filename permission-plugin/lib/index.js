@@ -1093,6 +1093,38 @@ export function apply(ctx) {
     },
   })
 
+  // ============ 拖框选区：用户说「框这块」，直接在屏幕上拖 ============
+  const REGION_FILE = join(PACKAGE_ROOT, '..', 'out', 'region.json')
+  function readRegion() {
+    try { const j = JSON.parse(readFileSync(REGION_FILE, 'utf8')); if (j && j.w > 0 && j.h > 0) return j } catch {}
+    return null
+  }
+
+  register({
+    name: 'saperm_region',
+    description: '拖框选区：用户说"框这块"时调用，屏幕变暗后让用户直接拖一个矩形，松手即保存（不用量像素）。之后 saperm_sheet / saperm_view 不传 x/y/w/h 时可复用。action: pick（拖框）/ get（读上次）/ clear（清除）. L0 观察，无需审批',
+    parameters: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', description: 'pick（默认，拖框）/ get / clear' },
+        timeoutMs: { type: 'integer', description: '等待用户拖框的毫秒上限（默认 120000）' },
+      },
+    },
+    execute: async (args) => {
+      const action = String(args.action || 'pick')
+      if (action === 'get') return { region: readRegion() }
+      if (action === 'clear') {
+        try { unlinkSync(REGION_FILE) } catch {}
+        return { cleared: true, region: null }
+      }
+      const r = await helperCall('region_pick', { timeoutMs: clampInt(args.timeoutMs, 120000, 5000, 600000) }, 150000)
+      if (!r || !r.ok) return { picked: false, cancelled: true, hint: '用户取消或超时（按 Esc 也是取消）' }
+      const region = { x: r.x, y: r.y, w: r.w, h: r.h }
+      try { writeFileSync(REGION_FILE, JSON.stringify({ ...region, at: Date.now() }), 'utf8') } catch {}
+      return { picked: true, region }
+    },
+  })
+
   register({
     name: 'saperm_sheet',
     description: '多帧拼图：连续抓 N 帧（默认 4）拼成一张网格图。**价格按张算不按帧算** —— 4 帧和 8 帧 token 相同，所以多留一帧几乎免费、漏掉一帧才贵。用于一次看清一段时间内的画面变化（网页滚动、视频、演示、操作回放）。返回网格布局与每格时间戳。L0 观察，无需审批',
@@ -1104,6 +1136,8 @@ export function apply(ctx) {
         quality: { type: 'string', description: 'low=798 约 242 token / standard=1050 / high=1260（默认）约 590 / ultra=1596' },
         maxW: { type: 'integer', description: '画布最大宽度（覆盖 quality，自动对齐 42）' },
         gap: { type: 'integer', description: '格子间距像素（默认 2）' },
+        select: { type: 'boolean', description: 'true（默认）=按画面变化量选帧（切点+积分，静止画面只出 1 张）；false=等间隔硬抓' },
+        maxMs: { type: 'integer', description: '选帧预算毫秒（默认 max(1200, frames×intervalMs×3)）' },
         x: { type: 'integer', description: '采集区域左上 x（默认全屏）' },
         y: { type: 'integer', description: '采集区域左上 y' },
         w: { type: 'integer', description: '采集区域宽' },
@@ -1115,17 +1149,20 @@ export function apply(ctx) {
       const wantW = snapWidth(qualityWidth(args.quality) || args.maxW || 1260)
       const req = {
         frames: clampInt(args.frames, 4, 1, 12),
-        intervalMs: clampInt(args.intervalMs, 120, 0, 5000),
+        intervalMs: clampInt(args.intervalMs, 120, 40, 5000),
         gap: clampInt(args.gap, 2, 0, 12),
         maxW: wantW,
+        select: args.select !== false,
       }
+      if (args.maxMs != null) req.maxMs = clampInt(args.maxMs, 3000, 300, 20000)
       if (args.x != null) { req.x = args.x; req.y = args.y; req.w = args.w; req.h = args.h }
       const r = await helperCall('sheet', req)
       const path = saveShot(r.jpegB64, 'sheet')
       const tokens = imageTokens(r.canvasW, r.canvasH)
       return {
         path,
-        frames: r.frames, cols: r.cols, rows: r.rows,
+        frames: r.frames, requested: r.requested, cols: r.cols, rows: r.rows,
+        selected: r.selected, isStatic: r.isStatic,
         w: r.canvasW, h: r.canvasH, cellW: r.cellW, cellH: r.cellH,
         tokens,
         perFrameTokens: Math.round(tokens / Math.max(1, r.frames)),
@@ -1345,6 +1382,8 @@ export function apply(ctx) {
         seconds: { type: 'integer', description: '任务时长（秒），AI 按任务需要决定；默认 180' },
         intervalMs: { type: 'integer', description: '采集间隔毫秒（默认 800，运动自动提速）' },
         reportEveryMs: { type: 'integer', description: '文字汇报间隔毫秒（默认 10000）' },
+        idleStopMin: { type: 'number', description: '用户连续这么久没碰键鼠就自动收工（分钟，默认 3；0=关闭）' },
+        maxReports: { type: 'integer', description: '最多汇报几次就收工（默认 0=不限）' },
         shotEveryMs: { type: 'integer', description: '屏幕图像抓取间隔毫秒（默认 30000）' },
         focus: { type: 'object', description: '关注区域 {x,y,w,h}（屏幕坐标），只感知该区域 OCR 增量', properties: { x: { type: 'integer' }, y: { type: 'integer' }, w: { type: 'integer' }, h: { type: 'integer' } } },
       },
@@ -1370,7 +1409,9 @@ export function apply(ctx) {
       }
       try { await helperCall('watch_start', { intervalMs: interval }) } catch {}
       try { await helperCall('overlay_open', {}) } catch {}
-      const task = { startedAt: Date.now(), seconds: secs, reportEvery, shotEvery, lastReport: 0, lastShot: 0, timer: null, endTimer: null, inFlight: false }
+      const idleStopMin = Number.isFinite(Number(args.idleStopMin)) ? Math.max(0, Number(args.idleStopMin)) : 3
+      const maxReports = Math.max(0, Number(args.maxReports) || 0)
+      const task = { startedAt: Date.now(), seconds: secs, reportEvery, shotEvery, lastReport: 0, lastShot: 0, timer: null, endTimer: null, inFlight: false, idleStopMin, maxReports, reports: 0 }
       state.observeTask = task
       injectToSession('[观察任务启动] 防打断已开启，持续识别 ' + secs + ' 秒。每 ' + Math.round(reportEvery / 1000) + 's 汇报屏幕变化摘要，每 ' + Math.round(shotEvery / 1000) + 's 抓取图像。')
       task.timer = setInterval(async () => {
@@ -1387,6 +1428,33 @@ export function apply(ctx) {
             const text = String((snap && snap.text) || '').trim()
             const added = String((snap && snap.added) || '').trim()
             const note = '已防打断）'
+            // 自动收工：用户离开（键鼠空闲超阈值）或汇报次数到顶，就不空转
+            task.reports++
+            if (task.maxReports && task.reports >= task.maxReports) {
+              injectToSession('[观察任务] 已汇报 ' + task.reports + ' 次，达到 maxReports，自动收工。')
+              if (state.observeTask === task) state.observeTask = null
+              state.interruptProtect = false
+              state.link = false
+              if (task.timer) clearInterval(task.timer)
+              if (task.endTimer) clearTimeout(task.endTimer)
+              try { await helperCall('watch_stop') } catch {}
+              return
+            }
+            if (task.idleStopMin > 0) {
+              try {
+                const ia = await helperCall('idle')
+                if (ia && ia.idleMs >= task.idleStopMin * 60000) {
+                  injectToSession('[观察任务] 用户已 ' + (ia.idleMs / 60000).toFixed(1) + ' 分钟没操作，自动收工（idleStopMin=' + task.idleStopMin + '）。')
+                  if (state.observeTask === task) state.observeTask = null
+                  state.interruptProtect = false
+                  state.link = false
+                  if (task.timer) clearInterval(task.timer)
+                  if (task.endTimer) clearTimeout(task.endTimer)
+                  try { await helperCall('watch_stop') } catch {}
+                  return
+                }
+              } catch {}
+            }
             injectToSession('[识图 ' + elapsed + 's/' + secs + 's] 运动=' + (snap && snap.motion) + ' 变化率=' + ((snap && snap.ratio) || 0) + ' 区域(' + rect.x + ',' + rect.y + ' ' + rect.w + 'x' + rect.h + ') 文本: ' + String(added || text || '(无变化)').slice(0, 220))
           }
           if (t - task.lastShot >= task.shotEvery) {

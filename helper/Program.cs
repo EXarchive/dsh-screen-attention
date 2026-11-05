@@ -2263,13 +2263,17 @@ class Program
 
             case "sheet":
                 {
-                    // 多帧拼图：连续抓 N 帧拼进一张网格图。
-                    // 关键是「价格按张算，不按帧算」——4 帧和 8 帧 token 相同，
-                    // 所以多留一帧几乎免费，漏掉一帧才贵。
+                    // 多帧拼图：**按画面变化量选帧**，不是等间隔硬抓。
+                    // 判据两条（缺一不可）：
+                    //   切点 = 分够大 且 是尖峰 且 运动补偿后确实变了 且 距上一刀够久
+                    //   积分 = 分不高但一直在动，攒够量才留（一镜到底没有尖峰，只能靠这个）
+                    // 静止画面天然只出一张 —— 这就是"静止几乎不花钱"的来源。
                     int frames = Math.Clamp(req.TryGetProperty("frames", out var pf) ? pf.GetInt32() : 4, 1, 12);
                     int maxW = req.TryGetProperty("maxW", out var pmw) ? pmw.GetInt32() : 1260;
-                    int intervalMs = Math.Clamp(req.TryGetProperty("intervalMs", out var pim) ? pim.GetInt32() : 120, 0, 5000);
+                    int intervalMs = Math.Clamp(req.TryGetProperty("intervalMs", out var pim) ? pim.GetInt32() : 120, 40, 5000);
                     int gap = Math.Clamp(req.TryGetProperty("gap", out var pg) ? pg.GetInt32() : 2, 0, 12);
+                    bool pick = !(req.TryGetProperty("select", out var psel) && psel.GetBoolean() == false);
+                    int budgetMs = Math.Clamp(req.TryGetProperty("maxMs", out var pms) ? pms.GetInt32() : Math.Max(1200, frames * intervalMs * 3), 300, 20000);
 
                     int vx2 = Gdi.GetSystemMetrics(76), vy2 = Gdi.GetSystemMetrics(77);
                     int vw2 = Gdi.GetSystemMetrics(78), vh2 = Gdi.GetSystemMetrics(79);
@@ -2280,26 +2284,83 @@ class Program
                     if (sw2 <= 0) sw2 = 1;
                     if (sh2 <= 0) sh2 = 1;
 
-                    // 等分网格：帧越多格子越小，一张图覆盖的时间越长
+                    // 先按目标帧数算格子尺寸（用最大帧数定格子，实际帧少时格子不会被撑大）
                     int cols = frames <= 1 ? 1 : frames == 2 ? 2 : frames <= 4 ? 2 : frames <= 6 ? 3 : 4;
-                    int rows = (int)Math.Ceiling((double)frames / cols);
+                    int rowsMax = (int)Math.Ceiling((double)frames / cols);
                     int cellW = Math.Max(1, (maxW - gap * (cols - 1)) / cols);
                     int cellH = Math.Max(1, (int)Math.Round(cellW * (double)sh2 / sw2));
-                    int canvasW = cellW * cols + gap * (cols - 1);
-                    int canvasH = cellH * rows + gap * (rows - 1);
+                    double fscale = (double)cellW / sw2;
 
+                    var picked = new List<(byte[] buf, int w, int h, int at, double score)>();
+                    var swatch = System.Diagnostics.Stopwatch.StartNew();
+                    var scorer = new Cuts.Scorer();
+
+                    if (pick)
+                    {
+                        // 积分门槛：4 分 × fps × 3 秒
+                        double fps = 1000.0 / intervalMs;
+                        double need = 4.0 * fps * 3.0;
+                        double accum = 0, prevScore = -1, lastCutAt = -999;
+                        long deadline = budgetMs;
+                        while (picked.Count < frames && swatch.ElapsedMilliseconds < deadline)
+                        {
+                            long tStart = swatch.ElapsedMilliseconds;
+                            var (fb, fw, fh) = Gdi.CaptureScaled(sx, sy, sw2, sh2, fscale);
+                            var (score, mc) = scorer.Push(fb, fw, fh);
+                            double t = (swatch.ElapsedMilliseconds - tStart) / 1000.0;  // 相对本张起点没用，用绝对
+                            t = swatch.ElapsedMilliseconds / 1000.0;
+
+                            if (score < 0)   // 首帧必留
+                            {
+                                picked.Add((fb, fw, fh, (int)swatch.ElapsedMilliseconds, 0));
+                            }
+                            else
+                            {
+                                bool isCut = score >= 12 && score > 2.5 * Math.Max(1.0, prevScore)
+                                             && mc >= 20 && (t - lastCutAt) >= 0.4;
+                                accum += Math.Max(0, score);
+                                bool isBurst = accum >= need;
+                                if (isCut || isBurst)
+                                {
+                                    picked.Add((fb, fw, fh, (int)swatch.ElapsedMilliseconds, Math.Round(score, 1)));
+                                    if (isCut) lastCutAt = t;
+                                    accum = 0;
+                                }
+                                prevScore = score;
+                            }
+                            int remain = intervalMs - (int)(swatch.ElapsedMilliseconds - tStart);
+                            if (remain > 0) Thread.Sleep(remain);
+                        }
+                        // 静止兜底：一张都没攒到（或只有首帧）也返回，标记 static
+                    }
+                    else
+                    {
+                        for (int i = 0; i < frames; i++)
+                        {
+                            long tStart = swatch.ElapsedMilliseconds;
+                            var (fb, fw, fh) = Gdi.CaptureScaled(sx, sy, sw2, sh2, fscale);
+                            scorer.Push(fb, fw, fh);
+                            picked.Add((fb, fw, fh, (int)swatch.ElapsedMilliseconds, 0));
+                            int remain = intervalMs - (int)(swatch.ElapsedMilliseconds - tStart);
+                            if (remain > 0) Thread.Sleep(remain);
+                        }
+                    }
+
+                    int n = Math.Max(1, picked.Count);
+                    // 实际帧数决定行数（静止时可能只有 1 张）
+                    int useCols = Math.Min(cols, n);
+                    int useRows = (int)Math.Ceiling((double)n / useCols);
+                    int canvasW = cellW * useCols + gap * (useCols - 1);
+                    int canvasH = cellH * useRows + gap * (useRows - 1);
                     byte[] canvas = new byte[canvasW * canvasH * 4];
                     for (int i = 0; i < canvas.Length; i += 4) { canvas[i] = 40; canvas[i + 1] = 40; canvas[i + 2] = 40; canvas[i + 3] = 255; }
 
-                    double fscale = (double)cellW / sw2;
                     var stamps = new List<object>();
-                    var swatch = System.Diagnostics.Stopwatch.StartNew();
-                    for (int i = 0; i < frames; i++)
+                    for (int i = 0; i < n; i++)
                     {
-                        long t = swatch.ElapsedMilliseconds;
-                        var (fb, fw, fh) = Gdi.CaptureScaled(sx, sy, sw2, sh2, fscale);
-                        int col = i % cols, row = i / cols;
+                        int col = i % useCols, row = i / useCols;
                         int ox = col * (cellW + gap), oy = row * (cellH + gap);
+                        var (fb, fw, fh, atMs, sc) = picked[i];
                         int copyW = Math.Min(fw, cellW), copyH = Math.Min(fh, cellH);
                         for (int ry = 0; ry < copyH; ry++)
                         {
@@ -2307,17 +2368,20 @@ class Program
                             int dstOff = ((oy + ry) * canvasW + ox) * 4;
                             Buffer.BlockCopy(fb, srcOff, canvas, dstOff, copyW * 4);
                         }
-                        stamps.Add(new { i, row, col, atMs = t });
-                        if (i < frames - 1 && intervalMs > 0) Thread.Sleep(intervalMs);
+                        DrawIndex(canvas, canvasW, canvasH, ox + 6, oy + 6, i + 1, 2);
+                        stamps.Add(new { i, row, col, atMs, score = sc });
                     }
+
                     string tmpDir2 = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Temp");
                     Directory.CreateDirectory(tmpDir2);
                     string tmp2 = Path.Combine(tmpDir2, "sa-sheet-" + Guid.NewGuid().ToString("N") + ".jpg");
                     var jpg2 = GdiPlus.EncodeJpeg(canvas, canvasW, canvasH, tmp2);
                     return new
                     {
-                        frames, cols, rows, cellW, cellH, canvasW, canvasH, gap,
-                        elapsedMs = swatch.ElapsedMilliseconds,
+                        frames = n, requested = frames, cols = useCols, rows = useRows,
+                        cellW, cellH, canvasW, canvasH, gap,
+                        selected = pick, elapsedMs = swatch.ElapsedMilliseconds,
+                        isStatic = pick && n <= 1,
                         rect = new { x = sx, y = sy, w = sw2, h = sh2 },
                         cells = stamps,
                         jpegB64 = Convert.ToBase64String(jpg2),
@@ -2778,6 +2842,12 @@ class Program
                         reasons,
                     };
                 }
+            case "region_pick":
+                {
+                    int timeout = req.TryGetProperty("timeoutMs", out var ptm) ? ptm.GetInt32() : 120000;
+                    var r = RegionPicker.Pick(timeout);
+                    return new { ok = r.Ok, cancelled = r.Cancelled, x = r.X, y = r.Y, w = r.W, h = r.H };
+                }
             case "providers":
                 return new
                 {
@@ -2890,6 +2960,50 @@ class Program
                 return new { bye = true };
 
             default: throw new Exception("UNKNOWN_CMD: " + cmd);
+        }
+    }
+
+
+    /// <summary>在画布上烧帧号（3×5 点阵，白底黑字），让 AI 看图能对上 cells 时间戳。</summary>
+    static void DrawIndex(byte[] canvas, int cw, int ch, int x0, int y0, int num, int scale)
+    {
+        // 3×5 点阵字模：bit0..bit14，行优先
+        int[] glyph = new int[10] {
+            0x7B6F, 0x2492, 0x79E7, 0x79E7, 0x4F5B, 0x79CF, 0x79EF, 0x2492, 0x79E7, 0x79E7
+        };
+        int g = num >= 0 && num <= 9 ? glyph[num] : 0;
+        int w = 3 * scale, ht = 5 * scale, pad = scale * 2;
+        // 白底
+        for (int y = y0 - pad; y < y0 + ht + pad; y++)
+        {
+            if (y < 0 || y >= ch) continue;
+            for (int x = x0 - pad; x < x0 + w + pad; x++)
+            {
+                if (x < 0 || x >= cw) continue;
+                int o = (y * cw + x) * 4;
+                canvas[o] = 245; canvas[o + 1] = 245; canvas[o + 2] = 245; canvas[o + 3] = 255;
+            }
+        }
+        // 黑点
+        for (int gy = 0; gy < 5; gy++)
+        {
+            for (int gx = 0; gx < 3; gx++)
+            {
+                int bit = gy * 3 + gx;
+                if (((g >> bit) & 1) == 0) continue;
+                for (int sy = 0; sy < scale; sy++)
+                {
+                    int y = y0 + gy * scale + sy;
+                    if (y < 0 || y >= ch) continue;
+                    for (int sx = 0; sx < scale; sx++)
+                    {
+                        int x = x0 + gx * scale + sx;
+                        if (x < 0 || x >= cw) continue;
+                        int o = (y * cw + x) * 4;
+                        canvas[o] = 20; canvas[o + 1] = 20; canvas[o + 2] = 20; canvas[o + 3] = 255;
+                    }
+                }
+            }
         }
     }
 
