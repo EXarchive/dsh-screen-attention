@@ -394,7 +394,8 @@ export function apply(ctx) {
     linkBudget: { count: 0, windowStart: 0 },  // 联动分钟配额（60s ≤6 次，防刷屏）
     interruptProtect: false,   // 防打断状态：识图/观察任务开启时打开，结束自动关闭（inject 不中断对话）
     observeTask: null,
-    target: null,          // 锁定的观察窗口 { hwnd, title }：只存标识，矩形每次现取         // 持续观察任务：{ startedAt, seconds, reportEvery, shotEvery, lastReport, lastShot, timer, endTimer }
+    target: null,          // 锁定的观察窗口 { hwnd, title }：只存标识，矩形每次现取
+    linkShot: true,        // 变化注入时附带画面（否则模型只收到文字，等于蒙着眼睛）         // 持续观察任务：{ startedAt, seconds, reportEvery, shotEvery, lastReport, lastShot, timer, endTimer }
     taskAgentId: null,         // 发起观察任务的 agent（会话）id：汇报定向注入到该会话，而非依赖 currentInitiator
     interpretInject: null,     // 连续解读 → 会话注入配置（inject/minInjectMs/kinds + 轮询游标）
     inferInject: null,         // 逐帧识别 → 会话注入配置（inject/injectChanges/minInjectMs + seq 游标）
@@ -505,7 +506,7 @@ export function apply(ctx) {
       const now = Date.now()
       if (now - state.lastLinkAt < 2000) return
       state.lastLinkAt = now
-      helperCall('watch_snapshot').then((snap) => {
+      helperCall('watch_snapshot').then(async (snap) => {
         if (!snap) return
         const rect = snap.rect || {}
         const text = String(snap.text || '').trim()
@@ -515,7 +516,15 @@ export function apply(ctx) {
         if (text === state.lastLinkText && text !== '') return
         state.lastLinkText = text
         if (!linkBudgetOk()) return
-        injectToSession(body)
+        // 画面也要给：只发文字等于"蒙着眼睛描述"，模型只能说"屏幕变了"
+        let shot = null
+        if (state.linkShot) {
+          try {
+            const s = await helperCall('screenshot', { maxW: 900 })
+            if (s && s.jpegB64) shot = s.jpegB64
+          } catch {}
+        }
+        injectToSession(body, shot)
       }).catch(() => {})
     }
   }
@@ -532,7 +541,7 @@ export function apply(ctx) {
   }
 
   // 变化摘要 → 注入当前发起方 agent（inject 不唤醒：对话不中断；steer 唤醒：空闲同步开轮次）
-  function injectToSession(body) {
+  async function injectToSession(body, jpegB64) {
     try {
       // 优先定向到发起观察任务的 agent（会话），避免依赖 currentInitiator（观察场景可能取空）
       let initiator = undefined
@@ -547,10 +556,21 @@ export function apply(ctx) {
         return
       }
       appendObservationLog({ type: 'inject', body })
+      const content = [{ type: 'text', text: body }]
+      // 关键：变化时把画面一起塞进消息 —— 模型才"看得见"，不然只有文字摘要
+      if (jpegB64) {
+        try {
+          if (ctx.attachments && typeof ctx.attachments.saveImages === 'function') {
+            const data = new Uint8Array(Buffer.from(jpegB64, 'base64'))
+            const refs = await ctx.attachments.saveImages([{ data, mediaType: 'image/jpeg', name: 'screen-change.jpg' }])
+            if (refs && refs[0]) content.push({ type: 'image', attachment: refs[0] })
+          }
+        } catch (e) { console.log('[sa-perm] 变化截图附件失败: ' + ((e && e.message) || e)) }
+      }
       const message = {
         id: (globalThis.crypto && crypto.randomUUID) ? crypto.randomUUID() : 'sa-change-' + Date.now() + '-' + Math.random().toString(16).slice(2),
         role: 'user',
-        content: [{ type: 'text', text: body }],
+        content,
         source: { kind: 'plugin', plugin: 'dsh-screen-attention-perm', form: 'notice', summary: '屏幕变化摘要' },
       }
       if (state.linkWake) {
@@ -1619,6 +1639,7 @@ export function apply(ctx) {
       properties: {
         intervalMs: { type: 'integer', description: '静止时采集间隔毫秒（默认 800，最小 100）' },
         wake: { type: 'boolean', description: 'true=变化时 steer 唤醒 AI 立即响应；false(默认)=inject 排队不打断' },
+        shot: { type: 'boolean', description: '变化时附带画面（默认 true）——AI 才能真正"看到"变化而不是只读文字摘要；关了更省 token' },
         focus: { type: 'object', description: '关注区域 {x,y,w,h}（屏幕坐标），限定观察范围（如对话窗口区域，用于感知对话输出）', properties: { x: { type: 'integer' }, y: { type: 'integer' }, w: { type: 'integer' }, h: { type: 'integer' } } },
       },
     },
@@ -1626,6 +1647,7 @@ export function apply(ctx) {
       const iv = Number.isFinite(args.intervalMs) ? args.intervalMs : 800
       state.link = true
       state.linkWake = !!args.wake
+      state.linkShot = args.shot !== false
       state.autoWatch = false   // 显式启动 → 关闭小窗时不停 watch
       if (args.focus && Number.isFinite(args.focus.x)) {
         await helperCall('watch_focus', args.focus)
