@@ -1617,8 +1617,10 @@ static class Watch
 {
     static Thread thread;
     static volatile bool watching;
+    static volatile int curMs = 0;        // 当前实际采样间隔（自适应浮动，不是固定值）
     static readonly object SyncLock = new object();
     public static bool IsWatching => watching;
+    public static int EffectiveMs => curMs > 0 ? curMs : IntervalMs;
     public static int IntervalMs = 1000;
     static readonly int FastMs = 100;
     static volatile bool motion;
@@ -1639,6 +1641,7 @@ static class Watch
     public static void Start(int intervalMs)
     {
         IntervalMs = Math.Max(10, intervalMs);
+        curMs = IntervalMs;               // 从基准起步，之后自己浮动
         if (watching) return;
         watching = true;
         FrameHub.Acquire();
@@ -1753,11 +1756,16 @@ static class Watch
                 DetectMotion(buf, w, h);
                 // 迟滞调速：连续运动→快模式；连续静止→慢模式
                 if (motion) { active++; steady = 0; } else { steady++; active = 0; }
-                int curMs = FastMs;
-                if (before == motion) curMs = motion ? FastMs : IntervalMs;   // 状态未翻转时按当前状态
-                if (motion && active >= 3) curMs = FastMs;
-                else if (!motion && steady >= 6) curMs = IntervalMs;
-                else if (!motion) curMs = IntervalMs;
+                // 自适应间隔（AIMD）：变化→乘性加速，连续静止→乘性减速。
+                // 不绑死任何一个值：实测同一场景 120ms 有效、500/900ms 反而 0（内容节拍，
+                // 某些间隔正好踩在同一姿态），所以固定间隔必然有"盲区"，让它自己浮动。
+                const int MinMs = 120;    // 实测再快只会重复读旧帧
+                const int MaxMs = 1600;   // 再慢就跟不上内容切换
+                // 加速要"实质变化"才算：光标闪烁/文字流式输出这类小 motion（ratio<0.005）
+                // 不值得拉满帧率，否则全屏观察时会被自身界面刷成 120ms 白烧 CPU。
+                bool substantial = motion && motionRatio >= 0.005;
+                if (substantial) curMs = (int)Math.Max(MinMs, curMs * 0.7);
+                else if (steady >= 2) curMs = (int)Math.Min(MaxMs, curMs * 1.4);
                 int sleep = curMs - (int)t0.ElapsedMilliseconds;
                 Thread.Sleep(Math.Max(10, sleep));
             }
@@ -2804,6 +2812,70 @@ class Program
                     return new { w, h, bw, bh, rect = new { x, y, w, h }, jpegB64 = Convert.ToBase64String(jpg), bytes = jpg.Length };
                 }
 
+            case "calibrate":
+                {
+                    // 自动找"变化最优"的采样间隔：屏幕合成有更新粒度，抓太快只是重复读旧内容。
+                    // 做法：每个候选间隔采 N 帧算 score，用「平均分 × 变化率」作为有效度，取最高。
+                    int vx = Gdi.GetSystemMetrics(76), vy = Gdi.GetSystemMetrics(77);
+                    int vw = Gdi.GetSystemMetrics(78), vhh = Gdi.GetSystemMetrics(79);
+                    int cx = req.TryGetProperty("x", out var pcx) ? pcx.GetInt32() : vx;
+                    int cy = req.TryGetProperty("y", out var pcy) ? pcy.GetInt32() : vy;
+                    int cw = req.TryGetProperty("w", out var pcw) ? pcw.GetInt32() : vw;
+                    int chh = req.TryGetProperty("h", out var pch) ? pch.GetInt32() : vhh;
+                    int per = Math.Clamp(req.TryGetProperty("frames", out var pcf) ? pcf.GetInt32() : 4, 2, 10);
+                    int[] cand = { 120, 250, 500, 900, 1500, 2500 };
+                    int maxCand = Math.Clamp(req.TryGetProperty("candidates", out var pcc) ? pcc.GetInt32() : 6, 2, 6);
+                    double scale = cw > 900 ? 900.0 / cw : 1.0;
+
+                    var rows = new List<object>();
+                    int bestIv = 900; double bestEff = -1;
+                    int fastIv = 0;   // 变化率够用的最小间隔（响应优先）
+                    int fastRate = 0;
+                    var sw2 = System.Diagnostics.Stopwatch.StartNew();
+                    for (int ci = 0; ci < maxCand; ci++)
+                    {
+                        int iv = cand[ci];
+                        var scorer = new Cuts.Scorer();
+                        double sum = 0; int scored = 0, changes = 0; double maxS = 0;
+                        for (int i = 0; i < per; i++)
+                        {
+                            var (b, bw, bh) = Gdi.CaptureScaled(cx, cy, cw, chh, scale);
+                            var (sc, mc) = scorer.Push(b, bw, bh);
+                            if (sc >= 0) { sum += sc; scored++; if (sc >= 6) changes++; if (sc > maxS) maxS = sc; }
+                            if (i < per - 1) Thread.Sleep(iv);
+                        }
+                        double avg = scored > 0 ? sum / scored : 0;
+                        double rate = scored > 0 ? (double)changes / scored : 0;
+                        // 有效度：既要持续有变化（rate），又要有足够幅度（avg）；两者相乘，任一为 0 则无效
+                        double eff = avg * rate;
+                        rows.Add(new
+                        {
+                            intervalMs = iv, avgScore = Math.Round(avg, 2), maxScore = Math.Round(maxS, 2),
+                            changeRate = Math.Round(rate, 2), effective = Math.Round(eff, 2),
+                        });
+                        if (eff > bestEff) { bestEff = eff; bestIv = iv; }
+                        // 响应优先：变化率 ≥0.34 就算"抓得住"，取其中最小的间隔（跟手且有效）
+                        if (rate >= 0.34 && fastIv == 0) { fastIv = iv; fastRate = (int)Math.Round(rate * 100); }
+                    }
+                    // 注意：间隔与变化率不是单调关系——实测 900ms 变化率 0 而 500ms 有 0.33
+                    // （内容节拍不均匀，某些间隔正好踩在同一姿态）。所以要么响应优先取最小有效间隔，
+                    // 要么退回有效度最高。单次标定有噪声，要稳就多跑几轮取众数。
+                    return new
+                    {
+                        bestIntervalMs = fastIv > 0 ? fastIv : bestIv,
+                        bestEffective = Math.Round(bestEff, 2),
+                        responsiveIntervalMs = fastIv > 0 ? fastIv : 0,
+                        responsiveRate = fastRate / 100.0,
+                        maxEffectiveIntervalMs = bestIv,
+                        rect = new { x = cx, y = cy, w = cw, h = chh },
+                        framesPerCandidate = per,
+                        elapsedMs = sw2.ElapsedMilliseconds,
+                        candidates = rows,
+                        hint = bestEff <= 0
+                            ? "所有候选间隔都没测到变化：目标区域可能静止，或被别的窗口盖住（先用 saperm_view 确认抓到的内容）"
+                            : "推荐用 bestIntervalMs；effective=平均分×变化率，0 表示该间隔下根本抓不到变化",
+                    };
+                }
             case "sheet":
                 {
                     // 多帧拼图：**按画面变化量选帧**，不是等间隔硬抓。
@@ -3209,6 +3281,7 @@ class Program
                     {
                         watching = Watch.IsWatching,
                         intervalMs = Watch.IntervalMs,
+                        effectiveMs = Watch.EffectiveMs,   // 自适应后的实际间隔（自己浮动，不是固定值）
                         motion = Watch.Motion,
                         motionRatio = Math.Round(Watch.MotionRatio, 4),
                         motionRect = mr.IsEmpty ? null : new { x = mr.X, y = mr.Y, w = mr.Width, h = mr.Height },

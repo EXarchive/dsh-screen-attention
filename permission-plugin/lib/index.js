@@ -1398,6 +1398,43 @@ export function apply(ctx) {
     },
   })
 
+  // ============ 自动标定采样间隔：找出"真能抓到变化"的那个间隔 ============
+  // 实测背景：屏幕合成有更新粒度，intervalMs=200 时连续抓只是重复读旧帧（score 恒 0），
+  // 900ms 才正常。所以间隔不能拍脑袋给，要现测。
+  const CAL_CACHE = { at: 0, key: "", result: null }
+  register({
+    name: 'saperm_calibrate',
+    description: '自动标定采样间隔：对同一区域逐个试 120/250/500/900/1500/2500ms，测出每个间隔下"能否真正抓到变化"，给出推荐值。因为屏幕合成有更新粒度——抓得太快只会重复读旧内容（实测 200ms 恒 0、900ms 正常）。结果缓存 2 分钟。L0 观察，无需审批',
+    parameters: {
+      type: 'object',
+      properties: {
+        x: { type: 'integer', description: '区域左上 x（默认全屏）' },
+        y: { type: 'integer' },
+        w: { type: 'integer' },
+        h: { type: 'integer' },
+        frames: { type: 'integer', description: '每个间隔采样帧数（默认 4）' },
+        force: { type: 'boolean', description: 'true=跳过缓存重新标定' },
+      },
+    },
+    execute: async (args) => {
+      const rg = await resolveObserveRect(args)
+      const key = rg ? rg.x + "," + rg.y + "," + rg.w + "," + rg.h : "screen"
+      if (!args.force && CAL_CACHE.result && CAL_CACHE.key === key && Date.now() - CAL_CACHE.at < 120000) {
+        return { ...CAL_CACHE.result, cached: true }
+      }
+      const r = await helperCall('calibrate', {
+        x: rg ? rg.x : undefined, y: rg ? rg.y : undefined,
+        w: rg ? rg.w : undefined, h: rg ? rg.h : undefined,
+        frames: clampInt(args.frames, 4, 2, 10),
+      }, 60000)
+      if (r && r.bestIntervalMs) {
+        CAL_CACHE.at = Date.now(); CAL_CACHE.key = key
+        CAL_CACHE.result = { ...r, from: rg ? rg.from : 'screen' }
+      }
+      return { ...r, from: rg ? rg.from : 'screen', cached: false }
+    },
+  })
+
   register({
     name: 'saperm_sheet',
     description: '多帧拼图：连续抓 N 帧（默认 4）拼成一张网格图。**价格按张算不按帧算** —— 4 帧和 8 帧 token 相同，所以多留一帧几乎免费、漏掉一帧才贵。用于一次看清一段时间内的画面变化（网页滚动、视频、演示、操作回放）。返回网格布局与每格时间戳。L0 观察，无需审批',

@@ -20,25 +20,30 @@ static class Cuts
     public const int ScanH = 36;
     public const int N = ScanW * ScanH;
 
-    /// <summary>64×36 网格：每格 4 点采样求平均（BGRA 输入）。</summary>
-    /// <remarks>曾试过 3×3 九点采样想提高小区域敏感度，结果实测 score 恒为 0（全场景失灵），已回滚。</remarks>
+    /// <summary>64×36 网格，每格 **3×3 九点**采样求平均（BGRA 输入）。小区域用 4 点会把细粒度变化抹平。</summary>
     public static void GridRgb(byte[] bgra, int w, int h, float[] outGrid)
     {
         double sx = (double)w / ScanW, sy = (double)h / ScanH;
         for (int gy = 0; gy < ScanH; gy++)
         {
-            int y0 = (int)((gy + 0.25) * sy), y1 = (int)((gy + 0.75) * sy);
-            if (y0 >= h) y0 = h - 1; if (y1 >= h) y1 = h - 1;
-            int r0 = y0 * w * 4, r1 = y1 * w * 4;
             for (int gx = 0; gx < ScanW; gx++)
             {
-                int x0 = (int)((gx + 0.25) * sx), x1 = (int)((gx + 0.75) * sx);
-                if (x0 >= w) x0 = w - 1; if (x1 >= w) x1 = w - 1;
-                int a = r0 + x0 * 4, b = r0 + x1 * 4, cc = r1 + x0 * 4, d = r1 + x1 * 4;
+                float sr = 0, sg = 0, sb = 0;
+                for (int oy = 0; oy < 3; oy++)
+                {
+                    int py = (int)((gy + (oy + 0.5) / 3.0) * sy);
+                    if (py >= h) py = h - 1;
+                    int row = py * w * 4;
+                    for (int ox = 0; ox < 3; ox++)
+                    {
+                        int px = (int)((gx + (ox + 0.5) / 3.0) * sx);
+                        if (px >= w) px = w - 1;
+                        int off = row + px * 4;
+                        sb += bgra[off]; sg += bgra[off + 1]; sr += bgra[off + 2];
+                    }
+                }
                 int i = (gy * ScanW + gx) * 3;
-                outGrid[i]     = (bgra[a + 2] + bgra[b + 2] + bgra[cc + 2] + bgra[d + 2]) * 0.25f;
-                outGrid[i + 1] = (bgra[a + 1] + bgra[b + 1] + bgra[cc + 1] + bgra[d + 1]) * 0.25f;
-                outGrid[i + 2] = (bgra[a]     + bgra[b]     + bgra[cc]     + bgra[d])     * 0.25f;
+                outGrid[i] = sr / 9f; outGrid[i + 1] = sg / 9f; outGrid[i + 2] = sb / 9f;
             }
         }
     }
