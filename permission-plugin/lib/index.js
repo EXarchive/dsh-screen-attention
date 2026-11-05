@@ -509,13 +509,18 @@ export function apply(ctx) {
       const now = Date.now()
       if (now - state.lastLinkAt < 1200) { appendObservationLog({ type: 'inject-skip', reason: 'throttle' }); return }
       state.lastLinkAt = now
+      // 事件已经带了 ratio/rect —— 必须用它判变化。
+      // 原来靠 watch_snapshot 的 motion，但快照是 2 秒后才拍的，那时画面往往已静止，
+      // 于是每条事件都被判成 no-motion-no-text 丢弃（实测踩过）。
+      const evRatio = Number(data && data.ratio) || 0
+      const evRect = (data && data.rect) || {}
       helperCall('watch_snapshot').then(async (snap) => {
-        if (!snap) { appendObservationLog({ type: 'inject-skip', reason: 'snap-null' }); return }
-        const rect = snap.rect || {}
-        const text = String(snap.text || '').trim()
-        const added = String(snap.added || '').trim()
-        if (!snap.motion && !text) { appendObservationLog({ type: 'inject-skip', reason: 'no-motion-no-text' }); return }
-        const body = '[屏幕变化通知] 屏幕运动区域 (' + rect.x + ',' + rect.y + ' ' + rect.w + 'x' + rect.h + ')，变化率 ' + (snap.ratio || 0) + '，变化文本: ' + (added ? added : (text ? text : '(无文本)')) + '。若与当前任务相关可继续处理；无关则忽略。'
+        const text = String((snap && snap.text) || '').trim()
+        const added = String((snap && snap.added) || '').trim()
+        // 事件本身已由 helper 的 m 判定（含 windowSum>=12 细粒度累计），此处不再二次判 ratio ——
+        // 细粒度变化时 ratio 可能接近 0，再做 evRatio<=0 会把它们全丢掉（实测踩过）。
+        // 刷屏由下面的 1.2s 节流 + 30 次/分钟配额控制。
+        const body = '[屏幕变化通知] 屏幕运动区域 (' + (evRect.x ?? 0) + ',' + (evRect.y ?? 0) + ' ' + (evRect.w ?? 0) + 'x' + (evRect.h ?? 0) + ')，变化率 ' + evRatio + '，变化文本: ' + (added ? added : (text ? text : '(无文本)')) + '。若与当前任务相关可继续处理；无关则忽略。'
         if (text === state.lastLinkText && text !== '') { appendObservationLog({ type: 'inject-skip', reason: 'dup-text' }); return }
         state.lastLinkText = text
         if (!linkBudgetOk()) { appendObservationLog({ type: 'inject-skip', reason: 'budget', count: state.linkBudget.count, windowMs: Date.now() - state.linkBudget.windowStart }); return }

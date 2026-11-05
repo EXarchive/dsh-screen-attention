@@ -1,5 +1,37 @@
 # Changelog (dsh-screen-attention)
 
+## v1.10.4 (2026-11-05) — 注入链路的第三、四道闸门
+
+重启后事件通道已完全正常（日志 15:10 实测），注入了三道闸门，逐层拆掉：
+
+### 闸门 1（v1.10.3 修）：事件分发只转发 hotkey
+`change` 被 `continue` 直接丢弃 → 改为全部转发。重启后实证事件到达。
+
+### 闸门 2（v1.10.3 修）：热加载实例叠加
+新模块实例的 listener 加在新 Set 上，旧实例的 reader 遍历旧 Set。
+→ `globalThis` 共享 + 新实例 kill 上一代 helper 接管。
+
+### 闸门 3（本轮修）：用 2 秒后的快照判变化
+```js
+if (!snap.motion && !text) skip   // watch_snapshot 是 2s 后拍的，那时画面早静止了
+```
+事件本就带 `ratio`/`rect`，却弃之不用去重新快照 —— 于是每条事件都被判成「没变化」丢弃。
+→ 改用事件自带的 `data.ratio` / `data.rect`。
+
+### 闸门 4（本轮修）：对 ratio 做二次判据
+```js
+if (evRatio <= 0 && !text) skip   // 细粒度变化时 ratio 可能≈0
+```
+helper 的 `m` 判定是 `ratio > ratioTh || windowSum >= 12`——细粒度累计触发时 `ratio` 可能接近 0，
+二次判 `evRatio <= 0` 又把它们全扔了。
+→ **事件本身已代表有变化，不再二次判**。刷屏由 1.2s 节流 + 30 次/分钟配额控制。
+
+### 状态
+四道闸门全部拆除后，**最后一次端到端验证未能完成**：helper 在 15:10:58 崩溃（日志 `helper_crash`），
+测试期间没有 change 事件发出。
+
+已知遗留：helper 崩溃频率偏高（本次会话日志里 `helper_crash` 出现十余次），需单独排查。
+
 ## v1.10.3 (2026-11-05) — 热加载实例叠加的两个真 bug
 
 ### 本轮确证的修复
