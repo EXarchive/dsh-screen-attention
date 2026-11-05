@@ -16,7 +16,7 @@ const HELPER_EXE =
   process.env.SA_HELPER_EXE ||
   join(PACKAGE_ROOT, '..', 'helper', 'bin', 'Release', 'net9.0-windows10.0.19041.0', 'SaHelper.exe')
 
-const L2_TOOLS = ['saperm_press', 'saperm_click', 'saperm_scroll', 'saperm_type', 'saperm_hotkey', 'saperm_clipboard', 'saperm_focus', 'saperm_excel_goto', 'saperm_excel_write', 'saperm_excel_read', 'saperm_fill_write']
+const L2_TOOLS = ['saperm_press', 'saperm_click', 'saperm_scroll', 'saperm_type', 'saperm_hotkey', 'saperm_clipboard', 'saperm_focus', 'saperm_excel', 'saperm_fill']
 const L3_TOOLS = ['saperm_drag', 'saperm_doubleclick']
 const INPUT_TOOLS = [...L2_TOOLS, ...L3_TOOLS]
 
@@ -2163,40 +2163,44 @@ export function apply(ctx) {
     await new Promise(r => setTimeout(r, 700))
   }
 
+  // Excel 操作合并为一个入口（原 4 个工具：goto/write/read/cells）
+  const EXCEL_ACTIONS = ['goto', 'write', 'read', 'cells']
   register({
-    name: 'saperm_excel_goto',
-    description: 'Excel 单元格定位（L2）：激活 Excel → F5 → 输入引用（如 "Sheet1!B5"）→ Enter。先 saperm_focus 或传 title/hwnd',
+    name: 'saperm_excel',
+    description: 'Excel 操作（统一入口）：action=goto 定位单元格(激活→F5→引用→Enter) | write 写单元格(多行/超长自动剪贴板粘贴，默认回读校验) | read 读单元格(Ctrl+C→剪贴板) | cells 可见单元格网格(UIA，过滤虚拟化离屏假坐标)。L0 观察 / L2 输入，先 saperm_focus 或传 hwnd/title',
     parameters: {
       type: 'object',
       properties: {
-        ref: { type: 'string', description: '单元格引用，如 Sheet1!B5 或 B5' },
+        action: { type: 'string', enum: EXCEL_ACTIONS, description: '操作类型' },
+        ref: { type: 'string', description: 'goto/write/read 用：单元格引用，如 Sheet1!B5 或 B5' },
+        value: { type: 'string', description: 'write 用：写入的值' },
+        verify: { type: 'boolean', description: 'write 用：写后 Ctrl+C 回读校验（默认 true）' },
+        maxCells: { type: 'integer', description: 'cells 用：最多返回单元格数（默认 100）' },
         hwnd: { type: 'integer' }, title: { type: 'string' },
       },
-      required: ['ref'],
+      required: ['action'],
     },
     execute: async (args) => {
+      const act = String(args.action || '')
+      if (!EXCEL_ACTIONS.includes(act)) throw new Error('action 必须是: ' + EXCEL_ACTIONS.join(' | '))
+      if (act === 'cells') {
+        const r = await helperCall('uia', args.hwnd ? { hwnd: args.hwnd } : {})
+        const all = (r && r.items) || []
+        const cells = all.filter(x => /^[A-Z]{1,3}[0-9]+$/.test(String(x.text || ''))
+          && x.rect && x.rect.x >= 0 && x.rect.y >= 0 && x.rect.w > 0 && x.rect.h > 0)
+          .map(x => ({ cell: x.text, x: x.rect.x, y: x.rect.y, w: x.rect.w, h: x.rect.h }))
+        return { cells: cells.slice(0, args.maxCells || 100), total: cells.length }
+      }
       const hwnd = await excelFocus(args)
       await excelGoto(args.ref)
-      return { done: true, ref: args.ref, hwnd }
-    },
-  })
-
-  register({
-    name: 'saperm_excel_write',
-    description: 'Excel 写单元格（L2）：激活 → GoTo 引用 → 输入值（多行/超长自动剪贴板粘贴）→ 可选回读校验',
-    parameters: {
-      type: 'object',
-      properties: {
-        ref: { type: 'string' },
-        value: { type: 'string' },
-        verify: { type: 'boolean', description: '写后 Ctrl+C 回读校验（默认 true）' },
-        hwnd: { type: 'integer' }, title: { type: 'string' },
-      },
-      required: ['ref', 'value'],
-    },
-    execute: async (args) => {
-      const hwnd = await excelFocus(args)
-      await excelGoto(args.ref)
+      if (act === 'goto') return { done: true, ref: args.ref, hwnd }
+      if (act === 'read') {
+        await helperCall('hotkey', { keys: ['CTRL', 'C'] })
+        await new Promise(r => setTimeout(r, 700))
+        const cg = await helperCall('clipboard_get', {})
+        return { done: true, ref: args.ref, text: String((cg && cg.text) || ''), hwnd }
+      }
+      // write
       const v = String(args.value == null ? '' : args.value)
       if (v.indexOf('\n') >= 0 || v.length > 200) {
         await helperCall('clipboard_set', { text: v })
@@ -2219,41 +2223,6 @@ export function apply(ctx) {
         } catch { }
       }
       return { done: true, ref: args.ref, written: v.length, readback, verified: readback === null ? null : readback === v }
-    },
-  })
-
-  register({
-    name: 'saperm_excel_read',
-    description: 'Excel 读单元格（L2）：激活 → GoTo 引用 → Ctrl+C → 读剪贴板返回文本。用于回读验证',
-    parameters: {
-      type: 'object',
-      properties: { ref: { type: 'string' }, hwnd: { type: 'integer' }, title: { type: 'string' } },
-      required: ['ref'],
-    },
-    execute: async (args) => {
-      const hwnd = await excelFocus(args)
-      await excelGoto(args.ref)
-      await helperCall('hotkey', { keys: ['CTRL', 'C'] })
-      await new Promise(r => setTimeout(r, 700))
-      const cg = await helperCall('clipboard_get', {})
-      return { done: true, ref: args.ref, text: String((cg && cg.text) || ''), hwnd }
-    },
-  })
-
-  register({
-    name: 'saperm_excel_cells',
-    description: 'Excel 可见单元格网格（UIA DataItem，L0 观察）：返回单元格名+屏幕坐标，自动过滤虚拟化的离屏假坐标',
-    parameters: {
-      type: 'object',
-      properties: { hwnd: { type: 'integer' }, maxCells: { type: 'integer' } },
-    },
-    execute: async (args) => {
-      const r = await helperCall('uia', args.hwnd ? { hwnd: args.hwnd } : {})
-      const all = (r && r.items) || []
-      const cells = all.filter(x => /^[A-Z]{1,3}[0-9]+$/.test(String(x.text || ''))
-        && x.rect && x.rect.x >= 0 && x.rect.y >= 0 && x.rect.w > 0 && x.rect.h > 0)
-        .map(x => ({ cell: x.text, x: x.rect.x, y: x.rect.y, w: x.rect.w, h: x.rect.h }))
-      return { cells: cells.slice(0, args.maxCells || 100), total: cells.length }
     },
   })
 
@@ -2442,113 +2411,112 @@ export function apply(ctx) {
     },
   })
 
+  // ===== 填表任务持久化（v1.10.1 补：这些函数原先只有调用没有定义，fill 系列一直是坏的）=====
+  const FILL_DIR = join(PACKAGE_ROOT, '..', 'out', 'fill')
+  const fillJobFile = (id) => join(FILL_DIR, String(id) + '.json')
+  function fillResolve(job) {
+    if (job) return String(job)
+    if (!existsSync(FILL_DIR)) return ''
+    const js = readdirSync(FILL_DIR).filter(f => f.endsWith('.json')).sort()
+    return js.length ? js[js.length - 1].replace(/\.json$/, '') : ''
+  }
+  function fillLoad(id) {
+    if (!id) throw new Error('没有填表任务，请先 action:start')
+    const f = fillJobFile(id)
+    if (!existsSync(f)) throw new Error('任务不存在: ' + id)
+    return JSON.parse(readFileSync(f, 'utf8'))
+  }
+  function fillSave(job) {
+    mkdirSync(FILL_DIR, { recursive: true })
+    writeFileSync(fillJobFile(job.id), JSON.stringify(job, null, 2), 'utf8')
+  }
+  function walkImages(dir, out = []) {
+    for (const n of readdirSync(dir)) {
+      const p = join(dir, n)
+      let st; try { st = statSync(p) } catch { continue }
+      if (st.isDirectory()) walkImages(p, out)
+      else if (/\.(png|jpe?g|webp|bmp)$/i.test(n)) out.push(p)
+    }
+    return out
+  }
+  function colLetter(n) { let s2 = ''; let v = n; while (v > 0) { const r = (v - 1) % 26; s2 = String.fromCharCode(65 + r) + s2; v = Math.floor((v - 1) / 26) } return s2 }
+  const sleepMs = (ms) => new Promise(r => setTimeout(r, ms))
+  // 填表任务合并为一个入口（原 6 个工具：start/status/next/submit/write/abort）
+  const FILL_ACTIONS = ['start', 'status', 'next', 'submit', 'write', 'abort']
   register({
-    name: 'saperm_fill_start',
-    description: '创建填表任务：递归扫描文件夹图片，生成 checkpoint（out/fill/<id>.json）。columns 指定要填的列，startRow 默认 2。L1 观察（读盘）',
+    name: 'saperm_fill',
+    description: '图片填表任务（统一入口）：action=start 建任务(递归扫文件夹图片→checkpoint) | status 看进度 | next 取下一张待提取图片 | submit 提交该图的字段 | write 把已提取的写入 Excel(TSV 每图一行，默认回读校验) | abort 删 checkpoint(不删图片/Excel)。典型流程 start→(next→submit)*→write。L0 观察 / L2 写单元格',
     parameters: {
       type: 'object',
       properties: {
-        sourceDir: { type: 'string', description: '数据图片文件夹（可含子目录）' },
-        columns: { type: 'array', items: { type: 'string' }, description: '要填写的字段/列名' },
-        excelPath: { type: 'string', description: '目标 Excel 路径（记录用，可空）' },
-        sheet: { type: 'string', description: '工作表名（可空）' },
-        startRow: { type: 'integer', description: '起始行（默认 2）' },
-      },
-      required: ['sourceDir'],
-    },
-    execute: async (args) => {
-      const dir = args.sourceDir
-      if (!existsSync(dir)) throw new Error('目录不存在: ' + dir)
-      const files = walkImages(dir).sort()
-      const job = {
-        id: 'fill-' + Date.now().toString(36),
-        createdAt: new Date().toISOString(),
-        sourceDir: dir,
-        columns: args.columns || [],
-        excelPath: args.excelPath || '',
-        sheet: args.sheet || '',
-        nextRow: args.startRow || 2,
-        files: files.map((fp, i) => ({ id: 'img' + (i + 1), path: fp, status: 'pending', fields: null, row: null })),
-      }
-      fillSave(job)
-      return { job: job.id, total: files.length, columns: job.columns, nextRow: job.nextRow, files: files.slice(0, 5) }
-    },
-  })
-
-  register({
-    name: 'saperm_fill_status',
-    description: '查看填表任务进度（pending/extracted/written/verified/failed + nextRow）。L0 观察',
-    parameters: { type: 'object', properties: { job: { type: 'string' } } },
-    execute: async (args) => {
-      const job = fillLoad(fillResolve(args.job))
-      const stats = { pending: 0, extracted: 0, written: 0, verified: 0, failed: 0 }
-      for (const f of job.files) stats[f.status] = (stats[f.status] || 0) + 1
-      return { job: job.id, total: job.files.length, stats, nextRow: job.nextRow, columns: job.columns, done: stats.pending === 0 && stats.extracted === 0 }
-    },
-  })
-
-  register({
-    name: 'saperm_fill_next',
-    description: '取下一张待提取图片（本地路径），供 AI 提取字段后 saperm_fill_submit。L0 观察',
-    parameters: { type: 'object', properties: { job: { type: 'string' } } },
-    execute: async (args) => {
-      const job = fillLoad(fillResolve(args.job))
-      const f = job.files.find(x => x.status === 'pending')
-      if (!f) return { job: job.id, done: true, message: '没有待提取图片' }
-      return { job: job.id, imageId: f.id, path: f.path, index: job.files.indexOf(f) + 1, total: job.files.length }
-    },
-  })
-
-  register({
-    name: 'saperm_fill_submit',
-    description: '提交某张图片的提取字段（{字段名:值}），标记 extracted。L0（只改 checkpoint）',
-    parameters: {
-      type: 'object',
-      properties: {
-        job: { type: 'string' },
-        imageId: { type: 'string' },
-        fields: { type: 'object', description: '字段对象' },
-      },
-      required: ['imageId', 'fields'],
-    },
-    execute: async (args) => {
-      const job = fillLoad(fillResolve(args.job))
-      const f = job.files.find(x => x.id === args.imageId)
-      if (!f) throw new Error('图片不存在: ' + args.imageId)
-      f.fields = args.fields || {}
-      f.status = 'extracted'
-      fillSave(job)
-      return { job: job.id, imageId: f.id, status: 'extracted' }
-    },
-  })
-
-  register({
-    name: 'saperm_fill_write',
-    description: '把已提取的图片写入 Excel（每图一行，按 columns 顺序 TSV 粘贴到 A{row}，写后回读校验）。L2（写单元格）',
-    parameters: {
-      type: 'object',
-      properties: {
-        job: { type: 'string' },
-        imageId: { type: 'string', description: '只写这一张（可选；缺省写全部 extracted）' },
+        action: { type: 'string', enum: FILL_ACTIONS, description: '操作类型' },
+        job: { type: 'string', description: '任务 id（status/next/submit/write/abort 用；缺省取当前任务）' },
+        sourceDir: { type: 'string', description: 'start 用：数据图片文件夹（可含子目录）' },
+        columns: { type: 'array', items: { type: 'string' }, description: 'start 用：要填写的字段/列名' },
+        excelPath: { type: 'string', description: 'start 用：目标 Excel 路径（记录用，可空）' },
+        sheet: { type: 'string', description: 'start 用：工作表名（可空）' },
+        startRow: { type: 'integer', description: 'start 用：起始行（默认 2）' },
+        imageId: { type: 'string', description: 'submit 必填；write 可选（只写这一张）' },
+        fields: { type: 'object', description: 'submit 用：{字段名: 值}' },
         hwnd: { type: 'integer' }, title: { type: 'string' },
-        verify: { type: 'boolean', description: '回读校验（默认 true）' },
+        verify: { type: 'boolean', description: 'write 用：回读校验（默认 true）' },
       },
+      required: ['action'],
     },
     execute: async (args) => {
+      const act = String(args.action || '')
+      if (!FILL_ACTIONS.includes(act)) throw new Error('action 必须是: ' + FILL_ACTIONS.join(' | '))
+      if (act === 'start') {
+        const dir = args.sourceDir
+        if (!dir) throw new Error('start 需要 sourceDir')
+        if (!existsSync(dir)) throw new Error('目录不存在: ' + dir)
+        const files = walkImages(dir).sort()
+        const job = {
+          id: 'fill-' + Date.now().toString(36),
+          createdAt: new Date().toISOString(),
+          sourceDir: dir,
+          columns: args.columns || [],
+          excelPath: args.excelPath || '',
+          sheet: args.sheet || '',
+          nextRow: args.startRow || 2,
+          files: files.map((fp, i) => ({ id: 'img' + (i + 1), path: fp, status: 'pending', fields: null, row: null })),
+        }
+        fillSave(job)
+        return { job: job.id, total: files.length, columns: job.columns, nextRow: job.nextRow, files: files.slice(0, 5) }
+      }
+      if (act === 'abort') {
+        const id = fillResolve(args.job)
+        try { unlinkSync(fillJobFile(id)) } catch { }
+        return { job: id, aborted: true }
+      }
       const job = fillLoad(fillResolve(args.job))
+      if (act === 'status') {
+        const stats = { pending: 0, extracted: 0, written: 0, verified: 0, failed: 0 }
+        for (const f of job.files) stats[f.status] = (stats[f.status] || 0) + 1
+        return { job: job.id, total: job.files.length, stats, nextRow: job.nextRow, columns: job.columns, done: stats.pending === 0 && stats.extracted === 0 }
+      }
+      if (act === 'next') {
+        const f = job.files.find(x => x.status === 'pending')
+        if (!f) return { job: job.id, done: true, message: '没有待提取图片' }
+        return { job: job.id, imageId: f.id, path: f.path, index: job.files.indexOf(f) + 1, total: job.files.length }
+      }
+      if (act === 'submit') {
+        const f = job.files.find(x => x.id === args.imageId)
+        if (!f) throw new Error('图片不存在: ' + args.imageId)
+        f.fields = args.fields || {}
+        f.status = 'extracted'
+        fillSave(job)
+        return { job: job.id, imageId: f.id, status: 'extracted' }
+      }
+      // write
       if (!job.columns.length) throw new Error('任务未定义 columns，无法写表')
-      const targets = args.imageId
-        ? job.files.filter(x => x.id === args.imageId)
-        : job.files.filter(x => x.status === 'extracted')
+      const targets = args.imageId ? job.files.filter(x => x.id === args.imageId) : job.files.filter(x => x.status === 'extracted')
       if (!targets.length) return { job: job.id, written: [], message: '没有待写入的 extracted 图片' }
       const hwnd = await excelFocus(args)
       const results = []
       for (const f of targets) {
         const row = f.row || job.nextRow
-        const vals = job.columns.map(c => {
-          const v = f.fields ? f.fields[c] : ''
-          return v == null ? '' : String(v)
-        })
+        const vals = job.columns.map(c => { const v = f.fields ? f.fields[c] : ''; return v == null ? '' : String(v) })
         const ref = (job.sheet ? job.sheet + '!' : '') + 'A' + row
         await excelGoto(ref)
         await helperCall('clipboard_set', { text: vals.join(String.fromCharCode(9)) })
@@ -2564,33 +2532,20 @@ export function apply(ctx) {
             await sleepMs(700)
             const cg = await helperCall('clipboard_get', {})
             readback = String((cg && cg.text) || '')
-            while (readback.endsWith(String.fromCharCode(10)) || readback.endsWith(String.fromCharCode(13))) readback = readback.slice(0, -1)
           } catch { }
         }
-        const expected = vals.join(String.fromCharCode(9))
-        const ok = readback === null ? null : readback === expected
         f.row = row
-        f.status = ok === false ? 'written' : 'verified'
+        f.status = 'written'
         job.nextRow = row + 1
-        results.push({ imageId: f.id, row, values: vals, readback, verified: ok })
+        fillSave(job)
+        results.push({ imageId: f.id, row, readback, verified: readback === null ? null : readback.replace(/[\r\n]+/g, String.fromCharCode(9)).replace(String.fromCharCode(9) + '$', '') === vals.join(String.fromCharCode(9)) })
       }
-      fillSave(job)
-      return { job: job.id, hwnd, written: results }
+      return { job: job.id, written: results, nextRow: job.nextRow }
     },
-  })
-
-  register({
-    name: 'saperm_fill_abort',
-    description: '删除填表任务 checkpoint（不删除图片/Excel）。L0',
-    parameters: { type: 'object', properties: { job: { type: 'string' } } },
-    execute: async (args) => {
-      const id = fillResolve(args.job)
-      try { unlinkSync(fillJobFile(id)) } catch { }
-      return { job: id, aborted: true }
-    },
-  })
+  })
 
   // ===== 连续解读（持续获取 + 变化区域 OCR + 内容/噪声分类） =====
+
   register({
     name: 'saperm_interpret_start',
     description: '启动连续解读：持续采集屏幕，自动检测变化区域并 OCR，分类"内容变化/动态噪声"，维护滚动历史。inject=true 时把"内容变化"事件按 minInjectMs 节流注入当前会话（≤200 字/条，不刷屏）。L0 观察，无需审批',

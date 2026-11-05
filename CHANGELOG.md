@@ -1,5 +1,41 @@
 # Changelog (dsh-screen-attention)
 
+## v1.10.1 (2026-11-05) — excel_*/fill_* 收敛 + 修掉两个既存缺陷
+
+### 合并
+- `saperm_excel_goto/write/read/cells` → **`saperm_excel({action})`**
+- `saperm_fill_start/status/next/submit/write/abort` → **`saperm_fill({action})`**
+- 工具数 **68 → 60**，index.js **3010 → 2953 行**
+
+### 修掉两个既存缺陷（不是我引入的，是合并时暴露的）
+
+**1. `fill` 系列一直是坏的**
+`fillLoad`/`fillResolve`/`fillSave`/`fillJobFile`/`walkImages`/`colLetter`/`sleepMs`
+在 v1.10.0 里**只有调用、没有定义**——这 6 个工具任何一次调用都是 `ReferenceError`。
+现在补齐实现（checkpoint 落 `out/fill/<id>.json`）。
+
+**2. L2 审批白名单指向了已不存在的工具名** ⚠️
+```js
+// 改前（合并后这些名字都不存在了 → 写 Excel 绕过审批）
+L2_TOOLS = [..., 'saperm_excel_goto', 'saperm_excel_write', 'saperm_excel_read', 'saperm_fill_write']
+// 改后
+L2_TOOLS = [..., 'saperm_excel', 'saperm_fill']
+```
+这是合并类重构最容易漏的一处：**改了工具名，忘了改权限白名单 = 审批形同虚设**。
+以后合并工具必须同步检查 `L2_TOOLS`/`L3_TOOLS`。
+
+### 端到端验证（fill 首次跑通）
+```text
+start  → job=fill-mw3mwtv7  total=39
+status → pending:39
+next   → img1  1/39
+submit → status: extracted
+status → pending:38  extracted:1
+abort  → aborted:true
+```
+
+`saperm_excel({action:'cells'})` → `{"cells":[],"total":0}`（Excel 未打开，空结果正确）
+
 ## v1.10.0 (2026-11-05) — 工具收敛：char_* 十个合成一个
 
 ### 构造问题（实测数字）
