@@ -1,5 +1,36 @@
 # Changelog (dsh-screen-attention)
 
+## v1.8.0 (2026-11-05) — 后台窗口捕获 + 无头网页（不只识别屏幕）
+
+### 新增
+- **saperm_window：抓窗口自身内容，不依赖它是否可见**
+  - PrintWindow + PW_RENDERFULLCONTENT(0x2)：被其它窗口完全盖住的窗口也能拿到画面（DWM 渲染离屏内容）
+  - 最小化窗口先 SW_SHOWNOACTIVATE 恢复再抓，抓完立刻 SW_MINIMIZE 还原（不抢焦点、不改用户布局）
+  - 全黑检测：抓到全黑时明确提示「窗口最小化或属于受保护内容」
+  - action: list 列可抓窗口；shot 按 hwnd 或 title 抓
+- **saperm_web：无头浏览器看网页**
+  - --headless=new --virtual-time-budget 渲染后截图，**全程不建窗口、不抢焦点、不遮挡用户**
+  - 视口可调（w/h/waitMs），实现在插件侧（spawn + 文件轮询）
+
+### 关键边界（实测）
+| 目标 | saperm_window（PrintWindow） | saperm_web（无头） |
+|---|---|---|
+| 普通 Win32 / GDI 窗口 | 有效 | — |
+| 浏览器 UI（标签栏/地址栏） | 有效 | — |
+| **浏览器网页渲染区** | **空白**（GPU/D3D 渲染层抓不到） | 有效 |
+| 最小化窗口 | 需先恢复（会短暂出现） | 不需要窗口 |
+
+### 踩坑
+- **窗口标题含不可见字符**：Edge 标题里 Microsoft 与 Edge 之间有零宽字符，按子串匹配直接失败。
+  → 已知 hwnd 时一律优先用 hwnd（工具契约已写明）。
+- **PrintWindow 拿不到 GPU 渲染层**：D3D surface 不在 GDI 世界里，这是设计使然不是 bug，补法是无头渲染或 CDP。
+
+### 实测
+| 场景 | 结果 |
+|---|---|
+| 抓被 DSH 全屏盖住的 Edge（hwnd=16518486） | ok 2247×1530 → 1260×858，标签页/地址栏/书签栏清晰，网页区空白 |
+| saperm_web example.com | ok 1200×800，多语言页面完整渲染，无任何窗口出现 |
+
 ## v1.7.0 (2026-11-05) — 开口说话（say 气泡 + TTS）/ 外观整合 / 闪屏修复
 
 ### 新增

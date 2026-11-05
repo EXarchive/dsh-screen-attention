@@ -270,6 +270,36 @@ static class Gdi
         return (ScaleBuffer(src, sw, sh, dw, dh), dw, dh);
     }
 
+    [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr hwnd, IntPtr hdc, uint flags);
+    [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr h);
+
+    /// <summary>
+    /// 抓窗口自身内容，不依赖它在屏幕上是否可见。
+    /// PrintWindow + PW_RENDERFULLCONTENT(0x2)：对**被遮挡**的窗口有效（DWM 会渲染离屏内容）；
+    /// 最小化窗口通常拿不到，所以调用方要先 SW_SHOWNOACTIVATE 恢复（不抢焦点）再抓。
+    /// </summary>
+    public static (byte[] buf, int w, int h, bool ok) PrintWindowCapture(IntPtr hwnd)
+    {
+        if (hwnd == IntPtr.Zero || !IsWindow(hwnd)) return (null, 0, 0, false);
+        Win.RECT r;
+        if (!Win.GetWindowRect(hwnd, out r)) return (null, 0, 0, false);
+        int w = r.R - r.L, hh = r.B - r.T;
+        if (w < 8 || hh < 8 || w > 8000 || hh > 8000) return (null, 0, 0, false);
+
+        IntPtr dc = GetDC(IntPtr.Zero);
+        IntPtr mem = CreateCompatibleDC(dc);
+        IntPtr bmp = CreateCompatibleBitmap(dc, w, hh);
+        IntPtr old = SelectObject(mem, bmp);
+        bool ok = PrintWindow(hwnd, mem, 2);   // PW_RENDERFULLCONTENT
+        var buf = new byte[w * hh * 4];
+        var bi = new BITMAPINFOHEADER { biSize = 40, biWidth = w, biHeight = -hh, biPlanes = 1, biBitCount = 32, biCompression = 0 };
+        GetDIBits(mem, bmp, 0, (uint)hh, buf, ref bi, 0);
+        SelectObject(mem, old); DeleteObject(bmp); DeleteDC(mem); ReleaseDC(IntPtr.Zero, dc);
+        return (buf, w, hh, ok);
+    }
+
+
+
     /// <summary>把已有的 BGRA buffer 缩放到目标尺寸（HALFTONE）。用于"先高分辨率打分、再缩到格子尺寸留帧"。</summary>
     public static byte[] ScaleBuffer(byte[] src, int sw, int sh, int dw, int dh)
     {
@@ -362,6 +392,7 @@ static class Win
     [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr p);
     [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
+    [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr h);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowText(IntPtr h, StringBuilder s, int n);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassName(IntPtr h, StringBuilder s, int n);
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
@@ -637,7 +668,6 @@ static class Win
 
     [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr h, out RECT rc);
     [DllImport("user32.dll")] public static extern bool ClientToScreen(IntPtr h, ref POINT p);
-    [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr h);
 
     public static long FindWindowByTitle(string titlePart)
     {
@@ -884,6 +914,176 @@ sealed class OverlayForm : Form
     protected override void OnPaintBackground(PaintEventArgs e) { }
 }
 
+// ============ 消息窗：AI 说的话独立成一个窗口，不与图像窗重叠 ============
+// 为什么要分开：气泡画在图像窗里会盖住正在看的内容（实测挡住视频下部）。
+// 布局：默认贴在图像窗上方 8px；上方放不下就放下方；没有图像窗则浮在屏幕右下角。
+static class SayWindow
+{
+    sealed class SayForm : Form
+    {
+        public string Body = "";
+        public SayForm()
+        {
+            FormBorderStyle = FormBorderStyle.None;
+            TopMost = true;
+            ShowInTaskbar = false;
+            StartPosition = FormStartPosition.Manual;
+            BackColor = Color.FromArgb(12, 20, 44);
+            SetStyle(ControlStyles.OptimizedDoubleBuffer | ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint, true);
+            DoubleBuffered = true;
+        }
+        // 不擦背景：双缓冲 + 不擦 = 不闪（与图像窗同一套手法）
+        protected override void OnPaintBackground(PaintEventArgs e) { }
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            var g = e.Graphics;
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            var rc = new Rectangle(0, 0, Width - 1, Height - 1);
+            using var path = Overlay.RoundRect(rc, 10);
+            using (var bg = new SolidBrush(Color.FromArgb(235, 12, 20, 44)))
+            using (var pen = new Pen(Color.FromArgb(210, 96, 196, 255), 1.5f))
+            {
+                g.FillPath(bg, path);
+                g.DrawPath(pen, path);
+            }
+            // 左侧竖条：标记"这句话来自 AI"
+            using (var bar2 = new SolidBrush(Color.FromArgb(220, 96, 196, 255)))
+                g.FillRectangle(bar2, 3, 8, 3, Height - 16);
+            var flags = TextFormatFlags.WordBreak | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding;
+            TextRenderer.DrawText(g, Body, bodyFont, new Rectangle(16, 6, Width - 28, Height - 12), Color.FromArgb(236, 244, 255), flags);
+        }
+    }
+
+    static SayForm form;
+    static string text = "";
+    static long until = 0;
+    public static string LastError;   // 创建失败时留下来，供 say 命令回报
+    static Rectangle lastTarget;
+    public static Rectangle LastTarget => lastTarget;
+    public static Rectangle? Bounds
+    {
+        get
+        {
+            var f = form;
+            if (f == null || f.IsDisposed) return null;
+            try { return f.Bounds; } catch { return null; }
+        }
+    }
+    static readonly object gate = new object();
+    static readonly Font bodyFont = new Font("Microsoft YaHei UI", 11f, FontStyle.Bold);
+    public static bool IsOpen => form != null;
+
+    static int MeasureH(string t, int w)
+    {
+        var flags = TextFormatFlags.WordBreak | TextFormatFlags.NoPadding;
+        var sz = TextRenderer.MeasureText(t, bodyFont, new Size(Math.Max(60, w - 28), 600), flags);
+        return Math.Clamp(sz.Height + 20, 44, 170);
+    }
+
+    /// <summary>算目标矩形：图像窗上方优先，其次下方，最后屏幕右下角。</summary>
+    static Rectangle Target(string t, Rectangle? anchor)
+    {
+        int w, x, y, hh;
+        if (anchor.HasValue)
+        {
+            var a = anchor.Value;
+            w = Math.Max(200, a.Width);
+            hh = MeasureH(t, w);
+            x = a.X;
+            y = a.Y - hh - 8;
+            if (y < 0) y = a.Bottom + 8;                        // 上方放不下 → 下方
+            var scr = Screen.FromRectangle(a).WorkingArea;
+            if (y + hh > scr.Bottom) y = Math.Max(scr.Top, scr.Bottom - hh - 8);
+            if (x + w > scr.Right) x = Math.Max(scr.Left, scr.Right - w);
+        }
+        else
+        {
+            var scr = Screen.PrimaryScreen.WorkingArea;
+            w = 420;
+            hh = MeasureH(t, w);
+            x = scr.Right - w - 16;
+            y = scr.Bottom - hh - 16;
+        }
+        return new Rectangle(x, y, w, hh);
+    }
+
+    public static void Show(string t, int ms)
+    {
+        lock (gate) { text = t ?? ""; until = Environment.TickCount64 + Math.Max(1200, ms); }
+        if (t.Trim().Length == 0) { Close(); return; }
+        var target = Target(text, Overlay.CurrentBounds());
+        lastTarget = target;
+        if (form == null || form.IsDisposed)
+        {
+            var sig = new System.Threading.Tasks.TaskCompletionSource<bool>();
+            var th = new Thread(() =>
+            {
+                try
+                {
+                    form = new SayForm { Bounds = target, Body = text, Text = "SA 消息" };
+                    // 拖动：消息窗也能挪走
+                    Point off = Point.Empty; bool drag = false;
+                    form.MouseDown += (s, e) => { if (e.Button == MouseButtons.Left) { drag = true; off = e.Location; } };
+                    form.MouseMove += (s, e) => { if (drag) form.Location = new Point(form.Left + e.X - off.X, form.Top + e.Y - off.Y); };
+                    form.MouseUp += (s, e) => { drag = false; Overlay.SyncSayWindow(); };
+                    form.DoubleClick += (s, e) => { try { Close(); } catch { } };
+                    var timer = new System.Windows.Forms.Timer { Interval = 120 };
+                    timer.Tick += (s, e) =>
+                    {
+                        try
+                        {
+                            bool live;
+                            lock (gate) live = Environment.TickCount64 < until;
+                            if (!live && form != null) { Close(); }
+                        }
+                        catch { }
+                    };
+                    timer.Start();
+                    form.FormClosed += (s, e) => { try { timer.Stop(); } catch { } };
+                    form.Shown += (s, e) => sig.TrySetResult(true);
+                    Application.Run(form);
+                }
+                catch (Exception ex) { LastError = ex.GetType().Name + ": " + ex.Message; sig.TrySetResult(false); }
+                form = null;
+            });
+            th.SetApartmentState(ApartmentState.STA);
+            th.IsBackground = true;
+            th.Start();
+            try { sig.Task.Wait(1500); } catch { }
+        }
+        else
+        {
+            try
+            {
+                form.Invoke(new Action(() =>
+                {
+                    try { form.Body = text; form.Bounds = target; form.Invalidate(); } catch { }
+                }));
+            }
+            catch { }
+        }
+    }
+
+    /// <summary>图像窗移动/缩放时跟随。</summary>
+    public static void Follow(Rectangle? anchor)
+    {
+        var f = form;
+        if (f == null || f.IsDisposed) return;
+        string t; lock (gate) t = text;
+        if (t.Length == 0) return;
+        var target = Target(t, anchor);
+        try { f.Invoke(new Action(() => { try { f.Bounds = target; f.Invalidate(); } catch { } })); } catch { }
+    }
+
+    public static void Close()
+    {
+        var f = form;
+        form = null;
+        if (f == null) return;
+        try { f.Invoke(new Action(() => { try { f.Close(); } catch { } })); } catch { }
+    }
+}
+
 static class Overlay
 {
     public static Form form;
@@ -902,18 +1102,31 @@ static class Overlay
     public static double fps;        // 采集帧率
     public static int originX = 0, originY = 0;  // 虚拟屏幕原点（多显示器，帧左上角虚拟坐标）
     public static bool IsOpen => form != null;
+
+    /// <summary>图像窗当前矩形（消息窗据此定位）；未打开返回 null。</summary>
+    static Rectangle cachedBounds;
+    static volatile bool hasCachedBounds;
+    public static Rectangle? CurrentBounds()
+    {
+        // 跨线程读控件属性不可靠，用 UI 线程刷新的缓存
+        if (hasCachedBounds) return cachedBounds;
+        return null;
+    }
+
+    /// <summary>图像窗移动/缩放后，让消息窗跟着走。</summary>
+    public static void SyncSayWindow()
+    {
+        try { SayWindow.Follow(CurrentBounds()); } catch { }
+    }
     // ==== say 气泡：AI 的话直接显示在小窗上（同时可选朗读）====
     public static string sayText = "";
     public static long sayUntil = 0;
     public static void Say(string text, int ms = 5000)
     {
-        sayText = text ?? "";
-        sayUntil = Environment.TickCount64 + Math.Max(800, ms);
-        frameStamp = unchecked(frameStamp + 1);   // 强制下一 tick 重绘
-        var f = form;
-        if (f != null) { try { f.Invoke(new Action(() => { try { f.Invalidate(); } catch { } })); } catch { } }
+        // 文字走独立消息窗，图像窗只留画面
+        SayWindow.Show(text, ms);
     }
-    public static void ClearSay() { sayText = ""; sayUntil = 0; var f = form; if (f != null) { try { f.Invoke(new Action(() => { try { f.Invalidate(); } catch { } })); } catch { } } }
+    public static void ClearSay() { SayWindow.Close(); }
     static volatile System.Threading.Tasks.TaskCompletionSource<bool> ReadySignal = new System.Threading.Tasks.TaskCompletionSource<bool>();
 
     // 等待窗口真正显示出来（<3s 超时）；失败返回 false
@@ -1007,6 +1220,7 @@ static class Overlay
 
     public static void Close()
     {
+        try { SayWindow.Close(); } catch { }
         var f = form;
         if (f == null) return;
         try { f.Invoke(new Action(() => { try { f.Close(); } catch { } })); } catch { }
@@ -1034,6 +1248,7 @@ static class Overlay
                 }
                 catch { }
             }));
+            SyncSayWindow();
             return true;
         }
         catch { return false; }
@@ -1077,26 +1292,10 @@ static class Overlay
                     g.DrawLine(pen, gx, gy - 12, gx, gy - 9);
                     g.DrawLine(pen, gx, gy + 9, gx, gy + 12);
                 }
-                // say 气泡：圆角，留 18px 不与信息条相贴
-                if (sayText.Length > 0 && Environment.TickCount64 < sayUntil)
-                {
-                    var flags = TextFormatFlags.WordBreak | TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding;
-                    int maxW = Math.Max(120, (int)(vw * 0.88));
-                    var sz = TextRenderer.MeasureText(sayText, sayFont, new Size(maxW - 28, 600), flags);
-                    int bw = Math.Min(maxW, sz.Width + 28), bh = sz.Height + 20;
-                    int bx = (vw - bw) / 2;
-                    int by = Math.Max(6, vh - bh - 18);
-                    using var path = RoundRect(new Rectangle(bx, by, bw, bh), 8);
-                    using (var bg = new SolidBrush(Color.FromArgb(226, 12, 20, 44)))
-                    using (var pen = new Pen(Color.FromArgb(200, 96, 196, 255), 1.5f))
-                    {
-                        g.FillPath(bg, path);
-                        g.DrawPath(pen, path);
-                    }
-                    TextRenderer.DrawText(g, sayText, sayFont, new Rectangle(bx + 14, by + 10, bw - 28, bh - 20), Color.FromArgb(236, 244, 255), flags);
-                }
+                // 气泡不再画在图像窗里 —— 文字走独立的消息窗（SayWindow），避免遮挡画面
             }
             DrawBar(g, client.Width, vh);
+            try { cachedBounds = new Rectangle(form != null ? form.Left : 0, form != null ? form.Top : 0, client.Width, client.Height); hasCachedBounds = true; } catch { }
         }
     }
 
@@ -1118,7 +1317,7 @@ static class Overlay
         g.DrawLine(pen, r.Right, r.Bottom, r.Right, r.Bottom - len);
     }
 
-    static GraphicsPath RoundRect(Rectangle r, int rad)
+    public static GraphicsPath RoundRect(Rectangle r, int rad)
     {
         var p = new GraphicsPath();
         int d = Math.Max(2, rad * 2);
@@ -2460,6 +2659,44 @@ class Program
             case "ping": return new { pong = true };
             case "screen_bounds": return new { x = 0, y = 0, w = Gdi.ScreenW(), h = Gdi.ScreenH() };
             case "windows": return new { windows = Win.ListWindows() };
+            case "window_capture":
+                {
+                    long hwndL = req.TryGetProperty("hwnd", out var pwh) ? pwh.GetInt64() : 0;
+                    string tp = req.TryGetProperty("title", out var pwt) ? (pwt.GetString() ?? "") : "";
+                    int maxW = req.TryGetProperty("maxW", out var pmw) ? pmw.GetInt32() : 1260;
+                    IntPtr hw = hwndL > 0 ? new IntPtr(hwndL) : (tp.Length > 0 ? new IntPtr(Win.FindWindowByTitle(tp)) : IntPtr.Zero);
+                    if (hw == IntPtr.Zero) return new { ok = false, error = "找不到窗口" };
+
+                    var sbT = new System.Text.StringBuilder(512); Win.GetWindowText(hw, sbT, 512);
+                    bool wasMin = Win.IsIconic(hw);
+                    // 最小化窗口 PrintWindow 拿不到画面：先"显示但不激活"，抓完再最小化回去
+                    if (wasMin) { Win.ShowWindow(hw, 4 /*SW_SHOWNOACTIVATE*/); Thread.Sleep(160); }
+
+                    var (buf, w, hh, okg) = Gdi.PrintWindowCapture(hw);
+                    if (wasMin) { Win.ShowWindow(hw, 6 /*SW_MINIMIZE*/); }
+
+                    if (!okg || buf == null) return new { ok = false, error = "PrintWindow 失败（该窗口可能禁止捕获）", title = sbT.ToString() };
+
+                    // 全黑检测：最小化的 DWM 窗口或受保护内容会返回全黑
+                    int sum = 0;
+                    for (int i = 0; i < buf.Length; i += 4 * 97) sum += buf[i];
+                    bool blank = sum / Math.Max(1, (buf.Length / (4 * 97))) < 3;
+
+                    int tw = Math.Min(w, maxW);
+                    int th = Math.Max(1, (int)Math.Round(hh * (double)tw / w));
+                    byte[] use = buf;
+                    if (tw < w) use = Gdi.ScaleBuffer(buf, w, hh, tw, th);
+                    string tmp = Path.Combine(Path.GetTempPath(), "sa-win-" + Guid.NewGuid().ToString("N") + ".jpg");
+                    var jpg = GdiPlus.EncodeJpeg(use, tw, th, tmp);
+                    return new
+                    {
+                        ok = true, title = sbT.ToString(), hwnd = (long)hw.ToInt64(),
+                        w = tw, h = th, srcW = w, srcH = hh,
+                        wasMinimized = wasMin, blank,
+                        blankHint = blank ? "抓到全黑：窗口最小化或属于受保护内容，先恢复窗口再抓" : null,
+                        jpegB64 = Convert.ToBase64String(jpg), bytes = jpg.Length,
+                    };
+                }
             case "window_rect":
                 {
                     long hwndL = req.TryGetProperty("hwnd", out var phw) ? phw.GetInt64() : 0;
@@ -2496,7 +2733,17 @@ class Program
                     Overlay.Say(text, ms);
                     var (ok2, err2) = (true, (string)null);
                     if (speak) (ok2, err2) = Tts.Speak(text, rate);
-                    return new { ok = true, shown = Overlay.IsOpen, spoke = speak, spokeOk = ok2, spokeError = err2, ms };
+                    return new
+                    {
+                        ok = true,
+                        imageOpen = Overlay.IsOpen,
+                        sayOpen = SayWindow.IsOpen,
+                        sayError = SayWindow.LastError,
+                        sayTarget = SayWindow.LastTarget,
+                        sayBounds = SayWindow.Bounds,
+                        anchor = Overlay.CurrentBounds(),
+                        spoke = speak, spokeOk = ok2, spokeError = err2, ms,
+                    };
                 }
             case "speech_voices": return new { voices = Tts.Voices() };
             case "audio_level":

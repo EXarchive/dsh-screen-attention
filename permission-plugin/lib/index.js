@@ -1176,6 +1176,106 @@ export function apply(ctx) {
     return null
   }
 
+  // ============ 后台网页：无头渲染截图，不建窗口、不抢焦点、不遮用户 ============
+  // 为什么需要：PrintWindow 抓不到浏览器 GPU 渲染层（实测拿到窗口 UI 但网页区空白）；
+  // 无头浏览器直接从渲染引擎出图，跟屏幕完全无关。
+  const EDGE_PATHS = [
+    'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
+    'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe',
+    'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+    'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+  ]
+
+  register({
+    name: 'saperm_web',
+    description: '后台打开网页看内容：用无头浏览器渲染后截图，**完全不建窗口、不抢焦点、不遮挡你正在做的事**。适合"我自己去这个页面看看"——不用切走你的屏幕。返回图片路径与 token。L0 观察，无需审批',
+    parameters: {
+      type: 'object',
+      properties: {
+        url: { type: 'string', description: '要看的网页地址（http/https）' },
+        w: { type: 'integer', description: '视口宽（默认 1400）' },
+        h: { type: 'integer', description: '视口高（默认 900）' },
+        waitMs: { type: 'integer', description: '等待渲染毫秒（默认 6000，SPA 可加大）' },
+        quality: { type: 'string', description: '输出清晰度 low/standard/high/ultra' },
+      },
+    },
+    execute: async (args) => {
+      const url = String(args.url || '').trim()
+      if (!/^https?:\/\//i.test(url)) return { ok: false, error: '需要 http/https 地址' }
+      const exe = EDGE_PATHS.find((x) => { try { return existsSync(x) } catch { return false } })
+      if (!exe) return { ok: false, error: '没找到 Edge/Chrome' }
+      const w = clampInt(args.w, 1400, 320, 3000)
+      const h = clampInt(args.h, 900, 240, 3000)
+      const wait = clampInt(args.waitMs, 6000, 1000, 30000)
+      try { mkdirSync(VIEW_DIR, { recursive: true }) } catch {}
+      const out = join(VIEW_DIR, 'web-' + Date.now() + '.png')
+
+      const okRun = await new Promise((resolve) => {
+        let done = false
+        const finish = (v) => { if (!done) { done = true; resolve(v) } }
+        try {
+          const ch = spawn(exe, ['--headless=new', '--disable-gpu', '--hide-scrollbars',
+            '--no-first-run', '--no-default-browser-check',
+            '--window-size=' + w + ',' + h,
+            '--virtual-time-budget=' + wait,
+            '--screenshot=' + out, url], { stdio: 'ignore', windowsHide: true })
+          ch.on('exit', () => finish(true))
+          ch.on('error', () => finish(false))
+          setTimeout(() => { try { ch.kill() } catch {} ; finish(true) }, wait + 9000)
+        } catch { finish(false) }
+      })
+      if (!okRun || !existsSync(out)) return { ok: false, error: '无头渲染失败（页面可能被拦截或超时）' }
+
+      // PNG 原样保留（saveShot 只接受 JPEG，硬走会存出错格式的 .jpg）
+      const bytes = statSync(out).size
+      return {
+        ok: true, url, path: out, viewport: { w, h },
+        bytes, waitMs: wait,
+        hint: '无头浏览器渲染，全程没有窗口出现、不抢焦点；用 read_image 看内容',
+      }
+    },
+  })
+
+  // ============ 后台窗口捕获：不依赖窗口是否在屏幕上可见 ============
+  // 屏幕截图只能看到最上层画面；被遮挡/在后台的软件，用 PrintWindow(PW_RENDERFULLCONTENT)
+  // 直接向它要画面。这样"看屏幕"就升级成"看任意窗口"。
+  register({
+    name: 'saperm_window',
+    description: '抓指定窗口自身的内容，**不依赖它是否可见**（被别的窗口盖住、在后台都行）；也可以列出所有可抓窗口。action: list（默认，列窗口）/ shot（抓图，按 title 或 hwnd）。与 saperm_target 配合可做后台窗口的持续观察。L0 观察，无需审批',
+    parameters: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', description: 'list（默认）/ shot（抓图）' },
+        title: { type: 'string', description: '窗口标题的一部分（子串匹配）' },
+        hwnd: { type: 'integer', description: '窗口句柄（比标题更准）' },
+        quality: { type: 'string', description: 'low=798 / standard=1050 / high=1260（默认）/ ultra=1596' },
+        maxW: { type: 'integer', description: '输出最大宽度（覆盖 quality）' },
+      },
+    },
+    execute: async (args) => {
+      const action = String(args.action || 'list')
+      if (action === 'list') {
+        const w = await helperCall('windows')
+        const list = ((w && w.windows) || []).filter((x) => x.w >= 200 && x.h >= 120)
+        return {
+          count: list.length,
+          windows: list.map((x) => ({ hwnd: x.hwnd, title: String(x.title).slice(0, 70), w: x.w, h: x.h, x: x.x, y: x.y, fg: x.fg })),
+        }
+      }
+      const maxW = args.maxW ? Math.min(2000, args.maxW) : snapWidth(qualityWidth(args.quality) || 1260)
+      const r = await helperCall('window_capture', { hwnd: Number(args.hwnd) || 0, title: String(args.title || ''), maxW }, 20000)
+      if (!r || !r.ok) return { ok: false, error: (r && r.error) || '抓取失败' }
+      const path = saveShot(r.jpegB64, 'window')
+      return {
+        ok: true, path, title: r.title, hwnd: r.hwnd,
+        w: r.w, h: r.h, srcW: r.srcW, srcH: r.srcH,
+        tokens: imageTokens(r.w, r.h),
+        wasMinimized: r.wasMinimized,
+        blank: r.blank, hint: r.blankHint || undefined,
+      }
+    },
+  })
+
   // ============ 说话：AI 的话显示在浮窗气泡上 + 朗读（Windows 自带 SAPI） ============
   register({
     name: 'saperm_say',

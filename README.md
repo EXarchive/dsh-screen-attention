@@ -182,6 +182,8 @@ saperm_health {}
 | **双方案识别** | `saperm_scan({mode})` | local / vision / auto | 文本够用走 local（0 token）；要看图标/照片/视频原貌走 vision |
 | **多帧拼图** | `saperm_sheet` | 一次看一段时间的变化 | 价格按张算不按帧算：4 帧 591 token（每帧 148），比看 4 次省 75%；**按变化量选帧**，静止画面只出 1 张 |
 | **拖框选区** | `saperm_region` | 用户拖框定区域 | 说"框这块"就弹半透明覆盖窗，拖完自动存，不用量像素；返回 `orientation` 标明竖屏还是横屏 |
+| **看后台窗口** | `saperm_window` | 被遮住/在后台的软件 | `PrintWindow` 直接向窗口要画面，不靠屏幕；浏览器网页区需配合 `saperm_web` |
+| **看网页** | `saperm_web` | 我不打扰你自己去看 | 无头浏览器渲染截图，全程不建窗口、不抢焦点 |
 | **开口说话** | `saperm_say` | AI 边看边说 | 文字进小窗圆角气泡 + Windows 自带 SAPI 朗读（系统有中文音色 Huihui）；`speak:false` 只显示不出声 |
 | **锁定观察目标** | `saperm_target` | 只看某个窗口 | 锁定后 sheet/view/scan/locate 不传区域就只看它**客户区**（自动去标题栏边框，窗口移动跟随）；实测同一段视频全屏变化分 6、只抓窗口 81 —— 差 13 倍 |
 | **听声音** | `saperm_audio` | 分辨谁在出声 | `source: device`（系统输出回环）/ `mic`（麦克风）/ `both`（两路并行，返回"谁在出声"）|
