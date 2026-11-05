@@ -77,6 +77,8 @@ static class AudioCapture
     public sealed class Level
     {
         public bool Ok;
+        public bool Loopback;   // true=设备输出(系统正在放什么) flase=false=麦克风
+        public string Source;
         public string Error;
         public double Rms;        // 0~1
         public double Peak;       // 0~1
@@ -87,14 +89,22 @@ static class AudioCapture
         public int Channels;
         public int SampleRate;
         public string DeviceId;
+        public string DeviceName;
 
-        public bool SoundsLikeVoice => Ok && !Silent && Rms > 0.004 && Zcr > 0.02;
+        // 人声的过零率落在中间带：太低是纯音/低频轰鸣，太高（>0.35）是噪声/金属感强的音乐。
+        // 实测：Alarm 蜂鸣 0.08~0.15；游戏 BGM 0.75（被判成"像人声"是错的，故加上限）
+        public bool SoundsLikeVoice => Ok && !Silent && Rms > 0.004 && Zcr > 0.01 && Zcr < 0.35;
     }
 
-    /// <summary>采 ms 毫秒的系统输出电平均值。</summary>
-    public static Level Measure(int ms)
+    /// <summary>
+    /// 采 ms 毫秒音频电平。
+    /// loopback=true  → eRender + LOOPBACK：「电脑正在放什么」（BGM、视频台词、会议里别人的声音）
+    /// loopback=false → eCapture：**麦克风**（你这边说话、环境声）
+    /// 两者是不同设备，可以并行采集，互不干扰。
+    /// </summary>
+    public static Level Measure(int ms, bool loopback = true)
     {
-        var res = new Level();
+        var res = new Level { Loopback = loopback, Source = loopback ? "device" : "mic" };
         var th = new Thread(() =>
         {
             IMMDeviceEnumerator en = null;
@@ -104,9 +114,21 @@ static class AudioCapture
             try
             {
                 en = (IMMDeviceEnumerator)new MMDeviceEnumeratorCom();
-                int hr = en.GetDefaultAudioEndpoint(EDataFlow.eRender, ERole.eMultimedia, out dev);
-                if (hr != 0 || dev == null) { res.Error = "no render device hr=" + hr; return; }
-                dev.GetId(out res.DeviceId);
+                // 设备音频走 eRender(渲染设备) + LOOPBACK；麦克风走 eCapture(采集设备) 且不能带 LOOPBACK
+                int hr = loopback
+                    ? en.GetDefaultAudioEndpoint(EDataFlow.eRender, ERole.eMultimedia, out dev)
+                    : en.GetDefaultAudioEndpoint(EDataFlow.eCapture, ERole.eCommunications, out dev);
+                if (hr != 0 || dev == null)
+                {
+                    res.Error = (loopback ? "没有可用的播放设备" : "没有可用的麦克风") + " hr=" + hr;
+                    return;
+                }
+                if (dev.GetId(out res.DeviceId) == 0 && res.DeviceId != null)
+                {
+                    // 设备 id 形如 {0.0.0.00000000}.{guid}，只留后缀便于辨认
+                    var seg = res.DeviceId.Split('.');
+                    res.DeviceName = seg.Length > 0 ? seg[seg.Length - 1].Trim('{', '}') : res.DeviceId;
+                }
 
                 Guid iid = typeof(IAudioClient).GUID;
                 object o;
@@ -122,7 +144,8 @@ static class AudioCapture
                 res.SampleRate = (int)fmt.nSamplesPerSec;
 
                 long dur = 10_000_000L; // 1s buffer
-                hr = client.Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK,
+                int streamFlags = loopback ? AUDCLNT_STREAMFLAGS_LOOPBACK : 0;
+                hr = client.Initialize(AUDCLNT_SHAREMODE_SHARED, streamFlags,
                     dur, 0, fmtPtr, IntPtr.Zero);
                 Marshal.FreeCoTaskMem(fmtPtr);
                 if (hr != 0) { res.Error = "Initialize hr=" + hr; return; }

@@ -75,6 +75,9 @@ dsh-screen-attention/
 │   ├── ClipScene.cs          # Chinese-CLIP ViT-L/14 场景分类与裁剪嵌入
 │   ├── AnimeFaceDetect.cs    # YOLOv8n-face 动漫人脸检测
 │   ├── CharId.cs             # 角色画廊匹配、未知聚类与原子持久化
+│   ├── Cuts.cs               # 变化分（HSV 64×36 网格 + 运动补偿），sheet 按变化量选帧
+│   ├── RegionPicker.cs       # 全屏拖框选区窗口
+│   ├── AudioCapture.cs       # WASAPI 回环/麦克风采集（设备音频与麦分路）
 │   └── models/               # 本地模型目录
 │       ├── ch_PP-OCRv4_det_infer.onnx
 │       ├── ch_PP-OCRv4_rec_infer.onnx
@@ -171,7 +174,8 @@ saperm_health {}
 | **双方案识别** | `saperm_scan({mode})` | local / vision / auto | 文本够用走 local（0 token）；要看图标/照片/视频原貌走 vision |
 | **多帧拼图** | `saperm_sheet` | 一次看一段时间的变化 | 价格按张算不按帧算：4 帧 591 token（每帧 148），比看 4 次省 75%；**按变化量选帧**，静止画面只出 1 张 |
 | **拖框选区** | `saperm_region` | 用户拖框定区域 | 说"框这块"就弹半透明覆盖窗，拖完自动存，不用量像素；返回 `orientation` 标明竖屏还是横屏 |
-| **听声音** | `saperm_audio` | 视频/会议里有没有人在说话 | WASAPI 回环采集，不需要虚拟声卡；返回 db/rms/过零率/是否静音 |
+| **锁定观察目标** | `saperm_target` | 只看某个窗口 | 锁定后 sheet/view/scan/locate 不传区域就只看它**客户区**（自动去标题栏边框，窗口移动跟随）；实测同一段视频全屏变化分 6、只抓窗口 81 —— 差 13 倍 |
+| **听声音** | `saperm_audio` | 分辨谁在出声 | `source: device`（系统输出回环）/ `mic`（麦克风）/ `both`（两路并行，返回"谁在出声"）|
 | **自动化输入** | `saperm_click` / `press` / `type` / `hotkey` | 鼠标键盘操作（含长按 holdMs） | 基于 OCR 坐标或 UIA 控件进行前台自动化交互 |
 | **急停** | `saperm_stop` | 立即急停 | 锁定输入注入；恢复需 `saperm_resume` 并经由用户明确授权 |
 

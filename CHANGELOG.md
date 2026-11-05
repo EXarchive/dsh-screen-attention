@@ -1,5 +1,40 @@
 # Changelog (dsh-screen-attention)
 
+## v1.6.0 (2026-11-05) — 锁定观察目标 / 音频分麦克风 / 选帧尺度修复
+
+### 新增
+- **`saperm_target`：锁定观察目标窗口**
+  - 锁一个窗口后，`saperm_sheet` / `saperm_view` / `saperm_scan` / `saperm_locate` /
+    `saperm_watch_focus` / `saperm_observe_task` 不传 x/y/w/h 就自动只看它的**客户区**
+  - 用 `GetClientRect + ClientToScreen`，不是 `GetWindowRect` —— 标题栏和边框不属于内容
+    （实测窗口 1302×776@189,75 → 客户区 1280×720@200,120）
+  - 只存 hwnd/title，矩形每次现取：窗口移动/缩放自动跟随（实测移到别处后 rect 变 1931×1108@161,135）
+  - 优先级：显式 x/y/w/h > 锁定窗口 > 拖框选区 > 全屏
+  - 与 `saperm_focus`（置前窗口，L2 输入）区分：这个是纯观察范围，L0
+- **`saperm_audio` 分麦克风与设备音频**（`source`）
+  - `device`（默认）：`eRender + AUDCLNT_STREAMFLAGS_LOOPBACK` —— 电脑正在放什么
+  - `mic`：`eCapture + eCommunications`，**不带** LOOPBACK —— 麦克风
+  - `both`：两路并行采集（不同设备互不干扰），返回 verdict："只有设备在放/只有麦克风有声音/两边都有"
+
+### 修复
+- **选帧打分尺度太小（真 bug）**：原来按格子宽度抓帧再算变化分，全屏 2560 只抓 418 宽，
+  视频里的角色动作被 HALFTONE 平均掉 —— score 恒为个位数，视频在播也报 `isStatic`。
+  改成分开两件事：**打分固定 ≥900 宽**（`pickScale`），留帧时再 `ScaleBuffer` 缩到格子尺寸。
+  实测同一段视频：全屏 score 6 → 聚焦窗口 81。
+- **"像人声"误判**：只有下限没有上限，`zcr=0.75` 的游戏 BGM 被判成人声。
+  加上限 `zcr < 0.35`（人声在中间带，太高是噪声/金属感音乐）。
+
+### 实测（2560×1600 / 本机）
+| 项 | 结果 |
+|---|---|
+| 窗口 1302×776@189,75 → 客户区 | **1280×720@200,120**（去掉边框标题栏） |
+| 窗口移动后 rect | 1931×1108@161,135（跟随，不缓存） |
+| `saperm_sheet` 不传区域 | 自动用客户区 |
+| `saperm_target clear` | 回退全屏 0,0,2560,1600 |
+| 音频 device | 设备 id `8d88de52…`，db -42，voice=false（音乐） |
+| 音频 mic | 设备 id `b21a48c5…`，db -37.3，voice=true |
+| 音频 both | "设备在放，麦克风也收到声音" |
+
 ## v1.5.0 (2026-11-05) — 听声音 / 手机竖屏适配 / 悬浮窗形状跟随
 
 ### 新增

@@ -393,7 +393,8 @@ export function apply(ctx) {
     obsTtlMs: 0,        // 当前自动关闭 TTL 毫秒数
     linkBudget: { count: 0, windowStart: 0 },  // 联动分钟配额（60s ≤6 次，防刷屏）
     interruptProtect: false,   // 防打断状态：识图/观察任务开启时打开，结束自动关闭（inject 不中断对话）
-    observeTask: null,         // 持续观察任务：{ startedAt, seconds, reportEvery, shotEvery, lastReport, lastShot, timer, endTimer }
+    observeTask: null,
+    target: null,          // 锁定的观察窗口 { hwnd, title }：只存标识，矩形每次现取         // 持续观察任务：{ startedAt, seconds, reportEvery, shotEvery, lastReport, lastShot, timer, endTimer }
     taskAgentId: null,         // 发起观察任务的 agent（会话）id：汇报定向注入到该会话，而非依赖 currentInitiator
     interpretInject: null,     // 连续解读 → 会话注入配置（inject/minInjectMs/kinds + 轮询游标）
     inferInject: null,         // 逐帧识别 → 会话注入配置（inject/injectChanges/minInjectMs + seq 游标）
@@ -1081,11 +1082,13 @@ export function apply(ctx) {
       },
     },
     execute: async (args) => {
+      const rgView = await resolveObserveRect(args)
       const shot = await helperCall('screenshot', {
-        x: args.x, y: args.y, w: args.w, h: args.h, scale: args.scale,
+        x: rgView ? rgView.x : undefined, y: rgView ? rgView.y : undefined,
+        w: rgView ? rgView.w : undefined, h: rgView ? rgView.h : undefined, scale: args.scale,
         maxW: args.maxW || args.quality ? snapWidth(qualityWidth(args.quality) || args.maxW) : undefined,
       })
-      const path = saveShot(shot.jpegB64, args.w ? 'focus' : 'glance')
+      const path = saveShot(shot.jpegB64, rgView ? 'focus' : 'glance')
       const rect = shot.rect || null
       state.overlayOpen = true
       refreshAutoCleanup()
@@ -1105,21 +1108,32 @@ export function apply(ctx) {
       type: 'object',
       properties: {
         ms: { type: 'integer', description: '采样时长毫秒（默认 600，范围 80~5000）' },
+        source: { type: 'string', description: 'device（默认，设备音频/电脑正在放什么）/ mic（麦克风，你这边说话）/ both（两路并行各采一次，返回谁在出声）' },
       },
     },
     execute: async (args) => {
-      const r = await helperCall('audio_level', { ms: clampInt(args.ms, 600, 80, 5000) }, 12000)
+      const source = String(args.source || 'device').toLowerCase()
+      const r = await helperCall('audio_level', { ms: clampInt(args.ms, 600, 80, 5000), source }, 20000)
+      const hintOf = (x) => !x || !x.ok ? ('采集失败: ' + ((x && x.error) || '未知'))
+        : x.silent ? '这段没有声音'
+        : x.voice ? '像有人在说话'
+        : '有声音但不像人声（音乐/音效）'
+      if (source === 'both') {
+        return { mode: 'both', verdict: r && r.verdict, device: r && r.device, mic: r && r.mic,
+                 hint: { device: hintOf(r && r.device), mic: hintOf(r && r.mic) } }
+      }
       return {
+        source: (r && r.source) || source,
         ok: !!(r && r.ok),
         error: (r && r.error) || null,
-        deviceId: (r && r.deviceId) || null,
+        deviceName: (r && r.deviceName) || null,
         db: r && r.db, rms: r && r.rms, peak: r && r.peak,
         zcr: r && r.zcr,
         silent: !!(r && r.silent),
         voice: !!(r && r.voice),
         sampleRate: r && r.sampleRate,
         channels: r && r.channels,
-        hint: (r && r.ok) ? (r.silent ? '这段没有声音' : (r.voice ? '像有人在说话' : '有声音但不像人声（音乐/音效）')) : '采集失败，见 error',
+        hint: hintOf(r),
       }
     },
   })
@@ -1131,9 +1145,78 @@ export function apply(ctx) {
     return null
   }
 
+  // ============ 观察目标：锁定一个窗口，之后所有观察都只看它的内容区 ============
+  // 只存 hwnd/title，矩形每次现取 —— 窗口会移动、缩放、换标题，缓存就等于看错地方。
+  // 客户区（GetClientRect + ClientToScreen）而不是窗口矩形：标题栏和边框不属于内容。
+  async function targetRect() {
+    const t = state.target
+    if (!t) return null
+    try {
+      const r = await helperCall('window_rect', { hwnd: t.hwnd || 0, title: t.title || '' })
+      if (r && r.ok && r.client && r.client.w > 0 && r.client.h > 0) {
+        return { x: r.client.x, y: r.client.y, w: r.client.w, h: r.client.h }
+      }
+      return null
+    } catch { return null }
+  }
+
+  /**
+   * 统一区域解析，优先级：显式 x/y/w/h → 锁定的目标窗口 → 拖框选区 → null（全屏）
+   * 全屏抓一块 4K 屏幕时，真正关心的窗口可能只占三分之一，
+   * 实测同一段视频：全屏变化分 6，只抓窗口 81 —— 差 13 倍。
+   */
+  async function resolveObserveRect(args) {
+    if (args && args.x != null && args.y != null && args.w != null && args.h != null) {
+      return { x: args.x, y: args.y, w: args.w, h: args.h, from: 'explicit' }
+    }
+    const tr = await targetRect()
+    if (tr) return { ...tr, from: 'target' }
+    const rg = readRegion()
+    if (rg) return { x: rg.x, y: rg.y, w: rg.w, h: rg.h, from: 'region' }
+    return null
+  }
+
+  register({
+    name: 'saperm_target',
+    description: '锁定观察目标窗口：指定一个窗口后，saperm_sheet / saperm_view / saperm_scan / saperm_locate / saperm_watch_focus / saperm_observe_task 不传 x/y/w/h 时都自动只看这个窗口的**内容区**（自动去掉标题栏和边框，窗口移动/缩放会跟随）。不锁定时回退到拖框选区或全屏。action: set（默认，按 title 或 hwnd 锁定）/ info（看当前目标）/ clear（解除）。L0 观察，无需审批',
+    parameters: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', description: 'set（默认）/ info / clear' },
+        title: { type: 'string', description: '窗口标题的一部分（不区分大小写的子串匹配）' },
+        hwnd: { type: 'integer', description: '窗口句柄（已知时比标题更准）' },
+      },
+    },
+    execute: async (args) => {
+      const action = String(args.action || 'set')
+      if (action === 'clear') {
+        state.target = null
+        return { target: null, cleared: true, hint: '已解除，观察回退到拖框选区或全屏' }
+      }
+      if (action === 'info') {
+        if (!state.target) return { target: null, hint: '当前没有锁定观察目标（回退拖框选区或全屏）' }
+        const r = await targetRect()
+        return { target: state.target, rect: r, alive: !!r, hint: r ? null : '目标窗口当前不可用（最小化/已关闭/取不到客户区）' }
+      }
+      // set
+      const hwnd = Number(args.hwnd) || 0
+      const title = String(args.title || '').trim()
+      if (!hwnd && !title) return { target: null, error: '需要 title 或 hwnd' }
+      const r = await helperCall('window_rect', { hwnd, title })
+      if (!r || !r.ok) return { target: null, error: (r && r.error) || '窗口不可用', minimized: !!(r && r.minimized) }
+      state.target = { hwnd: r.hwnd, title: r.title }
+      return {
+        target: state.target,
+        rect: r.client,
+        windowRect: r.window,
+        hint: '已锁定，观察工具不传 x/y/w/h 时自动只看这块内容区',
+      }
+    },
+  })
+
   register({
     name: 'saperm_region',
-    description: '拖框选区：用户说"框这块"时调用，屏幕变暗后让用户直接拖一个矩形，松手即保存（不用量像素）。之后 saperm_sheet / saperm_view 不传 x/y/w/h 时可复用。action: pick（拖框）/ get（读上次）/ clear（清除）. L0 观察，无需审批',
+    description: '拖框选区：用户说"框这块"时调用，屏幕变暗后让用户直接拖一个矩形，松手即保存（不用量像素）。之后观察工具不传 x/y/w/h 时可复用。优先级低于 saperm_target 锁定的窗口。action: pick（拖框）/ get（读上次）/ clear（清除）. L0 观察，无需审批',
     parameters: {
       type: 'object',
       properties: {
@@ -1195,7 +1278,8 @@ export function apply(ctx) {
       }
       if (args.maxMs != null) req.maxMs = clampInt(args.maxMs, 3000, 300, 20000)
       if (args.maxH != null) req.maxH = clampInt(args.maxH, 1600, 200, 4000)
-      if (args.x != null) { req.x = args.x; req.y = args.y; req.w = args.w; req.h = args.h }
+      const rgSheet = await resolveObserveRect(args)
+      if (rgSheet) { req.x = rgSheet.x; req.y = rgSheet.y; req.w = rgSheet.w; req.h = rgSheet.h }
       const r = await helperCall('sheet', req)
       const path = saveShot(r.jpegB64, 'sheet')
       const tokens = imageTokens(r.canvasW, r.canvasH)
@@ -1472,8 +1556,9 @@ export function apply(ctx) {
       state.interruptProtect = true
       state.link = true
       state.linkWake = false
-      if (args.focus && Number.isFinite(args.focus.x)) {
-        try { await helperCall('watch_focus', args.focus) } catch {}
+      const focusRect = (args.focus && Number.isFinite(args.focus.x)) ? args.focus : await resolveObserveRect({})
+      if (focusRect) {
+        try { await helperCall('watch_focus', focusRect) } catch {}
       }
       try { await helperCall('watch_start', { intervalMs: interval }) } catch {}
       try { await helperCall('overlay_open', {}) } catch {}
@@ -1993,7 +2078,8 @@ export function apply(ctx) {
       const out = { texts: [], elements: [], stages: {} }
       let rect = null
       try {
-        if (args.x != null) rect = { x: args.x, y: args.y, w: args.w, h: args.h }
+        const rgScan = await resolveObserveRect(args)
+        if (rgScan) rect = { x: rgScan.x, y: rgScan.y, w: rgScan.w, h: rgScan.h }
         else if (!args.full) {
           const w = await helperCall('windows')
           const fg = ((w && w.windows) || []).find((x) => x.fg)
@@ -2085,7 +2171,8 @@ export function apply(ctx) {
       const budget = 1900
       const stages = {}
       let rect = null
-      if (args.x != null) rect = { x: args.x, y: args.y, w: args.w, h: args.h }
+      const rgLoc = await resolveObserveRect(args)
+      if (rgLoc) rect = { x: rgLoc.x, y: rgLoc.y, w: rgLoc.w, h: rgLoc.h }
       else if (!args.full) {
         try {
           const w = await helperCall('windows')
@@ -2325,7 +2412,8 @@ export function apply(ctx) {
     },
     execute: async (args) => {
       const a = { intervalMs: args.intervalMs || 800 }
-      if (args.x != null && args.y != null && args.w != null && args.h != null) { a.x = args.x; a.y = args.y; a.w = args.w; a.h = args.h }
+      const rgWf = await resolveObserveRect(args)
+      if (rgWf) { a.x = rgWf.x; a.y = rgWf.y; a.w = rgWf.w; a.h = rgWf.h }
       let autoStopped = null
       if (state.obsMode === 'infer') {
         try { stopInject('infer'); await helperCall('infer_stop', {}); releaseHold('obs'); autoStopped = 'infer' } catch {}

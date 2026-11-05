@@ -266,11 +266,16 @@ static class Gdi
         if (Math.Abs(scale - 1.0) < 0.01) return (src, sw, sh);
         int dw = Math.Max(1, (int)Math.Round(sw * scale));
         int dh = Math.Max(1, (int)Math.Round(sh * scale));
+        return (ScaleBuffer(src, sw, sh, dw, dh), dw, dh);
+    }
+
+    /// <summary>把已有的 BGRA buffer 缩放到目标尺寸（HALFTONE）。用于"先高分辨率打分、再缩到格子尺寸留帧"。</summary>
+    public static byte[] ScaleBuffer(byte[] src, int sw, int sh, int dw, int dh)
+    {
         IntPtr dc = GetDC(IntPtr.Zero);
         IntPtr smem = CreateCompatibleDC(dc), dmem = CreateCompatibleDC(dc);
         IntPtr sbmp = CreateCompatibleBitmap(dc, sw, sh), dbmp = CreateCompatibleBitmap(dc, dw, dh);
         IntPtr sOld = SelectObject(smem, sbmp), dOld = SelectObject(dmem, dbmp);
-        // source bitmap from buffer: build via SetDIBits
         var bi = new BITMAPINFOHEADER { biSize = 40, biWidth = sw, biHeight = -sh, biPlanes = 1, biBitCount = 32, biCompression = 0 };
         SetDIBits(smem, sbmp, 0, (uint)sh, src, ref bi, 0);
         SetStretchBltMode(dmem, 4); // HALFTONE
@@ -281,7 +286,7 @@ static class Gdi
         SelectObject(smem, sOld); SelectObject(dmem, dOld);
         DeleteObject(sbmp); DeleteObject(dbmp);
         DeleteDC(smem); DeleteDC(dmem); ReleaseDC(IntPtr.Zero, dc);
-        return (outBuf, dw, dh);
+        return outBuf;
     }
 
     [DllImport("gdi32.dll")] public static extern int SetDIBits(IntPtr hdc, IntPtr bmp, uint start, uint lines, byte[] data, ref BITMAPINFOHEADER bi, uint usage);
@@ -615,6 +620,23 @@ static class Win
         if (!ok) { try { SwitchToThisWindow(h, false); } catch { } }
         return ok;
     }
+
+    /// <summary>窗口客户区在屏幕上的矩形（去掉标题栏与边框）。观察画面只该看内容区。</summary>
+    public static (int x, int y, int w, int h)? ClientRect(IntPtr hwnd)
+    {
+        if (hwnd == IntPtr.Zero || !IsWindow(hwnd)) return null;
+        RECT rc;
+        if (!GetClientRect(hwnd, out rc)) return null;
+        int w = rc.R - rc.L, hh = rc.B - rc.T;
+        if (w <= 0 || hh <= 0) return null;
+        var pt = new POINT { X = 0, Y = 0 };
+        if (!ClientToScreen(hwnd, ref pt)) return null;
+        return (pt.X, pt.Y, w, hh);
+    }
+
+    [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr h, out RECT rc);
+    [DllImport("user32.dll")] public static extern bool ClientToScreen(IntPtr h, ref POINT p);
+    [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr h);
 
     public static long FindWindowByTitle(string titlePart)
     {
@@ -2261,19 +2283,63 @@ class Program
             case "ping": return new { pong = true };
             case "screen_bounds": return new { x = 0, y = 0, w = Gdi.ScreenW(), h = Gdi.ScreenH() };
             case "windows": return new { windows = Win.ListWindows() };
-            case "audio_level":
+            case "window_rect":
                 {
-                    int ms = req.TryGetProperty("ms", out var pms2) ? pms2.GetInt32() : 600;
-                    var lv = AudioCapture.Measure(Math.Clamp(ms, 80, 5000));
+                    long hwndL = req.TryGetProperty("hwnd", out var phw) ? phw.GetInt64() : 0;
+                    string titlePart = req.TryGetProperty("title", out var ptt2) ? (ptt2.GetString() ?? "") : "";
+                    IntPtr hw = hwndL > 0 ? new IntPtr(hwndL) : IntPtr.Zero;
+                    if (hw == IntPtr.Zero)
+                    {
+                        if (titlePart.Length == 0) return new { ok = false, error = "需要 hwnd 或 title" };
+                        hw = new IntPtr(Win.FindWindowByTitle(titlePart));
+                        if (hw == IntPtr.Zero) return new { ok = false, error = "找不到标题包含「" + titlePart + "」的窗口" };
+                    }
+                    bool minimized = Win.IsIconic(hw);
+                    var cr = Win.ClientRect(hw);
+                    Win.GetWindowRect(hw, out var wr);
+                    var sbT = new System.Text.StringBuilder(512); Win.GetWindowText(hw, sbT, 512);
+                    if (cr == null)
+                        return new { ok = false, hwnd = (long)hw.ToInt64(), title = sbT.ToString(), minimized,
+                                     error = minimized ? "窗口已最小化，没有可见客户区" : "取不到客户区矩形" };
+                    var c = cr.Value;
                     return new
                     {
+                        ok = true, hwnd = (long)hw.ToInt64(), title = sbT.ToString(), minimized,
+                        client = new { x = c.x, y = c.y, w = c.w, h = c.h },
+                        window = new { x = wr.L, y = wr.T, w = wr.R - wr.L, h = wr.B - wr.T },
+                    };
+                }
+            case "audio_level":
+                {
+                    int ms = Math.Clamp(req.TryGetProperty("ms", out var pms2) ? pms2.GetInt32() : 600, 80, 5000);
+                    string src = req.TryGetProperty("source", out var psrc) ? (psrc.GetString() ?? "device") : "device";
+                    object Pack(AudioCapture.Level lv) => new
+                    {
+                        source = lv.Source,
                         ok = lv.Ok, error = lv.Error,
-                        deviceId = lv.DeviceId,
+                        deviceName = lv.DeviceName,
                         rms = Math.Round(lv.Rms, 4), peak = Math.Round(lv.Peak, 4),
                         db = Math.Round(lv.Db, 1), zcr = Math.Round(lv.Zcr, 4),
                         silent = lv.Silent, voice = lv.SoundsLikeVoice,
                         samples = lv.Samples, channels = lv.Channels, sampleRate = lv.SampleRate,
                     };
+                    if (src == "both")
+                    {
+                        // 两路是不同设备，并行采集互不干扰
+                        AudioCapture.Level dev = null, mic = null;
+                        var t1 = System.Threading.Tasks.Task.Run(() => dev = AudioCapture.Measure(ms, true));
+                        var t2 = System.Threading.Tasks.Task.Run(() => mic = AudioCapture.Measure(ms, false));
+                        System.Threading.Tasks.Task.WaitAll(t1, t2);
+                        bool devAudible = dev != null && dev.Ok && !dev.Silent;
+                        bool micAudible = mic != null && mic.Ok && !mic.Silent;
+                        string verdict = !devAudible && !micAudible ? "两路都安静"
+                            : devAudible && micAudible ? "设备在放，麦克风也收到声音"
+                            : devAudible ? "只有设备在放（对面/视频的声音）"
+                            : "只有麦克风有声音（你这边在说话）";
+                        return new { mode = "both", verdict, device = Pack(dev), mic = Pack(mic) };
+                    }
+                    var lv = AudioCapture.Measure(ms, src != "mic");
+                    return Pack(lv);
                 }
             case "idle": return new { idleMs = Win.IdleMs() };
 
@@ -2341,6 +2407,9 @@ class Program
                         cellW = Math.Max(1, (int)Math.Round(cellH * (double)sw2 / sh2));
                     }
                     double fscale = (double)cellW / sw2;
+                    // 打分必须比格子更细：按 cellW 尺度抓会把视频里的角色动作平均掉
+                    // （实测全屏 2560 抓 418 宽 → 视频动作 score 恒为 0；提到 900 宽后正常）
+                    double pickScale = Math.Min(1.0, Math.Max(900.0, cellW) / sw2);
 
                     var picked = new List<(byte[] buf, int w, int h, int at, double score)>();
                     var swatch = System.Diagnostics.Stopwatch.StartNew();
@@ -2356,14 +2425,13 @@ class Program
                         while (picked.Count < frames && swatch.ElapsedMilliseconds < deadline)
                         {
                             long tStart = swatch.ElapsedMilliseconds;
-                            var (fb, fw, fh) = Gdi.CaptureScaled(sx, sy, sw2, sh2, fscale);
+                            var (fb, fw, fh) = Gdi.CaptureScaled(sx, sy, sw2, sh2, pickScale);
                             var (score, mc) = scorer.Push(fb, fw, fh);
-                            double t = (swatch.ElapsedMilliseconds - tStart) / 1000.0;  // 相对本张起点没用，用绝对
-                            t = swatch.ElapsedMilliseconds / 1000.0;
+                            double t = swatch.ElapsedMilliseconds / 1000.0;
 
                             if (score < 0)   // 首帧必留
                             {
-                                picked.Add((fb, fw, fh, (int)swatch.ElapsedMilliseconds, 0));
+                                picked.Add((Gdi.ScaleBuffer(fb, fw, fh, cellW, cellH), cellW, cellH, (int)swatch.ElapsedMilliseconds, 0));
                             }
                             else
                             {
@@ -2373,7 +2441,7 @@ class Program
                                 bool isBurst = accum >= need;
                                 if (isCut || isBurst)
                                 {
-                                    picked.Add((fb, fw, fh, (int)swatch.ElapsedMilliseconds, Math.Round(score, 1)));
+                                    picked.Add((Gdi.ScaleBuffer(fb, fw, fh, cellW, cellH), cellW, cellH, (int)swatch.ElapsedMilliseconds, Math.Round(score, 1)));
                                     if (isCut) lastCutAt = t;
                                     accum = 0;
                                 }
