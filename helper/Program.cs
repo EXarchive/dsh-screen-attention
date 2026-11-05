@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Imaging;
+using System.Drawing.Drawing2D;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Windows.Forms;
@@ -692,6 +693,49 @@ static class Win
 }
 
 // ============ OCR（PaddleOCR PP-OCRv4 det+rec 委托） ============
+// ============ 语音合成（Windows 自带 SAPI，System.Speech 包） ============
+// 用途：浮窗 say 的同时把话说出来。异步朗读，不阻塞命令循环。
+static class Tts
+{
+    static System.Speech.Synthesis.SpeechSynthesizer _synth;
+    static readonly object _lock = new object();
+    public static int Rate = 0;
+
+    public static (bool ok, string err) Speak(string text, int rate = 0)
+    {
+        try
+        {
+            lock (_lock)
+            {
+                if (_synth == null)
+                {
+                    _synth = new System.Speech.Synthesis.SpeechSynthesizer();
+                    _synth.SetOutputToDefaultAudioDevice();
+                }
+                _synth.Rate = Math.Clamp(rate != 0 ? rate : Rate, -10, 10);
+                _synth.SpeakAsyncCancelAll();   // 新话打断旧话，不排队积压
+                _synth.SpeakAsync(text);
+            }
+            return (true, null);
+        }
+        catch (Exception e) { return (false, e.GetType().Name + ": " + e.Message); }
+    }
+
+    public static List<object> Voices()
+    {
+        var list = new List<object>();
+        try
+        {
+            var s = new System.Speech.Synthesis.SpeechSynthesizer();
+            foreach (var v in s.GetInstalledVoices())
+                list.Add(new { name = v.VoiceInfo.Name, culture = v.VoiceInfo.Culture?.Name, enabled = v.Enabled });
+            s.Dispose();
+        }
+        catch { }
+        return list;
+    }
+}
+
 static class Ocr
 {
     public static readonly string Lang = "zh-Hans-CN";
@@ -824,10 +868,27 @@ static class Uia
 }
 
 // ============ 注意力可视化小窗（WinForms overlay，STA 线程） ============
+// 双缓冲窗体：直接在 new Form 上设 DoubleBuffered 不行（protected），必须子类。
+// 不开这个，每帧 Invalidate 都是「先擦背景再画」→ 肉眼可见闪屏。
+sealed class OverlayForm : Form
+{
+    public OverlayForm()
+    {
+        SetStyle(ControlStyles.OptimizedDoubleBuffer
+               | ControlStyles.AllPaintingInWmPaint
+               | ControlStyles.UserPaint, true);
+        DoubleBuffered = true;
+        UpdateStyles();
+    }
+    // 彻底不擦背景（WM_ERASEBKGND），否则双缓冲也压不住边缘闪
+    protected override void OnPaintBackground(PaintEventArgs e) { }
+}
+
 static class Overlay
 {
     public static Form form;
-    public static Label bar;
+    public static Label bar;   // 保留字段兼容旧引用，信息条已改自绘（见 BarH + DrawBar）
+    public const int BarH = 40;
     public static readonly object Sync = new object();
     public static bool hasRect;
     public static Rectangle attRect;
@@ -835,10 +896,24 @@ static class Overlay
     public static Point gazePt;
     public static string note = "";
     public static byte[] frame;      // 最新采集帧 BGRA（watch 线程写）
+    public static volatile int frameStamp;   // 帧序号：只在真换帧时自增，供重绘判断
+    static bool sayJustCleared;              // 气泡刚消失的那一帧也要重绘一次
     public static int fw, fh;
     public static double fps;        // 采集帧率
     public static int originX = 0, originY = 0;  // 虚拟屏幕原点（多显示器，帧左上角虚拟坐标）
     public static bool IsOpen => form != null;
+    // ==== say 气泡：AI 的话直接显示在小窗上（同时可选朗读）====
+    public static string sayText = "";
+    public static long sayUntil = 0;
+    public static void Say(string text, int ms = 5000)
+    {
+        sayText = text ?? "";
+        sayUntil = Environment.TickCount64 + Math.Max(800, ms);
+        frameStamp = unchecked(frameStamp + 1);   // 强制下一 tick 重绘
+        var f = form;
+        if (f != null) { try { f.Invoke(new Action(() => { try { f.Invalidate(); } catch { } })); } catch { } }
+    }
+    public static void ClearSay() { sayText = ""; sayUntil = 0; var f = form; if (f != null) { try { f.Invoke(new Action(() => { try { f.Invalidate(); } catch { } })); } catch { } } }
     static volatile System.Threading.Tasks.TaskCompletionSource<bool> ReadySignal = new System.Threading.Tasks.TaskCompletionSource<bool>();
 
     // 等待窗口真正显示出来（<3s 超时）；失败返回 false
@@ -856,7 +931,7 @@ static class Overlay
         {
             try
             {
-                form = new Form
+                form = new OverlayForm
                 {
                     Text = "SA 注意力",
                     TopMost = true,
@@ -866,29 +941,39 @@ static class Overlay
                     Bounds = new Rectangle(x, y, w, h),
                     BackColor = Color.Black,
                 };
-                bar = new Label
-                {
-                    Dock = DockStyle.Bottom,
-                    Height = 46,
-                    BackColor = Color.FromArgb(210, 0, 0, 0),
-                    ForeColor = Color.White,
-                    Font = new Font("Microsoft YaHei UI", 9f),
-                    TextAlign = ContentAlignment.MiddleLeft,
-                    Padding = new Padding(8, 0, 8, 0),
-                    Text = "等待画面…",
-                };
-                form.Controls.Add(bar);
+                // 信息条改为自绘（PaintFrame → DrawBar），不再用 Label：Label 画不了圆点/分隔线/左右分层
                 form.DoubleClick += (s, e) => { try { form.Close(); } catch { } };
                 Point dragOff = Point.Empty; bool dragging = false;
                 form.MouseDown += (s, e) => { if (e.Button == MouseButtons.Left) { dragging = true; dragOff = e.Location; } };
                 form.MouseMove += (s, e) => { if (dragging) form.Location = new Point(form.Left + e.X - dragOff.X, form.Top + e.Y - dragOff.Y); };
                 form.MouseUp += (s, e) => dragging = false;
                 form.Paint += (s, e) => PaintFrame(e.Graphics, form.ClientSize);
-                // 每 100ms 重绘 + 每 tick 强化置顶到最高层
+                // 重绘定时器：100ms 只做事，不样样都干
+                // 三条节流（每条都曾是闪屏源）：
+                //   ① 标题只在 note 真变时改 —— 每 tick 改 Text 会发 WM_SETTEXT 触发重排
+                //   ② SetWindowPos 每 tick 调 = 每 100ms 强制重排 z 序 → 闪；降到 1s
+                //   ③ 帧没变就不 Invalidate
                 var timer = new System.Windows.Forms.Timer { Interval = 100 };
+                string lastTitle = "";
+                int lastFrameStamp = -1, tickCount = 0;
                 timer.Tick += (s, e) =>
                 {
-                    try { lock (Sync) { form.Text = note.Length > 0 ? "SA 注意力 - " + note : "SA 注意力"; } Win.RaiseTopmost(form.Handle); form.Invalidate(); } catch { }
+                    try
+                    {
+                        tickCount++;
+                        string want = note.Length > 0 ? "SA 注意力 - " + note : "SA 注意力";
+                        if (want != lastTitle) { lock (Sync) { form.Text = want; } lastTitle = want; }
+                        if (tickCount % 10 == 0) Win.RaiseTopmost(form.Handle);   // 1s 一次足够
+                        int stamp = frameStamp;
+                        bool sayLive = sayText.Length > 0 && Environment.TickCount64 < sayUntil;
+                        if (stamp != lastFrameStamp || sayLive || sayJustCleared)
+                        {
+                            lastFrameStamp = stamp;
+                            sayJustCleared = sayLive;   // 记录"上一帧还在显示气泡"
+                            form.Invalidate();
+                        }
+                    }
+                    catch { }
                 };
                 timer.Start();
                 form.FormClosed += (s, e) => { try { timer.Stop(); } catch { } };
@@ -954,54 +1039,145 @@ static class Overlay
         catch { return false; }
     }
 
-    // UI 线程：绘制最新帧 + 注意力标注 + 底部信息条
+    // UI 线程：绘制最新帧 + 注意力标注 + say 气泡 + 底部信息条（全部自绘）
+    // 设计语言：深蓝底 (10,16,34) / 强调青蓝 (96,196,255) / 主文字 (232,240,255) / 次要 (150,175,205)
     static void PaintFrame(Graphics g, Size client)
     {
         lock (Sync)
         {
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+            int vw = client.Width, vh = Math.Max(1, client.Height - BarH);
+
             if (frame != null && fw > 0 && fh > 0)
             {
-                using var bmp = BgraToBitmap(frame, fw, fh);
-                int barH = bar != null ? bar.Height : 0;
-                int vw = client.Width, vh = Math.Max(1, client.Height - barH);
+                var bmp = BgraToBitmap(frame, fw, fh);   // 复用缓冲，不能 using（Dispose 会毁掉缓存）
                 double scale = Math.Min((double)vw / fw, (double)vh / fh);
                 int dw = (int)(fw * scale), dh = (int)(fh * scale);
                 int dx = (vw - dw) / 2, dy = (vh - dh) / 2;
                 g.DrawImage(bmp, dx, dy, dw, dh);
+
+                // 注意力区域：四角括号（画满框会遮挡内容，括号只标边界）
                 if (hasRect)
                 {
-                    using var pen = new Pen(Color.Red, 2);
                     int rx = dx + (int)((attRect.X - originX) * scale), ry = dy + (int)((attRect.Y - originY) * scale);
-                    int rw = Math.Max(2, (int)(attRect.Width * scale)), rh = Math.Max(2, (int)(attRect.Height * scale));
-                    g.DrawRectangle(pen, rx, ry, rw, rh);
+                    int rw = Math.Max(6, (int)(attRect.Width * scale)), rh = Math.Max(6, (int)(attRect.Height * scale));
+                    using var pen = new Pen(Color.FromArgb(235, 255, 86, 96), 2f);
+                    DrawCorners(g, pen, new Rectangle(rx, ry, rw, rh));
                 }
+                // 注视点：同心圆 + 十字
                 if (hasGaze)
                 {
-                    using var pen = new Pen(Color.Lime, 2);
                     int gx = dx + (int)((gazePt.X - originX) * scale), gy = dy + (int)((gazePt.Y - originY) * scale);
-                    g.DrawLine(pen, gx - 8, gy, gx + 8, gy);
-                    g.DrawLine(pen, gx, gy - 8, gx, gy + 8);
+                    using var pen = new Pen(Color.FromArgb(235, 120, 240, 140), 1.6f);
+                    g.DrawEllipse(pen, gx - 7, gy - 7, 14, 14);
+                    g.DrawEllipse(pen, gx - 2, gy - 2, 4, 4);
+                    g.DrawLine(pen, gx - 12, gy, gx - 9, gy);
+                    g.DrawLine(pen, gx + 9, gy, gx + 12, gy);
+                    g.DrawLine(pen, gx, gy - 12, gx, gy - 9);
+                    g.DrawLine(pen, gx, gy + 9, gx, gy + 12);
+                }
+                // say 气泡：圆角，留 18px 不与信息条相贴
+                if (sayText.Length > 0 && Environment.TickCount64 < sayUntil)
+                {
+                    var flags = TextFormatFlags.WordBreak | TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding;
+                    int maxW = Math.Max(120, (int)(vw * 0.88));
+                    var sz = TextRenderer.MeasureText(sayText, sayFont, new Size(maxW - 28, 600), flags);
+                    int bw = Math.Min(maxW, sz.Width + 28), bh = sz.Height + 20;
+                    int bx = (vw - bw) / 2;
+                    int by = Math.Max(6, vh - bh - 18);
+                    using var path = RoundRect(new Rectangle(bx, by, bw, bh), 8);
+                    using (var bg = new SolidBrush(Color.FromArgb(226, 12, 20, 44)))
+                    using (var pen = new Pen(Color.FromArgb(200, 96, 196, 255), 1.5f))
+                    {
+                        g.FillPath(bg, path);
+                        g.DrawPath(pen, path);
+                    }
+                    TextRenderer.DrawText(g, sayText, sayFont, new Rectangle(bx + 14, by + 10, bw - 28, bh - 20), Color.FromArgb(236, 244, 255), flags);
                 }
             }
-            if (bar != null)
-            {
-                var sb = new StringBuilder();
-                sb.Append(note.Length > 0 ? "注意: " + note : "空闲");
-                if (hasRect) sb.Append("  |  区域 " + attRect.X + "," + attRect.Y + " " + attRect.Width + "x" + attRect.Height);
-                if (hasGaze) sb.Append("  |  注视 " + gazePt.X + "," + gazePt.Y);
-                sb.Append("  |  观察 " + fps.ToString("0.0") + "fps");
-                bar.Text = sb.ToString();
-            }
+            DrawBar(g, client.Width, vh);
         }
     }
 
+    /// <summary>四角括号（长度按框大小自适应，最长 18px）。</summary>
+    static void DrawCorners(Graphics g, Pen pen, Rectangle r)
+    {
+        int len = Math.Max(6, Math.Min(18, Math.Min(r.Width, r.Height) / 4));
+        // 左上
+        g.DrawLine(pen, r.Left, r.Top, r.Left + len, r.Top);
+        g.DrawLine(pen, r.Left, r.Top, r.Left, r.Top + len);
+        // 右上
+        g.DrawLine(pen, r.Right, r.Top, r.Right - len, r.Top);
+        g.DrawLine(pen, r.Right, r.Top, r.Right, r.Top + len);
+        // 左下
+        g.DrawLine(pen, r.Left, r.Bottom, r.Left + len, r.Bottom);
+        g.DrawLine(pen, r.Left, r.Bottom, r.Left, r.Bottom - len);
+        // 右下
+        g.DrawLine(pen, r.Right, r.Bottom, r.Right - len, r.Bottom);
+        g.DrawLine(pen, r.Right, r.Bottom, r.Right, r.Bottom - len);
+    }
+
+    static GraphicsPath RoundRect(Rectangle r, int rad)
+    {
+        var p = new GraphicsPath();
+        int d = Math.Max(2, rad * 2);
+        if (d > r.Width) d = r.Width;
+        if (d > r.Height) d = r.Height;
+        p.AddArc(r.X, r.Y, d, d, 180, 90);
+        p.AddArc(r.Right - d, r.Y, d, d, 270, 90);
+        p.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
+        p.AddArc(r.X, r.Bottom - d, d, d, 90, 90);
+        p.CloseFigure();
+        return p;
+    }
+
+    static readonly Font noteFont = new Font("Microsoft YaHei UI", 9.5f);
+    static readonly Font metaFont = new Font("Microsoft YaHei UI", 9f);
+    static readonly Font sayFont = new Font("Microsoft YaHei UI", 10f, FontStyle.Bold);
+
+    /// <summary>底部信息条：左=状态圆点+注意点，右=区域尺寸+帧率（单行省略，互不挤压）。</summary>
+    static void DrawBar(Graphics g, int w, int y)
+    {
+        int pad = 10, dot = 7, gap = 8;
+        using (var bg = new SolidBrush(Color.FromArgb(240, 10, 16, 34)))
+            g.FillRectangle(bg, 0, y, w, BarH);
+        using (var line = new Pen(Color.FromArgb(80, 96, 196, 255), 1f))
+            g.DrawLine(line, 0, y, w, y);
+
+        // 状态圆点：绿=在动，琥珀=静止
+        bool live = fps > 0.5;
+        using (var b = new SolidBrush(live ? Color.FromArgb(95, 220, 130) : Color.FromArgb(225, 190, 95)))
+            g.FillEllipse(b, pad, y + (BarH - dot) / 2, dot, dot);
+
+        // 右侧指标（先量，右边优先占位）
+        string right = (hasRect ? attRect.Width + "×" + attRect.Height + "   " : "") + fps.ToString("0.0") + " fps";
+        var rf = TextFormatFlags.NoPadding | TextFormatFlags.SingleLine | TextFormatFlags.VerticalCenter | TextFormatFlags.Right;
+        int rightW = TextRenderer.MeasureText(right, metaFont, new Size(w, BarH), rf).Width + 2;
+        int leftX = pad + dot + gap;
+        int leftMax = Math.Max(30, w - leftX - rightW - pad - gap);
+        var lf = TextFormatFlags.NoPadding | TextFormatFlags.SingleLine | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis;
+        TextRenderer.DrawText(g, note.Length > 0 ? note : "空闲", noteFont,
+            new Rectangle(leftX, y, leftMax, BarH), Color.FromArgb(232, 240, 255), lf);
+        TextRenderer.DrawText(g, right, metaFont,
+            new Rectangle(w - pad - rightW, y, rightW, BarH), Color.FromArgb(150, 175, 205), rf);
+    }
+
+    // 复用同一张位图：480×270@100ms 原来每秒 new 10 张 Bitmap，GC 压力直接表现为卡顿
+    static Bitmap _frameBmp;
+    static int _frameBmpW, _frameBmpH;
     static Bitmap BgraToBitmap(byte[] bgra, int w, int h)
     {
-        var bmp = new Bitmap(w, h, PixelFormat.Format32bppArgb);
-        var data = bmp.LockBits(new Rectangle(0, 0, w, h), ImageLockMode.WriteOnly, PixelFormat.Format32bppArgb);
+        if (_frameBmp == null || _frameBmpW != w || _frameBmpH != h)
+        {
+            try { _frameBmp?.Dispose(); } catch { }
+            _frameBmp = new Bitmap(w, h, PixelFormat.Format32bppArgb);
+            _frameBmpW = w; _frameBmpH = h;
+        }
+        var data = _frameBmp.LockBits(new Rectangle(0, 0, w, h), ImageLockMode.WriteOnly, PixelFormat.Format32bppArgb);
         Marshal.Copy(bgra, 0, data.Scan0, bgra.Length);
-        bmp.UnlockBits(data);
-        return bmp;
+        _frameBmp.UnlockBits(data);
+        return _frameBmp;
     }
 }
 
@@ -1365,6 +1541,7 @@ static class Watch
                 {
                     Overlay.frame = buf;
                     Overlay.fw = w; Overlay.fh = h;
+                    Overlay.frameStamp = unchecked(Overlay.frameStamp + 1);   // 换帧计数：驱动按需重绘
                     long now = DateTime.UtcNow.Ticks;
                     if (lastTick > 0)
                     {
@@ -2309,6 +2486,19 @@ class Program
                         window = new { x = wr.L, y = wr.T, w = wr.R - wr.L, h = wr.B - wr.T },
                     };
                 }
+            case "say":
+                {
+                    string text = req.TryGetProperty("text", out var ptx) ? (ptx.GetString() ?? "") : "";
+                    if (text.Trim().Length == 0) return new { ok = false, error = "text 为空" };
+                    bool speak = !(req.TryGetProperty("speak", out var psk) && psk.GetBoolean() == false);
+                    int ms = Math.Clamp(req.TryGetProperty("ms", out var pms3) ? pms3.GetInt32() : 5000, 800, 60000);
+                    int rate = req.TryGetProperty("rate", out var prt) ? prt.GetInt32() : 0;
+                    Overlay.Say(text, ms);
+                    var (ok2, err2) = (true, (string)null);
+                    if (speak) (ok2, err2) = Tts.Speak(text, rate);
+                    return new { ok = true, shown = Overlay.IsOpen, spoke = speak, spokeOk = ok2, spokeError = err2, ms };
+                }
+            case "speech_voices": return new { voices = Tts.Voices() };
             case "audio_level":
                 {
                     int ms = Math.Clamp(req.TryGetProperty("ms", out var pms2) ? pms2.GetInt32() : 600, 80, 5000);

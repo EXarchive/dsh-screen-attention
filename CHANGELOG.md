@@ -1,5 +1,41 @@
 # Changelog (dsh-screen-attention)
 
+## v1.7.0 (2026-11-05) — 开口说话（say 气泡 + TTS）/ 外观整合 / 闪屏修复
+
+### 新增
+- **`saperm_say`：AI 边看边说**
+  - 文字显示在小窗的**圆角气泡**里，同时用 Windows 自带 SAPI 朗读
+  - 依赖 `System.Speech` 9.0（官方包，无需第三方）；本机音色：**Microsoft Huihui Desktop（中文）**、Zira、David
+  - `speak:false` 只显示气泡不出声；新话打断旧话（`SpeakAsyncCancelAll`），不排队积压
+  - `saperm_speech_voices` 列出可用音色
+- **外观整合（统一设计语言）**
+  - 色板：深蓝底 `(10,16,34)` / 强调青蓝 `(96,196,255)` / 主文字 `(232,240,255)` / 次要 `(150,175,205)`
+  - **注意力区域：实心矩形 → 四角括号**（画满框会遮挡内容，括号只标边界，长度自适应最长 18px）
+  - **注视点：绿十字 → 同心圆 + 短十字**
+  - **气泡：直角矩形 → 圆角（r=8）+ 青蓝描边**，距信息条留 18px，最大宽度 88%
+  - **信息条：Label → 全自绘**，左=状态圆点（绿在动/琥珀静止）+ 注意点，右=区域尺寸 + 帧率；单行省略互不挤压
+- **`helper/deploy.ps1`**：全量同步 + 重试 kill + **逐文件哈希校验**（部署不完整直接报错，不再带病运行）
+
+### 修复
+- **浮窗闪屏**（三个原因叠加，逐个掐掉）
+  1. **没有双缓冲**：`new Form` 拿不到 protected 的 `DoubleBuffered` → 新增 `OverlayForm` 子类 `SetStyle(OptimizedDoubleBuffer | AllPaintingInWmPaint | UserPaint)`，并让 `OnPaintBackground` 空实现（连 WM_ERASEBKGND 都不擦）
+  2. **每帧新建 Bitmap**：480×270@100ms = 每秒 10 张，GC 直接表现为卡顿 → 复用同一张位图（注意不能 `using`，会 Dispose 掉缓存）
+  3. **每 tick 三件事都干**：改 `form.Text`（发 WM_SETTEXT 触发重排）、`SetWindowPos` 强化置顶（每 100ms 强制重排 z 序）、无条件 `Invalidate`
+     → 改成：标题只在 note 变化时改、置顶降到 1s 一次、**帧序号没变就不重绘**（`frameStamp`）
+- **`System.Speech.dll` 同名不同类型**：根目录是 310KB 的 facade（引用壳），实现版是 `runtimes\win\lib\net9.0\` 下的 685KB。
+  只复制根目录那份 → 运行时报 `Could not load file or assembly 'System.Speech'`。
+  修法：`runtimes` 目录整体同步，并把实现版覆盖到根目录（.NET 探测顺序优先应用目录）。
+
+### 实测
+| 项 | 结果 |
+|---|---|
+| 音色列表 | 3 个（Huihui 中文 / Zira / David） |
+| `saperm_say` | `ok:true shown:true spoke:true spokeOk:true`，截图可见圆角气泡 |
+| 浮窗像素稳定性（6 帧/150ms） | `isStatic:true`，score 全 0 |
+| 浮窗像素稳定性（10 帧/100ms） | 抖动分（0<score<8）**0 个** |
+| helper CPU | 16.9% 单核（含 500ms 全屏采集 + 浮窗绘制） |
+| `observe_task maxReports:2` | 10s 自动收工，浮窗一并回收 |
+
 ## v1.6.0 (2026-11-05) — 锁定观察目标 / 音频分麦克风 / 选帧尺度修复
 
 ### 新增

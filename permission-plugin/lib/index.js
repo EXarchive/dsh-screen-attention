@@ -1176,6 +1176,38 @@ export function apply(ctx) {
     return null
   }
 
+  // ============ 说话：AI 的话显示在浮窗气泡上 + 朗读（Windows 自带 SAPI） ============
+  register({
+    name: 'saperm_say',
+    description: '让 AI 开口：文字显示在悬浮小窗的气泡里（小窗没开则只朗读），同时用 Windows 自带语音合成念出来。适合"我要边看边说"的场景——比如盯屏时提醒、讲解、吐槽。默认朗读，speak=false 只显示气泡不出声；新话会打断旧话不排队。L0 观察，无需审批',
+    parameters: {
+      type: 'object',
+      properties: {
+        text: { type: 'string', description: '要说的话（要念出来的内容）' },
+        speak: { type: 'boolean', description: '是否朗读（默认 true）；false = 只显示气泡' },
+        ms: { type: 'integer', description: '气泡停留毫秒（默认 5000）' },
+        rate: { type: 'integer', description: '语速 -10~10（0 正常，负慢正快）' },
+      },
+    },
+    execute: async (args) => {
+      const text = String(args.text || "").trim()
+      if (!text) return { ok: false, error: "text 为空" }
+      return await helperCall('say', {
+        text,
+        speak: args.speak !== false,
+        ms: clampInt(args.ms, 5000, 800, 60000),
+        rate: clampInt(args.rate, 0, -10, 10),
+      }, 8000)
+    },
+  })
+
+  register({
+    name: 'saperm_speech_voices',
+    description: '列出系统已安装的语音合成音色（Windows SAPI）。用于确认中文语音是否可用，只读。L0 观察，无需审批',
+    parameters: empty,
+    execute: async () => await helperCall('speech_voices'),
+  })
+
   register({
     name: 'saperm_target',
     description: '锁定观察目标窗口：指定一个窗口后，saperm_sheet / saperm_view / saperm_scan / saperm_locate / saperm_watch_focus / saperm_observe_task 不传 x/y/w/h 时都自动只看这个窗口的**内容区**（自动去掉标题栏和边框，窗口移动/缩放会跟随）。不锁定时回退到拖框选区或全屏。action: set（默认，按 title 或 hwnd 锁定）/ info（看当前目标）/ clear（解除）。L0 观察，无需审批',
@@ -1398,6 +1430,8 @@ export function apply(ctx) {
         clearRegion: { type: 'boolean', description: '清除区域红框' },
         clearGaze: { type: 'boolean', description: '清除注视点十字' },
         note: { type: 'string', description: 'AI 注意点说明文字（显示在小窗底部）' },
+        say: { type: 'string', description: '让小窗显示一句话（气泡），并朗读出来' },
+        speak: { type: 'boolean', description: '配合 say：是否朗读（默认 true）' },
         aspect: { type: 'string', description: '运行时换窗口形状：auto / landscape / portrait（手机竖屏）/ square / custom（配合 w,h）' },
         w: { type: 'integer', description: 'aspect=custom 时的宽度' },
         h: { type: 'integer', description: 'aspect=custom 时的高度' },
@@ -1407,6 +1441,9 @@ export function apply(ctx) {
       state.overlayOpen = true
       refreshAutoCleanup()
       const out = await helperCall('overlay_set', { region: args.region, gaze: args.gaze, clearRegion: args.clearRegion, clearGaze: args.clearGaze, note: args.note })
+      if (args.say) {
+        try { await helperCall('say', { text: String(args.say), speak: args.speak !== false, ms: 6000 }, 8000) } catch {}
+      }
       if (args.aspect || (args.w && args.h)) {
         const box = resolveAspect(args.aspect || 'custom', args.w, args.h)
         const rz = await helperCall('overlay_resize', { w: box.w, h: box.h })

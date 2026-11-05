@@ -27,7 +27,14 @@
    - **角色知识库关联**：通过`saperm_char_note`写入背景知识，在识别到人物时一并输出（如 DeepSeek 蓝鲸拟人女仆）。
    - **原子持久化**：角色库采用 Temp + File.Replace 机制，杜绝并发写入损坏。
 
-3. **双观察模式与互斥调度**
+3. **注意力可视化小窗（overlay）**
+   - 无边框 TopMost + 屏幕缩略画面 + 注意力四角括号 + 注视同心圆 + `say` 圆角气泡 + 分层信息条（左状态圆点 / 右区域尺寸与帧率）；可拖动、双击关闭。
+   - 统一色板：深蓝底 `(10,16,34)` / 强调青蓝 `(96,196,255)` / 主文字 `(232,240,255)` / 次要 `(150,175,205)`。
+   - **抗闪三件套**：双缓冲 Form 子类（`OverlayForm`）+ 不擦背景（`OnPaintBackground` 空实现）+ 帧位图复用；
+     再叠加三重节流：标题只在 note 变化时改、`SetWindowPos` 降到 1s 一次、帧序号没换就不 `Invalidate`。
+   - `saperm_say` 让 AI 开口：文字进气泡 + Windows SAPI 朗读（系统有中文音色 Huihui）。
+
+4. **双观察模式与互斥调度**
    - **连续解读（Interpret）**：~800ms 间隔，粗粒度帧差触发区域 OCR 与变化分类（内容变化 / 动态噪声 / 文字位移）。
    - **逐帧融合（Infer）**：逐帧融合 OCR + 物体 + 角色身份 + 动漫脸 + 场景，单模式稳定帧率 6.7~6.9 fps。
    - **互斥守护**：启动任一长时观察模式时，插件自动停止另一模式（返回 `autoStopped`），避免 DirectML/算力资源争用降级。
@@ -78,6 +85,7 @@ dsh-screen-attention/
 │   ├── Cuts.cs               # 变化分（HSV 64×36 网格 + 运动补偿），sheet 按变化量选帧
 │   ├── RegionPicker.cs       # 全屏拖框选区窗口
 │   ├── AudioCapture.cs       # WASAPI 回环/麦克风采集（设备音频与麦分路）
+│   └── deploy.ps1            # 部署脚本（全量同步 + 哈希校验）
 │   └── models/               # 本地模型目录
 │       ├── ch_PP-OCRv4_det_infer.onnx
 │       ├── ch_PP-OCRv4_rec_infer.onnx
@@ -174,6 +182,7 @@ saperm_health {}
 | **双方案识别** | `saperm_scan({mode})` | local / vision / auto | 文本够用走 local（0 token）；要看图标/照片/视频原貌走 vision |
 | **多帧拼图** | `saperm_sheet` | 一次看一段时间的变化 | 价格按张算不按帧算：4 帧 591 token（每帧 148），比看 4 次省 75%；**按变化量选帧**，静止画面只出 1 张 |
 | **拖框选区** | `saperm_region` | 用户拖框定区域 | 说"框这块"就弹半透明覆盖窗，拖完自动存，不用量像素；返回 `orientation` 标明竖屏还是横屏 |
+| **开口说话** | `saperm_say` | AI 边看边说 | 文字进小窗圆角气泡 + Windows 自带 SAPI 朗读（系统有中文音色 Huihui）；`speak:false` 只显示不出声 |
 | **锁定观察目标** | `saperm_target` | 只看某个窗口 | 锁定后 sheet/view/scan/locate 不传区域就只看它**客户区**（自动去标题栏边框，窗口移动跟随）；实测同一段视频全屏变化分 6、只抓窗口 81 —— 差 13 倍 |
 | **听声音** | `saperm_audio` | 分辨谁在出声 | `source: device`（系统输出回环）/ `mic`（麦克风）/ `both`（两路并行，返回"谁在出声"）|
 | **自动化输入** | `saperm_click` / `press` / `type` / `hotkey` | 鼠标键盘操作（含长按 holdMs） | 基于 OCR 坐标或 UIA 控件进行前台自动化交互 |
