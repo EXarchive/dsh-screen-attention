@@ -1094,6 +1094,51 @@ export function apply(ctx) {
   })
 
   register({
+    name: 'saperm_sheet',
+    description: '多帧拼图：连续抓 N 帧（默认 4）拼成一张网格图。**价格按张算不按帧算** —— 4 帧和 8 帧 token 相同，所以多留一帧几乎免费、漏掉一帧才贵。用于一次看清一段时间内的画面变化（网页滚动、视频、演示、操作回放）。返回网格布局与每格时间戳。L0 观察，无需审批',
+    parameters: {
+      type: 'object',
+      properties: {
+        frames: { type: 'integer', description: '帧数（默认 4，范围 1~12）' },
+        intervalMs: { type: 'integer', description: '帧间隔毫秒（默认 120；调大等于看更长的时间窗）' },
+        quality: { type: 'string', description: 'low=798 约 242 token / standard=1050 / high=1260（默认）约 590 / ultra=1596' },
+        maxW: { type: 'integer', description: '画布最大宽度（覆盖 quality，自动对齐 42）' },
+        gap: { type: 'integer', description: '格子间距像素（默认 2）' },
+        x: { type: 'integer', description: '采集区域左上 x（默认全屏）' },
+        y: { type: 'integer', description: '采集区域左上 y' },
+        w: { type: 'integer', description: '采集区域宽' },
+        h: { type: 'integer', description: '采集区域高' },
+      },
+    },
+    execute: async (args) => {
+      const t0 = Date.now()
+      const wantW = snapWidth(qualityWidth(args.quality) || args.maxW || 1260)
+      const req = {
+        frames: clampInt(args.frames, 4, 1, 12),
+        intervalMs: clampInt(args.intervalMs, 120, 0, 5000),
+        gap: clampInt(args.gap, 2, 0, 12),
+        maxW: wantW,
+      }
+      if (args.x != null) { req.x = args.x; req.y = args.y; req.w = args.w; req.h = args.h }
+      const r = await helperCall('sheet', req)
+      const path = saveShot(r.jpegB64, 'sheet')
+      const tokens = imageTokens(r.canvasW, r.canvasH)
+      return {
+        path,
+        frames: r.frames, cols: r.cols, rows: r.rows,
+        w: r.canvasW, h: r.canvasH, cellW: r.cellW, cellH: r.cellH,
+        tokens,
+        perFrameTokens: Math.round(tokens / Math.max(1, r.frames)),
+        grid: r.rows + '×' + r.cols + '（行×列，按帧序从左到右、从上到下）',
+        cells: r.cells,
+        rect: r.rect,
+        elapsedMs: r.elapsedMs,
+        totalMs: Date.now() - t0,
+      }
+    },
+  })
+
+  register({
     name: 'saperm_glance',
     description: '全屏大图（glance 快速语义，默认最大宽 1260 = 42×30，约 560 token）：返回图片文件路径+全屏 rect+token 估算。配合 saperm_view(小区域) 构成多尺度对应：小图 rect 是大图的子区域。观察类，无需审批',
     parameters: {

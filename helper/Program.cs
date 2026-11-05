@@ -2261,6 +2261,70 @@ class Program
                     return new { w, h, bw, bh, rect = new { x, y, w, h }, jpegB64 = Convert.ToBase64String(jpg), bytes = jpg.Length };
                 }
 
+            case "sheet":
+                {
+                    // 多帧拼图：连续抓 N 帧拼进一张网格图。
+                    // 关键是「价格按张算，不按帧算」——4 帧和 8 帧 token 相同，
+                    // 所以多留一帧几乎免费，漏掉一帧才贵。
+                    int frames = Math.Clamp(req.TryGetProperty("frames", out var pf) ? pf.GetInt32() : 4, 1, 12);
+                    int maxW = req.TryGetProperty("maxW", out var pmw) ? pmw.GetInt32() : 1260;
+                    int intervalMs = Math.Clamp(req.TryGetProperty("intervalMs", out var pim) ? pim.GetInt32() : 120, 0, 5000);
+                    int gap = Math.Clamp(req.TryGetProperty("gap", out var pg) ? pg.GetInt32() : 2, 0, 12);
+
+                    int vx2 = Gdi.GetSystemMetrics(76), vy2 = Gdi.GetSystemMetrics(77);
+                    int vw2 = Gdi.GetSystemMetrics(78), vh2 = Gdi.GetSystemMetrics(79);
+                    int sx = req.TryGetProperty("x", out var psx) ? psx.GetInt32() : vx2;
+                    int sy = req.TryGetProperty("y", out var psy) ? psy.GetInt32() : vy2;
+                    int sw2 = req.TryGetProperty("w", out var psw) ? psw.GetInt32() : vw2;
+                    int sh2 = req.TryGetProperty("h", out var psh) ? psh.GetInt32() : vh2;
+                    if (sw2 <= 0) sw2 = 1;
+                    if (sh2 <= 0) sh2 = 1;
+
+                    // 等分网格：帧越多格子越小，一张图覆盖的时间越长
+                    int cols = frames <= 1 ? 1 : frames == 2 ? 2 : frames <= 4 ? 2 : frames <= 6 ? 3 : 4;
+                    int rows = (int)Math.Ceiling((double)frames / cols);
+                    int cellW = Math.Max(1, (maxW - gap * (cols - 1)) / cols);
+                    int cellH = Math.Max(1, (int)Math.Round(cellW * (double)sh2 / sw2));
+                    int canvasW = cellW * cols + gap * (cols - 1);
+                    int canvasH = cellH * rows + gap * (rows - 1);
+
+                    byte[] canvas = new byte[canvasW * canvasH * 4];
+                    for (int i = 0; i < canvas.Length; i += 4) { canvas[i] = 40; canvas[i + 1] = 40; canvas[i + 2] = 40; canvas[i + 3] = 255; }
+
+                    double fscale = (double)cellW / sw2;
+                    var stamps = new List<object>();
+                    var swatch = System.Diagnostics.Stopwatch.StartNew();
+                    for (int i = 0; i < frames; i++)
+                    {
+                        long t = swatch.ElapsedMilliseconds;
+                        var (fb, fw, fh) = Gdi.CaptureScaled(sx, sy, sw2, sh2, fscale);
+                        int col = i % cols, row = i / cols;
+                        int ox = col * (cellW + gap), oy = row * (cellH + gap);
+                        int copyW = Math.Min(fw, cellW), copyH = Math.Min(fh, cellH);
+                        for (int ry = 0; ry < copyH; ry++)
+                        {
+                            int srcOff = ry * fw * 4;
+                            int dstOff = ((oy + ry) * canvasW + ox) * 4;
+                            Buffer.BlockCopy(fb, srcOff, canvas, dstOff, copyW * 4);
+                        }
+                        stamps.Add(new { i, row, col, atMs = t });
+                        if (i < frames - 1 && intervalMs > 0) Thread.Sleep(intervalMs);
+                    }
+                    string tmpDir2 = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Temp");
+                    Directory.CreateDirectory(tmpDir2);
+                    string tmp2 = Path.Combine(tmpDir2, "sa-sheet-" + Guid.NewGuid().ToString("N") + ".jpg");
+                    var jpg2 = GdiPlus.EncodeJpeg(canvas, canvasW, canvasH, tmp2);
+                    return new
+                    {
+                        frames, cols, rows, cellW, cellH, canvasW, canvasH, gap,
+                        elapsedMs = swatch.ElapsedMilliseconds,
+                        rect = new { x = sx, y = sy, w = sw2, h = sh2 },
+                        cells = stamps,
+                        jpegB64 = Convert.ToBase64String(jpg2),
+                        bytes = jpg2.Length,
+                    };
+                }
+
             case "ocr":
                 {
                     int sw = Gdi.ScreenW(), sh = Gdi.ScreenH();

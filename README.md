@@ -165,6 +165,7 @@ saperm_health {}
 |  | `saperm_char_promote` | 晋升未知角色 | 将 `未知角色#1` 命名为正式角色名 |
 | **方案探测** | `saperm_profile` | 环境探测与推荐 | 首次接入或换机器时先跑一次，看 `recommended` 与 `reasons` |
 | **双方案识别** | `saperm_scan({mode})` | local / vision / auto | 文本够用走 local（0 token）；要看图标/照片/视频原貌走 vision |
+| **多帧拼图** | `saperm_sheet` | 一次看一段时间的变化 | 价格按张算不按帧算：4 帧 591 token（每帧 148），比看 4 次省 75% |
 | **自动化输入** | `saperm_click` / `press` / `type` / `hotkey` | 鼠标键盘操作（含长按 holdMs） | 基于 OCR 坐标或 UIA 控件进行前台自动化交互 |
 | **急停** | `saperm_stop` | 立即急停 | 锁定输入注入；恢复需 `saperm_resume` 并经由用户明确授权 |
 
