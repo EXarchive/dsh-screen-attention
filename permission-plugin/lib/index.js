@@ -706,7 +706,7 @@ export function apply(ctx) {
           c.recent.set(key, now)
           const o = rectById.get(Number(m[2]))
           const unknown = m[1].startsWith('未知角色#')
-          const hint = unknown ? '（未登记，可用 saperm_char_promote 命名）' : ''
+          const hint = unknown ? '（未登记，可用 saperm_char promote 命名）' : ''
           appendObservationLog({ type: 'infer', role: m[1], action: m[3], rect: o || null, understanding: (st.latest && st.latest.understanding) || '' })
           queueInject(c, '[角色] ' + m[1] + ' ' + m[3] + (o ? rectText(o) : '') + hint)
         }
@@ -2846,75 +2846,54 @@ export function apply(ctx) {
     },
   })
 
+  // 角色管理合并为一个入口（原 10 个工具：register/match/list/delete/rename/merge/unknowns/promote/ignore/note）
+  // 理由：全是低频 + 单行转发，拆成 10 个工具纯占 schema——每个都要进模型常驻上下文。
+  const CHAR_ACTIONS = ['register', 'match', 'list', 'delete', 'rename', 'merge', 'unknowns', 'promote', 'ignore', 'note']
   register({
-    name: 'saperm_char_register',
-    description: '注册人物/角色（CLIP 裁剪嵌入，用于识别 Harness 中的人物）：不传区域则自动检测最大人物框。L0 观察，无需审批',
+    name: 'saperm_char',
+    description: '角色管理（统一入口）：action=register 注册(CLIP裁剪嵌入，不传区域自动检测最大人物框) | match 识别人物 | list 列出已注册 | delete 删除 | rename 重命名 | merge 合并两个角色的参考嵌入 | unknowns 未标注聚类 | promote 把聚类提升为具名 | ignore 忽略聚类 | note 设置角色备注（识别时随结果返回）。L0 观察/只改注册表，无需审批',
     parameters: {
       type: 'object',
       properties: {
-        name: { type: 'string', description: '角色名（如 harness女仆）' },
-        note: { type: 'string', description: '角色知识说明（可选，识别人物时一并返回）' },
-        path: { type: 'string', description: '图片路径（可选）' },
+        action: { type: 'string', enum: CHAR_ACTIONS, description: '操作类型' },
+        name: { type: 'string', description: 'register/delete/note/promote 用：角色名' },
+        note: { type: 'string', description: 'register/note 用：角色知识说明' },
+        path: { type: 'string', description: 'register/match 用：图片路径（缺省=当前屏幕）' },
+        from: { type: 'string', description: 'rename/merge 用：源角色名' },
+        to: { type: 'string', description: 'rename/merge 用：目标角色名' },
+        unknown: { type: 'string', description: 'promote 用：聚类 id（如 未知角色#1）' },
+        id: { type: 'string', description: 'ignore 用：聚类 id' },
         x: { type: 'integer' }, y: { type: 'integer' },
-        w: { type: 'integer' }, h: { type: 'integer' },
+        w: { type: 'integer' }, h: { type: 'integer', description: 'register/match 可选区域' },
       },
-      required: ['name'],
+      required: ['action'],
     },
     execute: async (args) => {
-      const a = { name: args.name }
-      if (args.note) a.note = args.note
-      if (args.path) a.path = args.path
-      if (args.x != null) { a.x = args.x; a.y = args.y; a.w = args.w; a.h = args.h }
-      return await helperCall('char_register', a)
+      const act = String(args.action || '')
+      if (!CHAR_ACTIONS.includes(act)) throw new Error('action 必须是: ' + CHAR_ACTIONS.join(' | '))
+      const region = args.x != null ? { x: args.x, y: args.y, w: args.w, h: args.h } : {}
+      switch (act) {
+        case 'register': {
+          const a = { name: args.name, ...region }
+          if (args.note) a.note = args.note
+          if (args.path) a.path = args.path
+          return await helperCall('char_register', a)
+        }
+        case 'match': {
+          const a = { ...region }
+          if (args.path) a.path = args.path
+          return await helperCall('char_match', a)
+        }
+        case 'list': return await helperCall('char_list', {})
+        case 'delete': return await helperCall('char_delete', { name: args.name })
+        case 'rename': return await helperCall('char_rename', { from: args.from, to: args.to })
+        case 'merge': return await helperCall('char_merge', { from: args.from, to: args.to })
+        case 'unknowns': return await helperCall('char_unknowns', {})
+        case 'promote': return await helperCall('char_promote', { unknown: args.unknown, name: args.name })
+        case 'ignore': return await helperCall('char_ignore', { unknown: args.id, targetId: args.id })
+        case 'note': return await helperCall('char_note', { name: args.name, note: args.note })
+      }
     },
-  })
-
-  register({
-    name: 'saperm_char_match',
-    description: '识别人物/角色：检测画面中的人物并匹配已注册角色（返回角色名+相似度+框）。L0 观察',
-    parameters: {
-      type: 'object',
-      properties: {
-        path: { type: 'string', description: '图片路径（可选，缺省=当前屏幕）' },
-        x: { type: 'integer' }, y: { type: 'integer' },
-        w: { type: 'integer' }, h: { type: 'integer' },
-      },
-    },
-    execute: async (args) => {
-      const a = {}
-      if (args.path) a.path = args.path
-      if (args.x != null) { a.x = args.x; a.y = args.y; a.w = args.w; a.h = args.h }
-      return await helperCall('char_match', a)
-    },
-  })
-
-  register({
-    name: 'saperm_char_list',
-    description: '列出已注册的角色（名称/维度）。L0 观察',
-    parameters: empty,
-    execute: async () => await helperCall('char_list', {}),
-  })
-
-  register({
-    name: 'saperm_char_delete',
-    description: '删除已注册角色。L0（只改注册表）',
-    parameters: {
-      type: 'object',
-      properties: { name: { type: 'string' } },
-      required: ['name'],
-    },
-    execute: async (args) => await helperCall('char_delete', { name: args.name }),
-  })
-
-  register({
-    name: 'saperm_char_rename',
-    description: '重命名已注册角色。L0（只改注册表）',
-    parameters: {
-      type: 'object',
-      properties: { from: { type: 'string' }, to: { type: 'string' } },
-      required: ['from', 'to'],
-    },
-    execute: async (args) => await helperCall('char_rename', { from: args.from, to: args.to }),
   })
 
   register({
@@ -2936,57 +2915,6 @@ export function apply(ctx) {
       const r = await helperCall('animeface', a)
       return { count: r.count, faces: r.faces, ms: r.ms, backend: r.backend, engine: r.engine, rect: r.rect }
     },
-  })
-
-  register({
-    name: 'saperm_char_merge',
-    description: '合并两个角色的参考嵌入（同一角色的多份注册合并为一个名字，匹配取全部参考最大值）。L0（只改注册表）',
-    parameters: {
-      type: 'object',
-      properties: { from: { type: 'string' }, to: { type: 'string' } },
-      required: ['from', 'to'],
-    },
-    execute: async (args) => await helperCall('char_merge', { from: args.from, to: args.to }),
-  })
-
-  register({
-    name: 'saperm_char_unknowns',
-    description: '列出未知角色聚类（自动登记但未命名的角色：id/参考数/出现次数/首次末次时间）。L0 观察',
-    parameters: empty,
-    execute: async () => await helperCall('char_unknowns', {}),
-  })
-
-  register({
-    name: 'saperm_char_promote',
-    description: '把未知角色聚类提升为具名角色（转移其参考嵌入到已有/新名字）。L0（只改注册表）',
-    parameters: {
-      type: 'object',
-      properties: { unknown: { type: 'string', description: '未知角色 id（如 未知角色#1）' }, name: { type: 'string', description: '正式角色名' } },
-      required: ['unknown', 'name'],
-    },
-    execute: async (args) => await helperCall('char_promote', { unknown: args.unknown, name: args.name }),
-  })
-
-  register({
-    name: 'saperm_char_ignore',
-    description: '忽略/删除未知角色聚类（误检或不再关心）。L0（只改注册表）',
-    parameters: {
-      type: 'object',
-      properties: { id: { type: 'string' } },
-      required: ['id'],
-    },
-    execute: async (args) => await helperCall('char_ignore', { unknown: args.id, targetId: args.id }),
-  })
-
-  register({
-    name: 'saperm_char_note',
-    description: '设置/更新角色知识备注（识别人物时随 note 返回）。L0（只改知识文件）',
-    parameters: {
-      type: 'object',
-      properties: { name: { type: 'string' }, note: { type: 'string' } },
-      required: ['name', 'note'],
-    },
-    execute: async (args) => await helperCall('char_note', { name: args.name, note: args.note }),
   })
 
   register({

@@ -1,5 +1,45 @@
 # Changelog (dsh-screen-attention)
 
+## v1.10.0 (2026-11-05) — 工具收敛：char_* 十个合成一个
+
+### 构造问题（实测数字）
+| 指标 | 值 |
+|---|---|
+| index.js | 3082 行 |
+| 工具注册 | **77 个** |
+| 常驻 schema 估算 | 约 8500 token（每轮固定开销） |
+
+`char_*` 10 个、`fill_*` 6 个、`excel_*` 4 个，全是**单行转发**（`helperCall('char_xxx', {...})`），
+各占一个工具名额、各进一次模型上下文，纯属浪费。
+
+### 改动
+`saperm_char_register/match/list/delete/rename/merge/unknowns/promote/ignore/note`
+→ **`saperm_char({ action })`** 单一入口，schema 用 enum 约束 action，非法值直接报错。
+
+**77 → 68 个工具**，index.js **3082 → 3010 行**。
+
+### 验证
+| 调用 | 结果 |
+|---|---|
+| `action:'list'` | `count:2`（DeepSeek娘…） |
+| `action:'unknowns'` | `count:1`（未知角色#1） |
+| `action:'bogus'` | 报错「action 必须是: register \| match \| …」 |
+| `saperm_status` | helper online |
+
+### 两次失败的真因（都是我的操作，不是设计）
+**第一次**：文件是 CRLF，我用 `split('\n')` 切割再 `join('\n')` 拼回 → 混合换行符。
+**第二次**：改提示文案时把 `saperm_char(action:'promote')` 写进了**单引号字符串里**，字符串提前闭合：
+
+```js
+const hint = unknown ? '（未登记，可用 saperm_char(action:'promote') 命名）' : ''
+//                                           ^ 单引号在这里结束
+```
+
+而「语法检查通过」是假象——**先测语法、后改文案**，改完没再测。教训：任何改写之后都重新 `node --check`。
+
+### 待办
+`fill_*`（6→1）、`excel_*`（4→1）同样可合，预计再省 8 个工具。
+
 ## v1.9.0 (2026-11-05) — 间隔自适应（不绑死）+ 九点采样回归
 
 ### 核心：采样间隔改成运行时自适应（AIMD）
