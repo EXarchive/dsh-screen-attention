@@ -20,6 +20,30 @@ const L2_TOOLS = ['saperm_press', 'saperm_click', 'saperm_scroll', 'saperm_type'
 const L3_TOOLS = ['saperm_drag', 'saperm_doubleclick']
 const INPUT_TOOLS = [...L2_TOOLS, ...L3_TOOLS]
 
+// ── 会话消息 source 形状（宿主 Session V3 / V4 互斥） ──────────────────────────
+// V4 退役了 {kind:'plugin', plugin:'X'} 包装：宿主读、写两条路径都只收生产者自己的 kind，
+// 旧形状会被直接拒载，报 "format v4 message requires a producer-owned source kind"，
+// 而整批追加（含屏幕变化 notice 注入的这条 user/message）一起被丢。V3 只要求 kind 是非空
+// string，plugin:<name> 在 V3 上只是个不会被迁移器改写的普通 kind —— 两条路径都安全。
+// 版本取发起方会话的 header.version；探测不到时按生产者 kind（V4 唯一合法写法）。
+export function noticeSourceFor(session) {
+  // 注意：Number(null) === 0，若直接 Number() 会把「取不到会话」误判成 V3（0<4），
+  // 从而退回已退役的 {kind:'plugin'} 形状。只有真实取到正整数版本才算 V3。
+  const raw = session && session.header ? session.header.version : undefined
+  const version = Number(raw)
+  const base = { form: 'notice', summary: '屏幕变化摘要' }
+  if (Number.isInteger(version) && version > 0 && version < 4) {
+    return { kind: 'plugin', plugin: 'dsh-screen-attention-perm', ...base }
+  }
+  return { kind: 'plugin:dsh-screen-attention-perm', ...base }
+}
+
+/** 宿主拒收 source 形状时的判据（V4 的 producer-owned source kind 校验）。 */
+export function isProducerSourceError(err) {
+  const text = String((err && (err.message || err)) || '')
+  return text.includes('producer-owned source kind')
+}
+
 // AI 视角截图交付目录（工作区文件 + 路径返回，图片不进对话，按需用视觉工具查看）
 const VIEW_DIR = join(PACKAGE_ROOT, '..', 'out', 'sa-view')
 const LOGS_DIR = join(PACKAGE_ROOT, '..', 'out', 'logs')
@@ -580,15 +604,29 @@ export function apply(ctx) {
         id: (globalThis.crypto && crypto.randomUUID) ? crypto.randomUUID() : 'sa-change-' + Date.now() + '-' + Math.random().toString(16).slice(2),
         role: 'user',
         content,
-        source: { kind: 'plugin', plugin: 'dsh-screen-attention-perm', form: 'notice', summary: '屏幕变化摘要' },
+        source: noticeSourceFor(initiator.session),
       }
-      if (state.linkWake) {
-        initiator.steer(message)
-        console.log('[sa-perm] 变化已 steer 唤醒')
-      } else {
-        initiator.inject(message)
+      // 投递：宿主 V4 对 source 形状是硬拒（整批追加失败），探测不到版本时按旧形状投会挂，
+      // 所以按报错就地重投一次生产者 kind，不让一次 notice 把整轮追加带走。
+      const deliver = (msg) => {
+        if (state.linkWake) {
+          console.log('[sa-perm] 变化已 steer 唤醒')
+          return initiator.steer(msg)
+        }
         console.log('[sa-perm] 变化已 inject（不中断）')
+        return initiator.inject(msg)
       }
+      const deliverChecked = async (msg) => {
+        try {
+          await deliver(msg)
+          return
+        } catch (e) {
+          if (!isProducerSourceError(e)) throw e
+          console.log('[sa-perm] source 形状被宿主拒收，改生产者 kind 重投')
+        }
+        await deliver({ ...msg, source: noticeSourceFor({ header: { version: 4 } }) })
+      }
+      await deliverChecked(message)
     } catch (e) {
       console.log('[sa-perm] 注入失败: ' + ((e && e.message) || e))
     }
@@ -2575,7 +2613,7 @@ export function apply(ctx) {
       }
       return { job: job.id, written: results, nextRow: job.nextRow }
     },
-  })
+  })
 
   // ===== 连续解读（持续获取 + 变化区域 OCR + 内容/噪声分类） =====
 

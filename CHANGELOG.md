@@ -1,5 +1,49 @@
 # Changelog (dsh-screen-attention)
 
+## v1.13.0 (2026-11-06) — 注入不通的真正根因：V4 会话 source 校验
+
+### 根因（第三方排查确认，非猜测）
+注入的消息用 `source: { kind:'plugin', plugin:'dsh-screen-attention-perm' }` —— 这是 **V3 形状**。
+**V4 会话格式**要求 `source.kind` 为非空 string **且不得等于 `plugin`**，报
+``format v4 message requires a producer-owned source kind``，
+整批追加（含这条 notice）一起被丢弃。
+
+抛出点：`dsh-session-format-v3-to-v4/lib/index.js` 的 `source()`；
+由 `assertV4MessageSources` / `assertV4SourceRowAdmission` 调用。
+
+**这解释了此前六道闸门为何都“修了却不通”** —— 事件早就到了，注入也执行了，
+是**宿主在写盘时把整条消息拒了**，所以日志里连 skip 记录都留不下。
+
+### 修复
+```js
+noticeSourceFor(session)   // V4 → {kind:'plugin:dsh-screen-attention-perm'}
+                           // V3 → 保持 legacy {kind:'plugin', plugin}
+deliverChecked(msg)        // 捕获 producer-owned 报错后就地按生产者 kind 重投
+```
+
+### 本轮补的边界修复
+原实现 `Number(session?.header?.version)` 有两个误判：
+| 输入 | `Number()` 结果 | 原行为 | 后果 |
+|---|---|---|---|
+| `null`（取不到会话） | **0** | 判为 V3 | 退回被禁形状，**整条被拒** |
+| `{version:0}` | 0 | 判为 V3 | 同上 |
+
+加下界后：`Number.isInteger(version) && version > 0 && version < 4` 才算 V3。
+**取不到版本时一律用生产者 kind**（V4 唯一合法写法）。
+
+### 验证
+```text
+PASS  V4          kind="plugin:dsh-screen-attention-perm"
+PASS  V3          kind="plugin"
+PASS  null        kind="plugin:dsh-screen-attention-perm"
+PASS  无 header    kind="plugin:dsh-screen-attention-perm"
+PASS  version=0   kind="plugin:dsh-screen-attention-perm"
+5/5 PASS
+```
+
+### 需要重启
+插件已被 dsh 进程 require，热改不生效。
+
 ## v1.12.0 (2026-11-06) — observe_task 补全：浮窗汇报 + 帧交付
 
 ### 澄清一处误判
