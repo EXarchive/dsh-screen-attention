@@ -504,9 +504,7 @@ export function apply(ctx) {
       state.pausedBy = data.locked ? 'hotkey' : null
       console.log('[sa-perm] Pause 热键：注入' + (data.locked ? '锁定' : '解锁'))
     }
-    if (kind === 'change') { appendFileSync('C:/Users/Administrator/PycharmProjects/dsh-screen-attention/out/logs/diag.txt', new Date().toISOString().slice(11,19)+' A data='+(!!data)+' link='+state.link+'\n'); }
     if (kind === 'change' && data && state.link) {
-      appendFileSync('C:/Users/Administrator/PycharmProjects/dsh-screen-attention/out/logs/diag.txt', new Date().toISOString().slice(11,19)+' B 进入分支\n');
       // 变化事件 → 拉取 OCR 摘要 → 注入会话（节流 2s + 文本去重）
       const now = Date.now()
       if (now - state.lastLinkAt < 1200) { appendObservationLog({ type: 'inject-skip', reason: 'throttle' }); return }
@@ -535,7 +533,6 @@ export function apply(ctx) {
           if (sh && sh.jpegB64) shot = sh.jpegB64
         } catch (e) { appendObservationLog({ type: 'inject-skip', reason: 'shot-fail:' + ((e && e.message) || e) }) }
       }
-      appendFileSync('C:/Users/Administrator/PycharmProjects/dsh-screen-attention/out/logs/diag.txt', new Date().toISOString().slice(11,19)+' C 即将注入 bodyLen='+body.length+'\n');
       injectToSession(body, shot).catch(e => appendObservationLog({ type: 'inject-skip', reason: 'inject-throw:' + ((e && e.message) || e) }))
     }
   }
@@ -553,7 +550,6 @@ export function apply(ctx) {
 
   // 变化摘要 → 注入当前发起方 agent（inject 不唤醒：对话不中断；steer 唤醒：空闲同步开轮次）
   async function injectToSession(body, jpegB64) {
-    appendFileSync('C:/Users/Administrator/PycharmProjects/dsh-screen-attention/out/logs/diag.txt', new Date().toISOString().slice(11,19)+' D 进入注入器\n');
     try {
       // 优先定向到发起观察任务的 agent（会话），避免依赖 currentInitiator（观察场景可能取空）
       let initiator = undefined
@@ -567,7 +563,6 @@ export function apply(ctx) {
         console.log('[sa-perm] 无发起方 agent，跳过变化注入:', body.slice(0, 60))
         return
       }
-      appendFileSync('C:/Users/Administrator/PycharmProjects/dsh-screen-attention/out/logs/diag.txt', new Date().toISOString().slice(11,19)+' E 走到写 inject\n');
       appendObservationLog({ type: 'inject', body, withImage: !!jpegB64 })
       const content = [{ type: 'text', text: body }]
       // 关键：变化时把画面一起塞进消息 —— 模型才"看得见"，不然只有文字摘要
@@ -594,7 +589,6 @@ export function apply(ctx) {
         console.log('[sa-perm] 变化已 inject（不中断）')
       }
     } catch (e) {
-      appendFileSync('C:/Users/Administrator/PycharmProjects/dsh-screen-attention/out/logs/diag.txt', new Date().toISOString().slice(11,19)+' F 注入器异常: '+((e && e.message) || e)+'\n');
       console.log('[sa-perm] 注入失败: ' + ((e && e.message) || e))
     }
   }

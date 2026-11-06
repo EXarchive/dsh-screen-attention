@@ -1,5 +1,34 @@
 # Changelog (dsh-screen-attention)
 
+## v1.11.0 (2026-11-06) — 交付版：清理调试代码，注入改为附加能力
+
+### 本轮收口
+- **移除全部调试探针**（6 个 `diag.txt` 写入点），生产代码不留调试痕迹。
+- 代码回退到 v1.10.5 的干净状态，`node --check` 通过。
+
+### 已确证可用（本轮及前几轮实测）
+| 能力 | 状态 | 证据 |
+|---|---|---|
+| 消息窗 `saperm_say` | ✅ | 截图可见，`sayVisible:true`，`sayRealBounds` 正确 |
+| 观察帧率自适应 | ✅ | 0.75 → 5.0 fps，`effectiveMs` 120↔329 双向浮动 |
+| 采样间隔标定 `saperm_calibrate` | ✅ | 6 档候选，响应优先选值 |
+| 后台窗口 `saperm_window` | ✅ | 抓被遮挡 Edge，UI 清晰 |
+| 无头网页 `saperm_web` | ✅ | example.com 1200×800 完整渲染 |
+| 工具收敛 | ✅ | 77 → 60 个，`char/excel/fill` 合并为 action 模式 |
+| `fill` 填表全链路 | ✅ | start→next→submit→status→abort 跑通 39 张图 |
+
+### 注入功能状态
+**`watch_link` 的自动注入（`shot:true`）未验证通过**，追查六道闸门后仍未定位最后一个断点。
+已确证的是：事件能到达插件（`kind=change`、`link=true` 有日志实证）、
+分发/实例叠加/二次判据/`ctx.agents` 四项修复真实有效。
+
+**使用建议**：需要观察时用 `saperm_watch_link` 不带注入，或直接用
+`saperm_scan` / `saperm_view` / `saperm_observe` 主动取画面 —— 这些不依赖注入链路。
+
+### 已知问题
+1. 自动注入未通（见上）
+2. helper 崩溃频率偏高，退出码 -1 多为部署/接管逻辑主动 kill，非真崩溃
+
 ## v1.10.5 (2026-11-05) — 注入链路的第五道闸门：注入器本身在 throw
 
 ### 决定性证据（diag 探针）
