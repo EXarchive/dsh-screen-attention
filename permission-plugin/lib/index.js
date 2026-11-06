@@ -542,7 +542,7 @@ export function apply(ctx) {
       // 过滤哨兵值事件：helper 在没检测到运动时会传 int.MaxValue 的 minX/minY，
       // 这类事件变化率为 0、区域无效，注入出去只是噪音（实测日志里成片出现）。
       const badRect = !Number.isFinite(evRect.x) || evRect.x >= 2147483647 || (evRect.w <= 1 && evRect.h <= 1)
-      if (evRatio <= 0 && badRect) return
+      if (evRatio <= 0 && badRect) { appendObservationLog({ type: 'inject-skip', reason: 'sentinel', rect: evRect }); return }
       // 不再调 watch_snapshot：事件已带 ratio/rect，快照只补 OCR 文本，
       // 而它在这条回调链里会挂住（RPC 从 stdout reader 回调发起，响应回不来）。
       // 需要文本时用 saperm_observe 单独取，注入这条路径必须自给自足。
