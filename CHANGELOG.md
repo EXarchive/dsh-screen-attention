@@ -1,5 +1,40 @@
 # Changelog (dsh-screen-attention)
 
+## v1.11.1 (2026-11-06) — 浮窗实时评论验证通过
+
+### 验证方法（不依赖注入链路）
+```text
+saperm_overlay_open({aspect:'landscape'})   开图像窗 480x270
+saperm_scan / saperm_view                    取画面
+saperm_say({text, speak})                    评论推到浮窗（图像窗上方）
+```
+
+### 实测结果
+| 项 | 结果 |
+|---|---|
+| 图像窗 | `visible:true` @ 2040,1250 480x270 |
+| 评论窗 | @ 2040,1132 480x110 → 自适应 480x80 |
+| 窗口分离 | 评论在上、图像在下，互不遮盖 |
+| 帧率 | 5.0 fps 稳定 |
+| 连续更新 | 4 条评论依次覆盖，高度随文字自适应 |
+
+### 现场证据
+截图 `focus-1793974436863-4.jpg`：评论「DSH 主界面，女仆皮肤。左侧文件树停在
+dsh-screen-attention，中间在跑工具流水，底部输入框刚敲完。」+ 图像窗带红色注意力框
++ 状态条「实时评论取景 2560×1600 5.0 fps」。
+
+### 用法
+```js
+saperm_overlay_open({ aspect: 'landscape', ttlSec: 300 })   // 开窗
+// 循环：取画面 → 生成评论 → 推送
+saperm_say({ text: '画面描述…', speak: false, ms: 8000 })
+```
+`speak:true` 会同时用 Windows TTS 念出来；`ms` 控制停留时长。
+
+### 注意
+自动推送（`saperm_watch_link` 的注入）仍未通，实时评论需**由 AI 主动循环**，
+或由外层定时任务驱动。画面获取走 `saperm_scan`/`saperm_view`，零 token（本地 OCR）。
+
 ## v1.11.0 (2026-11-06) — 交付版：清理调试代码，注入改为附加能力
 
 ### 本轮收口
