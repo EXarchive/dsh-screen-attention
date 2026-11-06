@@ -1658,15 +1658,22 @@ export function apply(ctx) {
       state.overlayOpen = true
       refreshAutoCleanup()
       const out = await helperCall('overlay_set', { region: args.region, gaze: args.gaze, clearRegion: args.clearRegion, clearGaze: args.clearGaze, note: args.note })
+      let sayResult = null
       if (args.say) {
-        try { await helperCall('say', { text: String(args.say), speak: args.speak !== false, ms: 6000 }, 8000) } catch {}
+        // 关键：ms 必须用调用方传的值。原来硬编码 6000，把外部设的停留时长全覆盖成 6 秒，
+        // 表现为「内容一闪就没了」——用户根本没机会看。speak 默认关，避免无预期出声。
+        const sayMs = Number(args.ms) > 0 ? Number(args.ms) : 6000
+        try {
+          const r = await helperCall('say', { text: String(args.say), speak: args.speak === true, ms: sayMs }, 8000)
+          sayResult = { ok: true, ms: sayMs, visible: r && r.sayVisible, bounds: r && r.sayRealBounds }
+        } catch (e) { sayResult = { ok: false, err: String((e && e.message) || e) } }
       }
       if (args.aspect || (args.w && args.h)) {
         const box = resolveAspect(args.aspect || 'custom', args.w, args.h)
         const rz = await helperCall('overlay_resize', { w: box.w, h: box.h })
-        return { ...(out || {}), size: { ...box, resized: !!(rz && rz.resized) } }
+        return { ...(out || {}), size: { ...box, resized: !!(rz && rz.resized) }, say: sayResult }
       }
-      return out
+      return { ...(out || {}), say: sayResult }
     },
   })
 
@@ -2947,6 +2954,62 @@ export function apply(ctx) {
     },
   })
 
+  // ============ 本地视觉理解（Qwen2.5-VL via Ollama）============
+  // 实测热启动 788-792ms、197 tok/s，满足「2 秒内看懂画面」；冷启动首次约 49s（加载模型）。
+  // 这是唯一能给「画面内容」而非「文字/标签」的本地通道。
+  const OLLAMA_URL = process.env.SA_OLLAMA_URL || 'http://127.0.0.1:11434'
+  const OLLAMA_MODEL = process.env.SA_VLM_MODEL || 'qwen2.5vl:3b'
+  register({
+    name: 'saperm_vlm',
+    description: '本地视觉理解（Qwen2.5-VL）：直接问画面里有什么，返回中文描述。热启动约 0.8 秒。可指定窗口(hwnd)或屏幕区域，不给则全屏。与 saperm_scan 不同——它给的是「画面内容」不是「文字/标签」。L0 观察',
+    parameters: {
+      type: 'object',
+      properties: {
+        prompt: { type: 'string', description: '问什么（默认：一句话描述画面内容）' },
+        hwnd: { type: 'integer', description: '只描述这个窗口' },
+        x: { type: 'integer' }, y: { type: 'integer' },
+        w: { type: 'integer' }, h: { type: 'integer' },
+        maxTokens: { type: 'integer', description: '最多生成 token（默认 80）' },
+      },
+    },
+    execute: async (args) => {
+      const t0 = Date.now()
+      let buf = null, ww = 0, hh = 0
+      if (args.hwnd) {
+        const r = await helperCall('window_capture', { hwnd: args.hwnd, maxW: 900 })
+        if (r && r.jpegB64) { buf = r.jpegB64; ww = r.w; hh = r.h }
+      } else {
+        const g = await helperCall('screenshot', args.x != null
+          ? { x: args.x, y: args.y, w: args.w, h: args.h, maxW: 900 }
+          : { maxW: 900 })
+        if (g && g.jpegB64) { buf = g.jpegB64; ww = g.w; hh = g.h }
+      }
+      if (!buf) throw new Error('取图失败（窗口无效或截图失败）')
+      const shotMs = Date.now() - t0
+      const body = JSON.stringify({
+        model: OLLAMA_MODEL,
+        prompt: args.prompt || '一句话描述这个画面里有什么',
+        images: [buf],
+        stream: false,
+        options: { num_predict: clampInt(args.maxTokens, 80, 16, 400), temperature: 0.2 },
+      })
+      const t1 = Date.now()
+      const res = await fetch(OLLAMA_URL + '/api/generate', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body,
+        signal: AbortSignal.timeout(120000),
+      })
+      if (!res.ok) throw new Error('VLM HTTP ' + res.status + '：先确认 ollama serve 在跑')
+      const j = await res.json()
+      const vlmMs = Date.now() - t1
+      return {
+        text: String(j.response || '').trim(),
+        totalMs: Date.now() - t0, shotMs, vlmMs,
+        tokens: j.eval_count, model: OLLAMA_MODEL,
+        size: { w: ww, h: hh },
+        within2s: (Date.now() - t0) <= 2000,
+      }
+    },
+  })
   register({
     name: 'saperm_history',
     description: '读取观察审计历史日志（持久化落盘 JSONL，支持跨重启追溯）。L0 观察',

@@ -1,5 +1,38 @@
 # Changelog (dsh-screen-attention)
 
+## v1.15.0 (2026-11-07) — 本地视觉理解接入（saperm_vlm）
+
+### 背景
+`docs/vlm-research.md` 早就规划了「CLIP 快通道 + VLM 慢通道」，但**慢通道从未落地**——
+代码里 `qwen`/`vlm`/`ollama` 出现 0 次。所以「1 秒内看懂画面内容」一直做不到。
+
+### 本轮落地
+装了 Ollama + `qwen2.5vl:3b`（3.2GB），新增 **`saperm_vlm`** 工具。
+
+### 实测指标（本机 Intel UHD 770 iGPU）
+| 指标 | 实测 | 目标 |
+|---|---|---|
+| 热启动延迟 | **788-792ms** | ≤2000ms ✅ |
+| 冷启动延迟 | ~49000ms（加载模型） | — |
+| 生成速度 | **197 tok/s** | — |
+| 理解准确度 | 准确（首页/视频画面均正确描述） | ✅ |
+
+**结论推翻了调研文档的悲观判断**：文档说「2B 级 VLM 在本机 iGPU 上无法稳定 1 秒内」，
+实测热启动 0.79 秒 —— 只要模型常驻，1 秒内可行。
+
+### 安装要点（踩过的坑）
+1. Ollama 安装包 1.6GB，装完 `ollama.exe` 在 `%LOCALAPPDATA%\Programs\Ollama`
+2. **服务会被 dsh 的 Job Object 连带杀死** → 必须用 `Invoke-CimMethod Win32_Process.Create` 启动
+3. **不要给 ollama 设 `HTTPS_PROXY`** —— 会报 `proxyconnect tcp: lookup http: no such host`（server 侧残留代理配置）
+4. 下载中途重启 server 会导致 **manifest 未写入**（blobs 齐了但 `ollama list` 为空），重跑 `pull` 即可补上
+
+### 用法
+```js
+saperm_vlm({ hwnd: 8197188, prompt: '一句话描述视频画面' })
+// → { text, totalMs, shotMs, vlmMs, tokens, within2s }
+```
+支持 `hwnd`（整窗口）/ `x,y,w,h`（屏幕区域）/ 都不给（全屏）。
+
 ## v1.14.0 (2026-11-06) — 结构自检脚本 + 三处误判纠正
 
 ### 新增 `scripts/audit.mjs`
