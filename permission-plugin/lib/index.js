@@ -1646,7 +1646,8 @@ export function apply(ctx) {
         gaze: { type: 'object', description: '注视点 {x,y}（屏幕坐标）', properties: { x: { type: 'integer' }, y: { type: 'integer' } } },
         clearRegion: { type: 'boolean', description: '清除区域红框' },
         clearGaze: { type: 'boolean', description: '清除注视点十字' },
-        note: { type: 'string', description: 'AI 注意点说明文字（显示在小窗底部）' },
+        note: { type: 'string', description: '底部状态标签（短，如「在看视频」）' },
+        subtitle: { type: 'string', description: '讲解字幕：与画面同框显示在浮窗底部，多行自适应。这是「看画面 + 说内容」的主通道' },
         say: { type: 'string', description: '让小窗显示一句话（气泡），并朗读出来' },
         speak: { type: 'boolean', description: '配合 say：是否朗读（默认 true）' },
         aspect: { type: 'string', description: '运行时换窗口形状：auto / landscape / portrait（手机竖屏）/ square / custom（配合 w,h）' },
@@ -1657,7 +1658,7 @@ export function apply(ctx) {
     execute: async (args) => {
       state.overlayOpen = true
       refreshAutoCleanup()
-      const out = await helperCall('overlay_set', { region: args.region, gaze: args.gaze, clearRegion: args.clearRegion, clearGaze: args.clearGaze, note: args.note })
+      const out = await helperCall('overlay_set', { region: args.region, gaze: args.gaze, clearRegion: args.clearRegion, clearGaze: args.clearGaze, note: args.note, subtitle: args.subtitle })
       let sayResult = null
       if (args.say) {
         // 关键：ms 必须用调用方传的值。原来硬编码 6000，把外部设的停留时长全覆盖成 6 秒，

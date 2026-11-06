@@ -1,5 +1,44 @@
 # Changelog (dsh-screen-attention)
 
+## v1.16.0 (2026-11-07) — 重构：屏幕识别与讲解字幕同框
+
+### 改动（最高优先级需求）
+原先画面走 `OverlayForm`、文字走独立的 `SayForm`，两个窗口分离。
+现在**合并为一个容器**：画面在上、讲解字幕在下。
+
+```csharp
+// Overlay 新增字幕层
+public static string subtitle = "";
+// PaintFrame 里在 DrawBar 之前绘制：
+//   半透明底 (212,8,12,26) + 左侧 3px 高亮条 + 白字多行自适应
+// 高度上限 = 画面区 72%（字幕优先完整，宁可压小画面也不截断）
+```
+
+### 用法
+```js
+saperm_overlay_set({
+  note: '同框',                    // 底部短标签
+  subtitle: '讲解字幕，多行自适应',   // 与画面同框的主通道
+})
+```
+返回 `{ subtitle, subtitleLen }` 可自检是否送达。
+
+### 实测
+99 字字幕 → 5 行完整显示，无截断。截图 `focus-1793982032213-3.jpg`。
+
+### 同批修掉的根因：helper 降级到 Session 0
+现象：抓屏全黑（3KB）、`saperm_windows` 返回 0 个窗口、浮窗报 `visible:true` 却看不见。
+
+**根因**：helper 桥接失败降级到 **Session 0**（无桌面会话），
+抓的是一块不存在桌面的虚拟画布，浮窗也画在那上面。
+正确形态是 `Session 0 主进程 + Session 1 worker`（通过 TCP 回环桥接 stdio）。
+
+**判据**：`Get-Process SaHelper` 只看到 Session 0 一个进程 = 降级；
+看到 Session 0 + Session 1 两个进程 = 桥接正常。
+
+**处置**：kill 全部 SaHelper，让插件重新拉起（会自动桥接）。
+本次给 SessionBridge 加了文件日志（`%TEMP%\sa-bridge.log`），便于下次直接看原因。
+
 ## v1.15.0 (2026-11-07) — 本地视觉理解接入（saperm_vlm）
 
 ### 背景

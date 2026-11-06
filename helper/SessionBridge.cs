@@ -74,6 +74,12 @@ static class SessionBridge
         finally { CloseHandle(hTok); }
     }
 
+    static void BridgeLog(string m)
+    {
+        try { System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "sa-bridge.log"),
+            DateTime.Now.ToString("HH:mm:ss.fff") + " " + m + "\r\n"); } catch { }
+    }
+
     static (IntPtr hParentProc, IntPtr hPrimaryToken) AcquireSessionParentAndToken(uint targetSession)
     {
         EnablePrivilege("SeTcbPrivilege");
@@ -178,6 +184,7 @@ static class SessionBridge
         if (activeSession == 0 || activeSession == 0xFFFFFFFF) return false;
 
         var (hParent, hToken) = AcquireSessionParentAndToken(activeSession);
+        BridgeLog($"acquire hParent={hParent} hToken={hToken}");
         if (hParent == IntPtr.Zero || hToken == IntPtr.Zero)
         {
             if (hParent != IntPtr.Zero) CloseHandle(hParent);

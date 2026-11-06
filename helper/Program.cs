@@ -1112,6 +1112,10 @@ static class Overlay
     public static bool hasGaze;
     public static Point gazePt;
     public static string note = "";
+    // 讲解字幕：与画面同框（重构：原先走独立的 SayWindow，现并入图像窗底部）
+    public static string subtitle = "";
+    public static long subtitleAt = 0;
+    static readonly Font subtitleFont = new Font("Microsoft YaHei UI", 11.5f, FontStyle.Bold);
     public static byte[] frame;      // 最新采集帧 BGRA（watch 线程写）
     public static volatile int frameStamp;   // 帧序号：只在真换帧时自增，供重绘判断
     static bool sayJustCleared;              // 气泡刚消失的那一帧也要重绘一次
@@ -1310,6 +1314,22 @@ static class Overlay
                     g.DrawLine(pen, gx, gy + 9, gx, gy + 12);
                 }
                 // 气泡不再画在图像窗里 —— 文字走独立的消息窗（SayWindow），避免遮挡画面
+            }
+            // 讲解字幕层：叠在画面底部，半透明底 + 左侧高亮条，多行自适应
+            if (!string.IsNullOrEmpty(subtitle))
+            {
+                var flags = TextFormatFlags.WordBreak | TextFormatFlags.NoPadding;
+                int pad = 12, maxW = Math.Max(40, vw - pad * 2);
+                var sz = TextRenderer.MeasureText(subtitle, subtitleFont, new Size(maxW, 300), flags);
+                // 上限放到画面区 72%：字幕优先完整显示，宁可压小画面也不截断文字
+                int sh = Math.Min(Math.Max(44, (int)(vh * 0.72)), Math.Max(44, sz.Height + 18));
+                int sy = Math.Max(0, vh - sh);
+                using (var bg = new SolidBrush(Color.FromArgb(212, 8, 12, 26)))
+                    g.FillRectangle(bg, 0, sy, vw, sh);
+                using (var bar = new SolidBrush(Color.FromArgb(235, 96, 196, 255)))
+                    g.FillRectangle(bar, 0, sy, 3, sh);
+                TextRenderer.DrawText(g, subtitle, subtitleFont,
+                    new Rectangle(pad, sy + 9, maxW, sh - 18), Color.FromArgb(242, 247, 255), flags);
             }
             DrawBar(g, client.Width, vh);
             try { cachedBounds = new Rectangle(form != null ? form.Left : 0, form != null ? form.Top : 0, client.Width, client.Height); hasCachedBounds = true; } catch { }
@@ -3293,8 +3313,14 @@ class Program
                         if (req.TryGetProperty("clearRegion", out var cr) && cr.GetBoolean()) Overlay.hasRect = false;
                         if (req.TryGetProperty("clearGaze", out var cg) && cg.GetBoolean()) Overlay.hasGaze = false;
                         if (req.TryGetProperty("note", out var nt)) Overlay.note = nt.GetString() ?? "";
+                        if (req.TryGetProperty("subtitle", out var sb))
+                        {
+                            Overlay.subtitle = sb.GetString() ?? "";
+                            Overlay.subtitleAt = DateTime.UtcNow.Ticks;
+                            try { Overlay.form?.Invalidate(); } catch { }
+                        }
                     }
-                    return new { hasRect = Overlay.hasRect, hasGaze = Overlay.hasGaze, note = Overlay.note };
+                    return new { hasRect = Overlay.hasRect, hasGaze = Overlay.hasGaze, note = Overlay.note, subtitle = Overlay.subtitle, subtitleLen = (Overlay.subtitle ?? "").Length };
                 }
             case "watch_start":
                 {
