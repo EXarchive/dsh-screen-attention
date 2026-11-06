@@ -532,13 +532,17 @@ export function apply(ctx) {
     if (kind === 'change' && data && state.link) {
       // 变化事件 → 拉取 OCR 摘要 → 注入会话（节流 2s + 文本去重）
       const now = Date.now()
-      if (now - state.lastLinkAt < 1200) { appendObservationLog({ type: 'inject-skip', reason: 'throttle' }); return }
+      if (now - state.lastLinkAt < 3000) { appendObservationLog({ type: 'inject-skip', reason: 'throttle' }); return }
       state.lastLinkAt = now
       // 事件已经带了 ratio/rect —— 必须用它判变化。
       // 原来靠 watch_snapshot 的 motion，但快照是 2 秒后才拍的，那时画面往往已静止，
       // 于是每条事件都被判成 no-motion-no-text 丢弃（实测踩过）。
       const evRatio = Number(data && data.ratio) || 0
       const evRect = (data && data.rect) || {}
+      // 过滤哨兵值事件：helper 在没检测到运动时会传 int.MaxValue 的 minX/minY，
+      // 这类事件变化率为 0、区域无效，注入出去只是噪音（实测日志里成片出现）。
+      const badRect = !Number.isFinite(evRect.x) || evRect.x >= 2147483647 || (evRect.w <= 1 && evRect.h <= 1)
+      if (evRatio <= 0 && badRect) return
       // 不再调 watch_snapshot：事件已带 ratio/rect，快照只补 OCR 文本，
       // 而它在这条回调链里会挂住（RPC 从 stdout reader 回调发起，响应回不来）。
       // 需要文本时用 saperm_observe 单独取，注入这条路径必须自给自足。
