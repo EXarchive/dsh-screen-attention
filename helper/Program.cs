@@ -2635,7 +2635,16 @@ class Program
     const uint VK_PAUSE = 0x13;
     const int WM_HOTKEY = 0x0312;
 
-    static void WriteLine(string json) { lock (Wl) { Console.Out.WriteLine(json); Console.Out.Flush(); } }
+    static void WriteLine(string json)
+    {
+        lock (Wl)
+        {
+            // stdout 同样可能被父进程关掉（10054）——写失败只说明没人接了，
+            // 绝不能让它变成未捕获异常把进程带走。
+            try { Console.Out.WriteLine(json); Console.Out.Flush(); }
+            catch { }
+        }
+    }
     public static void Event(string name, object data = null)
     {
         WriteLine(JsonSerializer.Serialize(new Dictionary<string, object> { { "event", name }, { "data", data ?? new { } } }));
@@ -3735,8 +3744,23 @@ class Program
 
         string line;
         long lastNumericId = 0;
-        while ((line = Console.In.ReadLine()) != null)
+        while (true)
         {
+            // ReadLine 必须在 try 里：父进程（DSH）关闭 stdin 时它会抛
+            // IOException 包装的 SocketException(10054「远程主机强迫关闭了一个现有的连接」)。
+            // 之前这行在 try 之外，管道一断就变成未捕获异常 → 0xe0434352 崩溃
+            // （2026-11-06 事件日志 22:02:41 / 22:09:03 / 22:15:44 连续三次）。
+            // 管道关闭是正常收场信号，安静退出即可。
+            try
+            {
+                line = Console.In.ReadLine();
+            }
+            catch (Exception)
+            {
+                break;
+            }
+
+            if (line == null) break;   // stdin 正常 EOF
             if (string.IsNullOrWhiteSpace(line)) continue;
             long id = 0;
             try

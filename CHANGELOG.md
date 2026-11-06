@@ -1,5 +1,31 @@
 # Changelog (dsh-screen-attention)
 
+## v1.12.0 (2026-11-06) — observe_task 补全：浮窗汇报 + 帧交付
+
+### 澄清一处误判
+上一条结论「`shotEveryMs` 是死参数」**是错的**。grep 只搜了小写 `shotEvery`，漏掉了
+`task.shotEvery` 这种带前缀的写法。定时抓图本来就在（1823-1830 行），存盘也在。
+这是当天第 N 次 grep 假阳性，已记入 falsify 清单。
+
+### 真正的缺口：汇报只走 inject
+`observe_task` 定时器里的两类汇报（识图摘要、图像已生成）全部只调 `injectToSession`，
+而那条通道未通 —— 所以功能在跑、用户却什么都看不到。**这才是被阉割的地方。**
+
+### 改动
+1. **双通道汇报**：识图摘要除 inject 外，同时 `overlay_set` 推浮窗
+   （带红框区域 + `观察 Ns · M帧` 标签 + 完整文字，`ms` 跟随 `reportEveryMs`）
+2. **抓图后浮窗反馈**：每抓到一帧，浮窗标签更新 `观察 Ns · M帧`
+3. **帧交付**：抓到的帧记入 `task.shots`（上限 30 张滚动），
+   任务结束/停止时经 `state.lastObserveShots` 保留，`observe_task_stop` 返回
+   `{ shots, shotCount, hint }` —— AI 回来后可直接 `read_image` 批量读图描述
+
+### 效果
+```text
+之前：定时器跑着，inject 掉进黑洞，用户屏幕上一片安静
+现在：浮窗每 reportEveryMs 更新一次摘要；抓图时更新帧计数；
+      停止时把帧路径全交给 AI，AI 能描述这整段时间的画面变化
+```
+
 ## v1.11.1 (2026-11-06) — 浮窗实时评论验证通过
 
 ### 验证方法（不依赖注入链路）

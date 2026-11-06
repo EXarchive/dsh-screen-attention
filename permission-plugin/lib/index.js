@@ -397,6 +397,7 @@ export function apply(ctx) {
     linkBudget: { count: 0, windowStart: 0 },  // 联动分钟配额（60s ≤6 次，防刷屏）
     interruptProtect: false,   // 防打断状态：识图/观察任务开启时打开，结束自动关闭（inject 不中断对话）
     observeTask: null,
+    lastObserveShots: [],   // 上一次观察任务抓到的帧（AI 回来批量读图用）
     target: null,          // 锁定的观察窗口 { hwnd, title }：只存标识，矩形每次现取
     linkShot: true,        // 变化注入时附带画面（否则模型只收到文字，等于蒙着眼睛）         // 持续观察任务：{ startedAt, seconds, reportEvery, shotEvery, lastReport, lastShot, timer, endTimer }
     taskAgentId: null,         // 发起观察任务的 agent（会话）id：汇报定向注入到该会话，而非依赖 currentInitiator
@@ -1821,14 +1822,28 @@ export function apply(ctx) {
                 }
               } catch {}
             }
-            injectToSession('[识图 ' + elapsed + 's/' + secs + 's] 运动=' + (snap && snap.motion) + ' 变化率=' + ((snap && snap.ratio) || 0) + ' 区域(' + rect.x + ',' + rect.y + ' ' + rect.w + 'x' + rect.h + ') 文本: ' + String(added || text || '(无变化)').slice(0, 220))
+            const report = '[识图 ' + elapsed + 's/' + secs + 's] 运动=' + (snap && snap.motion) + ' 变化率=' + ((snap && snap.ratio) || 0) + ' 区域(' + rect.x + ',' + rect.y + ' ' + rect.w + 'x' + rect.h + ') 文本: ' + String(added || text || '(无变化)').slice(0, 220)
+            injectToSession(report)
+            // 双通道：inject 之外同时推浮窗，保证用户一定看得到
+            try {
+              await helperCall('overlay_set', {
+                region: (rect && rect.w > 0) ? { x: rect.x, y: rect.y, w: rect.w, h: rect.h } : undefined,
+                note: '观察 ' + elapsed + 's · ' + (task.shots ? task.shots.length : 0) + '帧',
+                say: report.replace(/^\[识图 [^\]]*\]\s*/, ''),
+                ms: Math.max(4000, task.reportEvery),
+              })
+            } catch {}
           }
           if (t - task.lastShot >= task.shotEvery) {
             task.lastShot = t
             const shot = await helperCall('screenshot', { maxW: 900 })
             if (shot && shot.jpegB64) {
               const path = saveShot(shot.jpegB64, 'task')
+              task.shots = task.shots || []
+              task.shots.push({ t, path })
+              if (task.shots.length > 30) task.shots.shift()
               injectToSession('[识图图像 ' + elapsed + 's] 屏幕快照已生成: ' + path)
+              try { await helperCall('overlay_set', { note: '观察 ' + elapsed + 's · ' + task.shots.length + '帧', ms: 4000 }) } catch {}
             }
           }
         } catch (e) {
@@ -1836,6 +1851,7 @@ export function apply(ctx) {
         }
       }, 1000)
       task.endTimer = setTimeout(async () => {
+        state.lastObserveShots = task.shots || []
         if (state.observeTask === task) state.observeTask = null
         state.interruptProtect = false
         state.link = false
@@ -1863,7 +1879,7 @@ export function apply(ctx) {
       state.link = false
       try { await helperCall('watch_stop') } catch {}
       try { await helperCall('overlay_close') } catch {}
-      return { stopped: true, interruptProtect: false }
+      return { stopped: true, interruptProtect: false, shots, shotCount: shots.length, hint: shots.length ? '用 read_image 依次读 shots 里的路径即可描述这段时间的画面变化' : '本次任务没有抓到帧（检查 shotEveryMs）' }
     },
   })
 
