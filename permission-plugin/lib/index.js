@@ -499,16 +499,19 @@ export function apply(ctx) {
   }
 
   const onHelperEvent = async (kind, data) => {
+    appendFileSync('C:/Users/Administrator/PycharmProjects/dsh-screen-attention/out/logs/diag.txt', new Date().toISOString().slice(11,19)+' ENTRY kind='+kind+' hasData='+(!!data)+' link='+!!state.link+'\n');
     if (kind === 'hotkey' && data && typeof data.locked === 'boolean') {
       state.paused = data.locked
       state.pausedBy = data.locked ? 'hotkey' : null
       console.log('[sa-perm] Pause 热键：注入' + (data.locked ? '锁定' : '解锁'))
     }
     if (kind === 'change' && data && state.link) {
+      appendFileSync('C:/Users/Administrator/PycharmProjects/dsh-screen-attention/out/logs/diag.txt', new Date().toISOString().slice(11,19)+'  IN-CHANGE\n');
       // 变化事件 → 拉取 OCR 摘要 → 注入会话（节流 2s + 文本去重）
       const now = Date.now()
       if (now - state.lastLinkAt < 1200) { appendObservationLog({ type: 'inject-skip', reason: 'throttle' }); return }
       state.lastLinkAt = now
+      appendFileSync('C:/Users/Administrator/PycharmProjects/dsh-screen-attention/out/logs/diag.txt', new Date().toISOString().slice(11,19)+'  AFTER-THROTTLE ratio='+evRatio+'\n');
       // 事件已经带了 ratio/rect —— 必须用它判变化。
       // 原来靠 watch_snapshot 的 motion，但快照是 2 秒后才拍的，那时画面往往已静止，
       // 于是每条事件都被判成 no-motion-no-text 丢弃（实测踩过）。
@@ -520,6 +523,7 @@ export function apply(ctx) {
       const body = '[屏幕变化通知] 屏幕运动区域 (' + (evRect.x ?? 0) + ',' + (evRect.y ?? 0) + ' ' + (evRect.w ?? 0) + 'x' + (evRect.h ?? 0) + ')，变化率 ' + evRatio + '。若与当前任务相关可继续处理；无关则忽略。'
       state.lastLinkText = ''
       if (!linkBudgetOk()) { appendObservationLog({ type: 'inject-skip', reason: 'budget', count: state.linkBudget.count }); return }
+      appendFileSync('C:/Users/Administrator/PycharmProjects/dsh-screen-attention/out/logs/diag.txt', new Date().toISOString().slice(11,19)+'  AFTER-BUDGET shot='+!!state.linkShot+'\n');
       let shot = null
       if (state.linkShot) {
         try {
@@ -533,6 +537,7 @@ export function apply(ctx) {
           if (sh && sh.jpegB64) shot = sh.jpegB64
         } catch (e) { appendObservationLog({ type: 'inject-skip', reason: 'shot-fail:' + ((e && e.message) || e) }) }
       }
+      appendFileSync('C:/Users/Administrator/PycharmProjects/dsh-screen-attention/out/logs/diag.txt', new Date().toISOString().slice(11,19)+'  BEFORE-INJECT hasShot='+!!shot+'\n');
       injectToSession(body, shot).catch(e => appendObservationLog({ type: 'inject-skip', reason: 'inject-throw:' + ((e && e.message) || e) }))
     }
   }
