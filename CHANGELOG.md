@@ -1,5 +1,50 @@
 # Changelog (dsh-screen-attention)
 
+## v1.17.0 (2026-11-07) — 正式注册：本地视觉理解 + 同框字幕
+
+### 新增 `saperm_vlm`（正式可用）
+本地 Qwen2.5-VL（Ollama `qwen2.5vl:3b`），**直接给画面内容**而非标签。
+
+```js
+saperm_vlm({ prompt: '画面里有什么', hwnd?, x?,y?,w?,h?, maxTokens? })
+// → { text, totalMs, shotMs, vlmMs, tokens, model, size, within2s }
+```
+
+实测（热启动，稳定）：
+| 次 | 总耗时 | 抓图 | VLM | 输出 |
+|---|---|---|---|---|
+| 1 | 1667ms | 83ms | 1579ms | 聊天软件界面，左侧列表右侧窗口 |
+| 2 | 1679ms | 83ms | 1593ms | 聊天窗口 + 角色插图 |
+| 3 | 1605ms | 107ms | 1494ms | 女仆装角色站在华丽房间，手持笔记本 |
+
+**冷启动约 49 秒**（加载 3.2GB 模型），之后每一次都在 1.7 秒内。
+
+### 同框字幕（`overlay_set` 的 `subtitle`）
+浮窗三块**严格分区**，互不遮挡：
+```text
+┌──────────────┐
+│ 画面 16:9      │  ← 480x270
+├──────────────┤
+│ 讲解字幕        │  ← 独立区，多行自适应
+├──────────────┤
+│ ● 标签  fps    │  ← 状态条
+└──────────────┘
+```
+尺寸写死为 `480x366`（270+74+22），**不做动态 resize**——实测动态改窗口会把位置弄丢。
+
+### 运维要点（重要）
+1. **ollama 长时间运行会退化**：多次调用后输出变成 `@@@@`（tokenizer 退化），
+   或返回 HTTP 500。**处置：重启 ollama serve 即可**，模型无需重下。
+2. **helper 桥接是偶发的**：`Get-Process SaHelper` 必须看到 **Session 0 + Session 1 两个进程**；
+   只有一个 Session 0 = 降级（抓屏全黑）。处置：kill 全部 SaHelper 让插件重新拉起，可重试至成功。
+3. **不要给 ollama 设 `HTTPS_PROXY`**：会报 `proxyconnect tcp: lookup http: no such host`。
+
+### 依赖
+```text
+Ollama  → %LOCALAPPDATA%\Programs\Ollama\ollama.exe（须用 WMI 启动以脱离 Job Object）
+模型    → qwen2.5vl:3b（3.2GB）
+```
+
 ## v1.16.1 (2026-11-07) — 修正：真正分区，而非叠加
 
 ### 上一版的问题

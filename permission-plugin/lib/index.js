@@ -415,7 +415,8 @@ export function apply(ctx) {
     lastLinkAt: 0,
     lastLinkText: '',
     autoWatch: false,   // watch 是否随小窗自动启动（关闭小窗时停）
-    overlayOpen: false, // 注意力小窗是否已打开
+    overlayOpen: false,
+    overlaySize: null,   // 浮窗当前尺寸 {w,h}：用于判断字幕加高是否需要 resize // 注意力小窗是否已打开
     obsTtlTimer: null,  // 观察/小窗无操作自动关闭定时器
     obsTtlMs: 0,        // 当前自动关闭 TTL 毫秒数
     linkBudget: { count: 0, windowStart: 0 },  // 联动分钟配额（60s ≤6 次，防刷屏）
@@ -1568,7 +1569,8 @@ export function apply(ctx) {
   })
   // ============ 注意力可视化小窗（L1 观察类，免审） ============
   // 形状档位：小窗跟着画面形状走（手机竖屏画面塞进 16:9 横窗只会变成一条细缝）
-  const ASPECT_SIZE = { landscape: [480, 270], portrait: [270, 480], square: [360, 360] }
+  // landscape 高度 = 16:9 画面(270) + 字幕区(74) + 状态条(22)，这样画面区天生就是 16:9，不靠动态 resize
+  const ASPECT_SIZE = { landscape: [480, 366], portrait: [280, 560], square: [380, 430] }
   function resolveAspect(aspect, w, h) {
     let a = String(aspect || '').toLowerCase()
     if (!a) a = (w && h) ? 'custom' : 'auto'
