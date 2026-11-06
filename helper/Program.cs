@@ -1283,7 +1283,17 @@ static class Overlay
         {
             g.SmoothingMode = SmoothingMode.AntiAlias;
             g.PixelOffsetMode = PixelOffsetMode.HighQuality;
-            int vw = client.Width, vh = Math.Max(1, client.Height - BarH);
+            int vw = client.Width;
+            // 上下分区：先留出字幕区高度，画面只占剩下的部分（不是叠加，是让位）
+            int subH = 0;
+            if (!string.IsNullOrEmpty(subtitle))
+            {
+                var mflags = TextFormatFlags.WordBreak | TextFormatFlags.NoPadding;
+                int mw = Math.Max(40, vw - 24);
+                var msz = TextRenderer.MeasureText(subtitle, subtitleFont, new Size(mw, 400), mflags);
+                subH = Math.Min((int)(client.Height * 0.55), Math.Max(40, msz.Height + 16));
+            }
+            int vh = Math.Max(1, client.Height - BarH - subH);   // 画面可用高度
 
             if (frame != null && fw > 0 && fh > 0)
             {
@@ -1322,8 +1332,8 @@ static class Overlay
                 int pad = 12, maxW = Math.Max(40, vw - pad * 2);
                 var sz = TextRenderer.MeasureText(subtitle, subtitleFont, new Size(maxW, 300), flags);
                 // 上限放到画面区 72%：字幕优先完整显示，宁可压小画面也不截断文字
-                int sh = Math.Min(Math.Max(44, (int)(vh * 0.72)), Math.Max(44, sz.Height + 18));
-                int sy = Math.Max(0, vh - sh);
+                int sh = subH > 0 ? subH : Math.Max(40, sz.Height + 16);
+                int sy = vh;   // 紧接画面下沿，独立区域
                 using (var bg = new SolidBrush(Color.FromArgb(212, 8, 12, 26)))
                     g.FillRectangle(bg, 0, sy, vw, sh);
                 using (var bar = new SolidBrush(Color.FromArgb(235, 96, 196, 255)))
@@ -1331,7 +1341,7 @@ static class Overlay
                 TextRenderer.DrawText(g, subtitle, subtitleFont,
                     new Rectangle(pad, sy + 9, maxW, sh - 18), Color.FromArgb(242, 247, 255), flags);
             }
-            DrawBar(g, client.Width, vh);
+            DrawBar(g, client.Width, vh + subH);   // 状态条在字幕区之下
             try { cachedBounds = new Rectangle(form != null ? form.Left : 0, form != null ? form.Top : 0, client.Width, client.Height); hasCachedBounds = true; } catch { }
         }
     }
