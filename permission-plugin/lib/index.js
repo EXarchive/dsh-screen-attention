@@ -1587,96 +1587,77 @@ export function apply(ctx) {
   }
 
   register({
-    name: 'saperm_overlay_open',
-    description: '打开注意力可视化悬浮小窗：实时显示采集的屏幕画面、AI 注意力区域（红框）、注视点（十字）与注意点文字说明。小窗与观察引擎捆绑：若 watch 未运行则自动以低频(1000ms,运动自动提速)启动同一采集管线。默认 480x270 位于屏幕右下角；小窗可拖动、双击关闭（观察类，无需审批）',
+    name: 'saperm_overlay',
+    description: '浮窗控制（统一入口）：action=open 打开 | close 关闭 | set 设标记与字幕。画面在上、讲解字幕在下、状态条最底，三块分区不重叠。L0 观察',
     parameters: {
       type: 'object',
       properties: {
-        x: { type: 'integer', description: '窗口左上角屏幕 x 坐标（默认屏幕右侧）' },
-        y: { type: 'integer', description: '窗口左上角屏幕 y 坐标（默认屏幕下部）' },
-        w: { type: 'integer', description: '窗口宽度（aspect=custom 时生效）' },
-        h: { type: 'integer', description: '窗口高度（aspect=custom 时生效）' },
-        aspect: { type: 'string', description: '窗口形状：auto（默认，跟随拖框区域比例）/ landscape 480x270 / portrait 270x480（手机竖屏画面用这个）/ square 360x360 / custom（配合 w,h）' },
-        ttlSec: { type: 'integer', description: '无操作自动关闭秒数（默认 120 秒，到期自动停止观察并关闭小窗）' },
+        action: { type: 'string', enum: ['open', 'close', 'set'], description: '操作类型' },
+        x: { type: 'integer' }, y: { type: 'integer' }, w: { type: 'integer' }, h: { type: 'integer' },
+        aspect: { type: 'string', description: 'open/set 用：auto/landscape/portrait/square/custom' },
+        ttlSec: { type: 'integer', description: 'open 用：无操作自动关闭秒数' },
+        region: { type: 'object', description: 'set 用：注意力红框', properties: { x: { type: 'integer' }, y: { type: 'integer' }, w: { type: 'integer' }, h: { type: 'integer' } } },
+        gaze: { type: 'object', description: 'set 用：注视点', properties: { x: { type: 'integer' }, y: { type: 'integer' } } },
+        clearRegion: { type: 'boolean', description: 'set 用：清除红框' },
+        clearGaze: { type: 'boolean', description: 'set 用：清除注视点' },
+        note: { type: 'string', description: 'set 用：底部短标签' },
+        subtitle: { type: 'string', description: 'set 用：讲解字幕（与画面同框，多行自适应）' },
+        say: { type: 'string', description: 'set 用：气泡文字（可与 subtitle 并存）' },
+        speak: { type: 'boolean', description: 'set 用：是否朗读 say' },
+        ms: { type: 'integer', description: 'set 用：气泡停留毫秒（默认 6000）' },
       },
+      required: ['action'],
     },
     execute: async (args) => {
-      state.overlayOpen = true
-      const defaultTtl = state.obsMode ? (state.obsTtlMs / 1000 || 120) : 60
-      armAutoCleanup(args.ttlSec || defaultTtl)
-      const box = resolveAspect(args.aspect, args.w, args.h)
-      const r = await helperCall('overlay_open', { x: args.x, y: args.y, w: box.w, h: box.h })
-      // 捆绑：小窗画面依赖 watch 帧源——未运行则自动低频启动（单一采集引擎）
-      if (r && r.open) {
-        try {
-          const st = await helperCall('watch_status')
-          if (st && !st.watching) {
-            await helperCall('watch_start', { intervalMs: 1000 })
-            state.autoWatch = true
-          }
-        } catch {}
+      const act = String(args.action || '')
+      if (act === 'open') {
+        state.overlayOpen = true
+        const defaultTtl = state.obsMode ? (state.obsTtlMs / 1000 || 120) : 60
+        armAutoCleanup(args.ttlSec || defaultTtl)
+        const box = resolveAspect(args.aspect, args.w, args.h)
+        const r = await helperCall('overlay_open', { x: args.x, y: args.y, w: box.w, h: box.h })
+        if (r && r.open) {
+          try {
+            const st = await helperCall('watch_status')
+            if (st && !st.watching) {
+              await helperCall('watch_start', { intervalMs: 1000 })
+              state.autoWatch = true
+            }
+          } catch {}
+        }
+        return { ...(r || {}), size: box, autoWatch: state.autoWatch }
       }
-      return { ...(r || {}), size: box, autoWatch: state.autoWatch }
-    },
-  })
-
-  register({
-    name: 'saperm_overlay_close',
-    description: '关闭注意力可视化悬浮小窗：若 watch 是随小窗自动启动的（autoWatch），一并停止采集以省资源；显式启动的 watch 保留（观察类，无需审批）',
-    parameters: empty,
-    execute: async () => {
-      state.overlayOpen = false
-      const r = await helperCall('overlay_close')
-      if (state.autoWatch) {
-        state.autoWatch = false
-        try { await helperCall('watch_stop') } catch {}
-        releaseHold('watch')
+      if (act === 'close') {
+        state.overlayOpen = false
+        const r = await helperCall('overlay_close')
+        if (state.autoWatch) {
+          state.autoWatch = false
+          try { await helperCall('watch_stop') } catch {}
+          releaseHold('watch')
+        }
+        clearAutoCleanupIfIdle()
+        return { ...(r || {}), autoWatchStopped: true }
       }
-      clearAutoCleanupIfIdle()
-      return { ...(r || {}), autoWatchStopped: true }
-    },
-  })
-
-
-  register({
-    name: 'saperm_overlay_set',
-    description: '设置 AI 注意力标记并显示在小窗上：注意力区域（红框）、注视点（十字）、注意点文字说明。可单独清除区域或注视点（观察类，无需审批）',
-    parameters: {
-      type: 'object',
-      properties: {
-        region: { type: 'object', description: '注意力区域 {x,y,w,h}（屏幕坐标）', properties: { x: { type: 'integer' }, y: { type: 'integer' }, w: { type: 'integer' }, h: { type: 'integer' } } },
-        gaze: { type: 'object', description: '注视点 {x,y}（屏幕坐标）', properties: { x: { type: 'integer' }, y: { type: 'integer' } } },
-        clearRegion: { type: 'boolean', description: '清除区域红框' },
-        clearGaze: { type: 'boolean', description: '清除注视点十字' },
-        note: { type: 'string', description: '底部状态标签（短，如「在看视频」）' },
-        subtitle: { type: 'string', description: '讲解字幕：与画面同框显示在浮窗底部，多行自适应。这是「看画面 + 说内容」的主通道' },
-        say: { type: 'string', description: '让小窗显示一句话（气泡），并朗读出来' },
-        speak: { type: 'boolean', description: '配合 say：是否朗读（默认 true）' },
-        aspect: { type: 'string', description: '运行时换窗口形状：auto / landscape / portrait（手机竖屏）/ square / custom（配合 w,h）' },
-        w: { type: 'integer', description: 'aspect=custom 时的宽度' },
-        h: { type: 'integer', description: 'aspect=custom 时的高度' },
-      },
-    },
-    execute: async (args) => {
-      state.overlayOpen = true
-      refreshAutoCleanup()
-      const out = await helperCall('overlay_set', { region: args.region, gaze: args.gaze, clearRegion: args.clearRegion, clearGaze: args.clearGaze, note: args.note, subtitle: args.subtitle })
-      let sayResult = null
-      if (args.say) {
-        // 关键：ms 必须用调用方传的值。原来硬编码 6000，把外部设的停留时长全覆盖成 6 秒，
-        // 表现为「内容一闪就没了」——用户根本没机会看。speak 默认关，避免无预期出声。
-        const sayMs = Number(args.ms) > 0 ? Number(args.ms) : 6000
-        try {
-          const r = await helperCall('say', { text: String(args.say), speak: args.speak === true, ms: sayMs }, 8000)
-          sayResult = { ok: true, ms: sayMs, visible: r && r.sayVisible, bounds: r && r.sayRealBounds }
-        } catch (e) { sayResult = { ok: false, err: String((e && e.message) || e) } }
+      if (act === 'set') {
+        state.overlayOpen = true
+        refreshAutoCleanup()
+        const out = await helperCall('overlay_set', { region: args.region, gaze: args.gaze, clearRegion: args.clearRegion, clearGaze: args.clearGaze, note: args.note, subtitle: args.subtitle })
+        let sayResult = null
+        if (args.say) {
+          const sayMs = Number(args.ms) > 0 ? Number(args.ms) : 6000
+          try {
+            const r = await helperCall('say', { text: String(args.say), speak: args.speak === true, ms: sayMs }, 8000)
+            sayResult = { ok: true, ms: sayMs, visible: r && r.sayVisible, bounds: r && r.sayRealBounds }
+          } catch (e) { sayResult = { ok: false, err: String((e && e.message) || e).slice(0, 80) } }
+        }
+        if (args.aspect || (args.w && args.h)) {
+          const box = resolveAspect(args.aspect || 'custom', args.w, args.h)
+          const rz = await helperCall('overlay_resize', { w: box.w, h: box.h })
+          return { ...(out || {}), size: { ...box, resized: !!(rz && rz.resized) }, say: sayResult }
+        }
+        return { ...(out || {}), say: sayResult }
       }
-      if (args.aspect || (args.w && args.h)) {
-        const box = resolveAspect(args.aspect || 'custom', args.w, args.h)
-        const rz = await helperCall('overlay_resize', { w: box.w, h: box.h })
-        return { ...(out || {}), size: { ...box, resized: !!(rz && rz.resized) }, say: sayResult }
-      }
-      return { ...(out || {}), say: sayResult }
+      throw new Error('action 必须是: open | close | set')
     },
   })
 
@@ -2521,152 +2502,170 @@ export function apply(ctx) {
   // ===== 连续解读（持续获取 + 变化区域 OCR + 内容/噪声分类） =====
 
   register({
-    name: 'saperm_interpret_start',
-    description: '启动连续解读：持续采集屏幕，自动检测变化区域并 OCR，分类"内容变化/动态噪声"，维护滚动历史。inject=true 时把"内容变化"事件按 minInjectMs 节流注入当前会话（≤200 字/条，不刷屏）。L0 观察，无需审批',
+    name: 'saperm_interpret',
+    description: '连续解读（统一入口）：action=start 启动（持续采集+变化区域OCR+内容/噪声分类）| status 查状态 | stop 停止。inject=true 时按 minInjectMs 节流注入会话。L0 观察',
     parameters: {
       type: 'object',
       properties: {
-        intervalMs: { type: 'integer', description: '解读间隔毫秒（默认 800，最小 100）' },
-        x: { type: 'integer' }, y: { type: 'integer' },
-        w: { type: 'integer' }, h: { type: 'integer' },
-        inject: { type: 'boolean', description: '是否把变化事件注入会话（默认 false）' },
-        minInjectMs: { type: 'integer', description: '注入最小间隔毫秒（默认 2000，范围 200-60000）' },
-        kinds: { type: 'array', items: { type: 'string' }, description: '注入的变化类型（默认 ["content_change"]，可选 content_change/text_shift/dynamic_noise/idle）' },
-        ttlSec: { type: 'integer', description: '无操作自动关闭秒数（默认 120 秒，到期自动停止观察并关闭小窗）' },
+        action: { type: 'string', enum: ['start', 'status', 'stop'], description: '操作类型' },
+        intervalMs: { type: 'integer', description: 'start 用：解读间隔毫秒（默认 800）' },
+        x: { type: 'integer' }, y: { type: 'integer' }, w: { type: 'integer' }, h: { type: 'integer' },
+        inject: { type: 'boolean', description: 'start 用：变化事件注入会话' },
+        minInjectMs: { type: 'integer', description: 'start 用：注入最小间隔毫秒' },
+        kinds: { type: 'array', items: { type: 'string' }, description: 'start 用：注入的变化类型' },
+        ttlSec: { type: 'integer', description: 'start 用：无操作自动关闭秒数' },
+        limit: { type: 'integer', description: 'status 用：返回历史条数（默认 20）' },
+        keepOverlay: { type: 'boolean', description: 'stop 用：是否保留小窗' },
       },
+      required: ['action'],
     },
     execute: async (args) => {
-      const a = { intervalMs: args.intervalMs || 800 }
-      const rgWf = await resolveObserveRect(args)
-      if (rgWf) { a.x = rgWf.x; a.y = rgWf.y; a.w = rgWf.w; a.h = rgWf.h }
-      let autoStopped = null
-      if (state.obsMode === 'infer') {
-        try { stopInject('infer'); await helperCall('infer_stop', {}); releaseHold('obs'); autoStopped = 'infer' } catch {}
+      const act = String(args.action || '')
+      if (act === 'start') {
+        const a = { intervalMs: args.intervalMs || 800 }
+        const rgWf = await resolveObserveRect(args)
+        if (rgWf) { a.x = rgWf.x; a.y = rgWf.y; a.w = rgWf.w; a.h = rgWf.h }
+        let autoStopped = null
+        if (state.obsMode === 'infer') {
+          try { stopInject('infer'); await helperCall('infer_stop', {}); releaseHold('obs'); autoStopped = 'infer' } catch {}
+        }
+        armAutoCleanup(args.ttlSec || 120)
+        const r = await helperCall('interpret_start', a)
+        if (r && r.running) {
+          holdHelper('obs')
+          state.obsMode = 'interpret'
+          state.obsConfig = { mode: 'interpret', cmd: 'interpret_start', args: a }
+        }
+        const c = startInterpretInject({ inject: args.inject, minInjectMs: args.minInjectMs, kinds: args.kinds })
+        return autoStopped ? { ...r, autoStopped, injection: injectSummary(c) } : { ...r, injection: injectSummary(c) }
       }
-      armAutoCleanup(args.ttlSec || 120)
-      const r = await helperCall('interpret_start', a)
-      if (r && r.running) {
-        holdHelper('obs')
-        state.obsMode = 'interpret'
-        state.obsConfig = { mode: 'interpret', cmd: 'interpret_start', args: a }
+      if (act === 'status') {
+        refreshAutoCleanup()
+        const r = await helperCall('interpret_status', { limit: args.limit || 20 })
+        return { ...r, injection: injectSummary(state.interpretInject) }
       }
-      const c = startInterpretInject({ inject: args.inject, minInjectMs: args.minInjectMs, kinds: args.kinds })
-      return autoStopped ? { ...r, autoStopped, injection: injectSummary(c) } : { ...r, injection: injectSummary(c) }
+      if (act === 'stop') {
+        stopInject('interpret')
+        state.obsConfig = null
+        const r = await helperCall('interpret_stop', {})
+        releaseHold('obs')
+        state.obsMode = null
+        let overlayClosed = false
+        if (!args.keepOverlay) {
+          try { await helperCall('overlay_close', {}) } catch {}
+          if (state.autoWatch) { state.autoWatch = false; try { await helperCall('watch_stop', {}) } catch {}; releaseHold('watch') }
+          state.overlayOpen = false
+          overlayClosed = true
+        }
+        clearAutoCleanupIfIdle()
+        return { ...r, injection: injectSummary(state.interpretInject), ...(overlayClosed ? { overlayClosed: true } : {}) }
+      }
+      throw new Error('action 必须是: start | status | stop')
     },
   })
 
   register({
-    name: 'saperm_interpret_status',
-    description: '读取连续解读状态：运行中/解读次数/平均 OCR 耗时/当前变化类型/滚动历史（内容变化 vs 动态噪声）+ 当前注入配置。L0 观察',
-    parameters: {
-      type: 'object',
-      properties: { limit: { type: 'integer', description: '返回历史条数（默认 20）' } },
-    },
-    execute: async (args) => {
-      refreshAutoCleanup()
-      const r = await helperCall('interpret_status', { limit: args.limit || 20 })
-      return { ...r, injection: injectSummary(state.interpretInject) }
-    },
-  })
-
-  register({
-    name: 'saperm_interpret_stop',
-    description: '停止连续解读（同时清理注入轮询定时器）。L0 观察，无需审批',
+    name: 'saperm_infer',
+    description: '逐帧实时识别（统一入口）：action=start 启动（每帧检测+识别，结果流式）| status 查 fps/耗时/最新文本 | stop 停止。inject=true 时把角色出现/消失事件节流注入。L0 观察',
     parameters: {
       type: 'object',
       properties: {
-        keepOverlay: { type: 'boolean', description: '是否保留注意力小窗（默认 false 自动关闭）' },
+        action: { type: 'string', enum: ['start', 'status', 'stop'], description: '操作类型' },
+        maxBoxes: { type: 'integer', description: 'start 用：每帧最多识别框数（默认 60）' },
+        objects: { type: 'boolean', description: 'start 用：逐帧目标检测' },
+        scene: { type: 'boolean', description: 'start 用：逐帧场景分类' },
+        accurate: { type: 'boolean', description: 'start 用：YOLOv8m 精确模式' },
+        animeface: { type: 'boolean', description: 'start 用：动漫脸检测' },
+        sceneEvery: { type: 'integer', description: 'start 用：场景采样间隔帧（默认 8）' },
+        faceEvery: { type: 'integer', description: 'start 用：动漫脸采样间隔帧（默认 4）' },
+        inject: { type: 'boolean', description: 'start 用：注入角色出现/消失事件（需 objects=true）' },
+        injectChanges: { type: 'boolean', description: 'start 用：注入变化（默认 true）' },
+        minInjectMs: { type: 'integer', description: 'start 用：注入最小间隔毫秒' },
+        ttlSec: { type: 'integer', description: 'start 用：无操作自动关闭秒数' },
+        streamMs: { type: 'integer', description: 'start 用：数据流采样间隔（默认 1000）' },
+        fullRate: { type: 'boolean', description: 'start 用：不做静止节流' },
+        limit: { type: 'integer', description: 'status 用：返回历史条数（默认 10）' },
+        keepOverlay: { type: 'boolean', description: 'stop 用：是否保留小窗' },
       },
+      required: ['action'],
     },
     execute: async (args) => {
-      stopInject('interpret')
-      state.obsConfig = null
-      const r = await helperCall('interpret_stop', {})
-      releaseHold('obs')
-      state.obsMode = null
-      let overlayClosed = false
-      if (!args || !args.keepOverlay) {
-        try { await helperCall('overlay_close', {}) } catch {}
-        if (state.autoWatch) { state.autoWatch = false; try { await helperCall('watch_stop', {}) } catch {}; releaseHold('watch') }
-        state.overlayOpen = false
-        overlayClosed = true
+      const act = String(args.action || '')
+      if (act === 'start') {
+        let autoStopped = null
+        if (state.obsMode === 'interpret') {
+          try { stopInject('interpret'); await helperCall('interpret_stop', {}); releaseHold('obs'); autoStopped = 'interpret' } catch {}
+        }
+        armAutoCleanup(args.ttlSec || 120)
+        const inferArgs = { maxBoxes: args.maxBoxes || 60, objects: !!args.objects, scene: !!args.scene, accurate: !!args.accurate, animeface: !!args.animeface, sceneEvery: args.sceneEvery || 8, faceEvery: args.faceEvery || 4, fullRate: args.fullRate === true }
+        const r = await helperCall('infer_start', inferArgs)
+        if (r && r.running) {
+          holdHelper('obs')
+          state.obsMode = 'infer'
+          state.obsConfig = { mode: 'infer', cmd: 'infer_start', args: inferArgs }
+        }
+        const c = startInferInject({ inject: args.inject, injectChanges: args.injectChanges, minInjectMs: args.minInjectMs })
+        if (r && r.running) startStream({ intervalMs: args.streamMs || 1000 })
+        const out = { ...r, injection: injectSummary(c), stream: streamStatus() }
+        if (autoStopped) out.autoStopped = autoStopped
+        if (c.inject && !args.objects) out.injectionNote = '角色变化依赖 objects=true；当前 objects=false 时不会产生出现/消失事件'
+        return out
       }
-      clearAutoCleanupIfIdle()
-      return { ...r, injection: injectSummary(state.interpretInject), ...(overlayClosed ? { overlayClosed: true } : {}) }
-    },
-  })
-
-  // ===== 实时逐帧识别（每帧都送识别，结果流式输出） =====
-  register({
-    name: 'saperm_infer_start',
-    description: '启动逐帧实时识别：每一帧都做检测+识别（rec 缓存复用只重识别变化框），结果流式输出。inject=true 时把角色出现/消失事件按 minInjectMs 节流注入当前会话（需 objects=true）。L0 观察，无需审批',
-    parameters: {
-      type: 'object',
-      properties: {
-        maxBoxes: { type: 'integer', description: '每帧最多识别框数（默认 60）' },
-        objects: { type: 'boolean', description: '逐帧目标检测（物体描述，YOLOv8n）' },
-        scene: { type: 'boolean', description: '逐帧场景语义分类（Chinese-CLIP，ACG 标签）' },
-        accurate: { type: 'boolean', description: '精确物体检测（YOLOv8m，更准但稍慢）' },
-        animeface: { type: 'boolean', description: '逐帧动漫脸检测（YOLOv8n face，ACG 场景用，~65ms/帧）' },
-        sceneEvery: { type: 'integer', description: '场景语义采样间隔帧数（默认 8，0/省略=8）' },
-        faceEvery: { type: 'integer', description: '动漫脸采样间隔帧数（默认 4）' },
-        inject: { type: 'boolean', description: '是否把角色出现/消失事件注入会话（默认 false）' },
-        injectChanges: { type: 'boolean', description: '注入角色出现/消失变化（默认 true；false=不注入变化）' },
-        minInjectMs: { type: 'integer', description: '注入最小间隔毫秒（默认 2000，范围 200-60000）' },
-        ttlSec: { type: 'integer', description: '无操作自动关闭秒数（默认 120 秒，到期自动停止观察并关闭小窗）' },
-        streamMs: { type: 'integer', description: 'AI 可读数据流采样间隔毫秒（默认 1000，范围 200-10000）' },
-        fullRate: { type: 'boolean', description: 'true=不做静止节流，每帧都识别（追 30fps 高速识别）；默认 false 省电' },
-      },
-    },
-    execute: async (args) => {
-      let autoStopped = null
-      if (state.obsMode === 'interpret') {
-        try { stopInject('interpret'); await helperCall('interpret_stop', {}); releaseHold('obs'); autoStopped = 'interpret' } catch {}
+      if (act === 'status') {
+        refreshAutoCleanup()
+        const r = await helperCall('infer_status', { limit: args.limit || 10 })
+        return { ...r, injection: injectSummary(state.inferInject), stream: streamStatus() }
       }
-      armAutoCleanup(args.ttlSec || 120)
-      const inferArgs = { maxBoxes: args.maxBoxes || 60, objects: !!args.objects, scene: !!args.scene, accurate: !!args.accurate, animeface: !!args.animeface, sceneEvery: args.sceneEvery || 8, faceEvery: args.faceEvery || 4, fullRate: args.fullRate === true }
-      const r = await helperCall('infer_start', inferArgs)
-      if (r && r.running) {
-        holdHelper('obs')
-        state.obsMode = 'infer'
-        state.obsConfig = { mode: 'infer', cmd: 'infer_start', args: inferArgs }
+      if (act === 'stop') {
+        stopInject('infer')
+        stopStream()
+        state.obsConfig = null
+        const r = await helperCall('infer_stop', {})
+        releaseHold('obs')
+        state.obsMode = null
+        let overlayClosed = false
+        if (!args.keepOverlay) {
+          try { await helperCall('overlay_close', {}) } catch {}
+          if (state.autoWatch) { state.autoWatch = false; try { await helperCall('watch_stop', {}) } catch {}; releaseHold('watch') }
+          state.overlayOpen = false
+          overlayClosed = true
+        }
+        clearAutoCleanupIfIdle()
+        return { ...r, injection: injectSummary(state.inferInject), ...(overlayClosed ? { overlayClosed: true } : {}) }
       }
-      const c = startInferInject({ inject: args.inject, injectChanges: args.injectChanges, minInjectMs: args.minInjectMs })
-      if (r && r.running) startStream({ intervalMs: args.streamMs || 1000 })
-      const out = { ...r, injection: injectSummary(c), stream: streamStatus() }
-      if (autoStopped) out.autoStopped = autoStopped
-      if (c.inject && !args.objects) out.injectionNote = '角色变化依赖 objects=true 的目标检测/身份；当前 objects=false 时不会产生出现/消失事件'
-      return out
-    },
-  })
-
-  register({
-    name: 'saperm_infer_status',
-    description: '读取逐帧识别状态：fps/已处理帧/丢弃帧/OCR耗时P50-P90/最新文本/rec缓存命中 + 当前注入配置。L0 观察',
-    parameters: {
-      type: 'object',
-      properties: { limit: { type: 'integer', description: '返回历史条数（默认 10）' } },
-    },
-    execute: async (args) => {
-      refreshAutoCleanup()
-      const r = await helperCall('infer_status', { limit: args.limit || 10 })
-      return { ...r, injection: injectSummary(state.inferInject), stream: streamStatus() }
+      throw new Error('action 必须是: start | status | stop')
     },
   })
 
   register({
     name: 'saperm_stream',
-    description: '读取 AI 可读数据流：每帧识别结果已压成一行紧凑文本（W=前台窗口 SC=场景 OB=物体 F=动漫脸 TX=文本,增量语义 =相同/\u002B新增 CH=变化事件 fps/ms）。默认返回 text 多行，token 极省；file=true 返回 latest.txt 路径（可用 read 工具分页读）。L0 观察',
+    description: 'AI 可读数据流（统一入口）：action=read 读最近行（默认）| start 开启采样 | stop 停止。每帧压成一行紧凑文本，token 极省。需 infer 在跑才有数据。L0 观察',
     parameters: {
       type: 'object',
       properties: {
-        limit: { type: 'integer', description: '返回最近行数（默认 40，最大 600）' },
-        sinceSeq: { type: 'integer', description: '只返回帧号 seq 大于该值的行（增量拉取）' },
-        format: { type: 'string', description: 'lines=紧凑文本(默认) | json=结构化数组' },
-        file: { type: 'boolean', description: 'true=只返回 latest.txt 路径与状态' },
+        action: { type: 'string', enum: ['read', 'start', 'stop'], description: '操作类型（默认 read）' },
+        limit: { type: 'integer', description: 'read 用：返回最近行数（默认 40，最大 600）' },
+        sinceSeq: { type: 'integer', description: 'read 用：只返回 seq 大于该值的行' },
+        format: { type: 'string', description: 'read 用：lines=紧凑文本(默认) | json=结构化' },
+        file: { type: 'boolean', description: 'read 用：只返回 latest.txt 路径' },
+        intervalMs: { type: 'integer', description: 'start 用：采样间隔毫秒（默认 1000）' },
+        ttlSec: { type: 'integer', description: 'start 用：无操作自动停止秒数（可选）' },
       },
     },
     execute: async (args) => {
+      const act = String(args.action || 'read')
+      if (act === 'start') {
+        const st = startStream({ intervalMs: args.intervalMs || 1000 })
+        if (args.ttlSec) {
+          clearTimeout(state.streamTtlTimer)
+          state.streamTtlTimer = setTimeout(() => { try { stopStream() } catch {} }, Math.max(2000, Number(args.ttlSec) * 1000))
+        }
+        return st
+      }
+      if (act === 'stop') {
+        const summary = stopStream()
+        return { stopped: true, ...(summary || {}), file: streamLatest() }
+      }
       const limit = clampInt(args.limit, 40, 1, 600)
       if (args.file) return { file: streamLatest(), status: streamStatus() }
       const st = state.stream
@@ -2676,8 +2675,8 @@ export function apply(ctx) {
         try {
           const f = streamFile(streamDay(Date.now()))
           if (existsSync(f)) {
-            const lines = readFileSync(f, 'utf8').split('\n').filter(Boolean)
-            for (const ln of lines.slice(-limit)) { try { rows.push(JSON.parse(ln)) } catch {} }
+            const raw = readFileSync(f, 'utf8').split('\n').filter(Boolean)
+            for (const ln of raw.slice(-limit)) { try { rows.push(JSON.parse(ln)) } catch {} }
           }
         } catch {}
       }
@@ -2685,61 +2684,6 @@ export function apply(ctx) {
       rows = rows.slice(-limit)
       if (String(args.format || 'lines') === 'json') return { count: rows.length, status: streamStatus(), rows }
       return { count: rows.length, status: streamStatus(), text: rows.map(formatStreamLine).join('\n') }
-    },
-  })
-
-  register({
-    name: 'saperm_stream_start',
-    description: '单独开启 AI 可读数据流（需 infer 在跑才有数据）。默认 1000ms 采样，带 ttlSec 时到期自动停止。L0 观察',
-    parameters: {
-      type: 'object',
-      properties: {
-        intervalMs: { type: 'integer', description: '采样间隔毫秒（默认 1000，范围 200-10000）' },
-        ttlSec: { type: 'integer', description: '无操作自动停止秒数（可选）' },
-      },
-    },
-    execute: async (args) => {
-      const st = startStream({ intervalMs: args.intervalMs || 1000 })
-      if (args.ttlSec) { try { armAutoCleanup(args.ttlSec) } catch {} }
-      return { running: !!st.timer, intervalMs: st.intervalMs, file: streamLatest() }
-    },
-  })
-
-  register({
-    name: 'saperm_stream_stop',
-    description: '停止 AI 可读数据流（saperm_infer_stop 会自动停止，通常无需手动调用）。L0 观察',
-    parameters: empty,
-    execute: async () => {
-      const summary = stopStream()
-      return { stopped: true, ...(summary || {}), file: streamLatest() }
-    },
-  })
-
-  register({
-    name: 'saperm_infer_stop',
-    description: '停止逐帧实时识别（同时清理注入轮询定时器）。L0 观察，无需审批',
-    parameters: {
-      type: 'object',
-      properties: {
-        keepOverlay: { type: 'boolean', description: '是否保留注意力小窗（默认 false 自动关闭）' },
-      },
-    },
-    execute: async (args) => {
-      stopInject('infer')
-      stopStream()
-      state.obsConfig = null
-      const r = await helperCall('infer_stop', {})
-      releaseHold('obs')
-      state.obsMode = null
-      let overlayClosed = false
-      if (!args || !args.keepOverlay) {
-        try { await helperCall('overlay_close', {}) } catch {}
-        if (state.autoWatch) { state.autoWatch = false; try { await helperCall('watch_stop', {}) } catch {}; releaseHold('watch') }
-        state.overlayOpen = false
-        overlayClosed = true
-      }
-      clearAutoCleanupIfIdle()
-      return { ...r, injection: injectSummary(state.inferInject), ...(overlayClosed ? { overlayClosed: true } : {}) }
     },
   })
 

@@ -1,5 +1,28 @@
 # Changelog (dsh-screen-attention)
 
+## v1.19.0 (2026-11-13) — 全组整合：61 → 49
+
+### 合并清单
+| 组 | 原 | 合并后 | action |
+|---|---|---|---|
+| watch | 6 | `saperm_watch` | start / stop / status / link / unlink / focus |
+| stream | 3 | `saperm_stream` | read / start / stop |
+| overlay | 3 | `saperm_overlay` | open / close / set |
+| interpret | 3 | `saperm_interpret` | start / status / stop |
+| infer | 3 | `saperm_infer` | start / status / stop |
+
+外加上一提交的 `saperm_look`。净变化：61 − 16 旧工具 + 5 合并工具 + 1 look = **49**。
+
+### 验证
+```text
+node --check            通过
+真实 ctx 跑 apply        49 个工具全部注册成功
+```
+
+### 已知限制
+热重载只替换模块，**不刷新 DSH 工具注册表**：旧名消失、新名报 `unknown tool`。
+必须重启 DSH（`taskkill /IM node.exe /F` → 等 4 秒 → `run-dsh.bat`）才能让 49 工具表生效。
+
 ## v1.18.0 (2026-11-13) — 工具整合 + 联动入口
 
 ### 一、联动：新增 `saperm_look`
