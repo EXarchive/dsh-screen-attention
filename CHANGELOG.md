@@ -1,5 +1,29 @@
 # Changelog (dsh-screen-attention)
 
+## v1.20.2 (2026-11-13) — 修复 saperm_see 文字坐标丢失
+
+### 问题
+`saperm_see` 返回的文字全部 `x/y/w/h = 0`，无法定位。
+
+### 根因
+helper 的 `ocr_file` 返回结构是 `{ text, rect:{x,y,w,h}, score }`，
+而 `saperm_see` 直接读了 `it.x / it.y / it.w / it.h` —— 取到 undefined，兜底成 0。
+
+```diff
+- .map((it) => ({ text: it.text, x: dx + (it.x || 0), y: dy + (it.y || 0), w: it.w || 0, h: it.h || 0 }))
++ .map((it) => { const r = it.rect || {}; return { text: it.text, x: dx + (r.x || 0), y: dy + (r.y || 0), w: r.w || 0, h: r.h || 0 } })
+```
+
+### 同时删除
+`saperm_windows`（已被 `saperm_window({action:'list'})` 完全覆盖）→ 46 → 45。
+
+### 内置运行时验收
+| 工具 | 耗时 | 结果 |
+|---|---|---|
+| `saperm_vlm` 冷 | 9.8s | 正确描述画面 |
+| `saperm_vlm` 热 | **850ms / 903ms** | `within2s=true` |
+| `saperm_look` | **1026ms** | `shown=true` `subtitleLen=70` |
+
 ## v1.20.1 (2026-11-13) — 内置 VLM 运行时打通
 
 ### 落地

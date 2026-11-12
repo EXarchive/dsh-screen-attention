@@ -2089,15 +2089,6 @@ export function apply(ctx) {
     },
   })
 
-  register({
-    name: 'saperm_windows',
-    description: '列出可见窗口（标题/类名/矩形/pid/前台标志）。观察类，无需审批；用于找 Excel、资源管理器等目标窗口',
-    parameters: empty,
-    execute: async () => {
-      const r = await helperCall('windows', {})
-      return { windows: (r && r.windows) || [] }
-    },
-  })
 
   // ===== Excel 录入组合工具（F5 GoTo + 写入 + 剪贴板回读） =====
   async function excelFocus(args) {
@@ -2341,7 +2332,8 @@ export function apply(ctx) {
           stages.scale = effScale
           const dx = rect ? rect.x : 0, dy = rect ? rect.y : 0
           texts = ((o && o.items) || []).slice(0, clampInt(args.maxTexts, 80, 1, 200))
-            .map((it) => ({ text: it.text, x: dx + (it.x || 0), y: dy + (it.y || 0), w: it.w || 0, h: it.h || 0 }))
+            // helper 的 ocr_file 返回 { text, rect:{x,y,w,h}, score }，不能直接读 it.x
+            .map((it) => { const r = it.rect || {}; return { text: it.text, x: dx + (r.x || 0), y: dy + (r.y || 0), w: r.w || 0, h: r.h || 0 } })
         } catch (e) { stages.ocrError = ((e && e.message) || String(e)).slice(0, 80) }
         stages.ocr = Date.now() - tOcr
       }
