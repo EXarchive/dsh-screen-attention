@@ -1,5 +1,45 @@
 # Changelog (dsh-screen-attention)
 
+## v1.18.0 (2026-11-13) — 工具整合 + 联动入口
+
+### 一、联动：新增 `saperm_look`
+一次调用完成「抓画面 → 本地 VLM 理解 → 字幕推浮窗」三步，调用方不必手动串。
+
+```js
+saperm_look({ hwnd?, x?,y?,w?,h?, prompt?, show?, speak?, maxTokens? })
+// → { text, totalMs, shotMs, vlmMs, tokens, shown, subtitleLen, within2s }
+```
+
+内部串联：`window_capture`/`screenshot` → Ollama `/api/generate` → `overlay_set({ subtitle })`。
+`show:false` 可只取描述不推浮窗；`speak:true` 同时走 TTS。
+
+### 二、整合：`watch_*` 六个变一个
+| 已移除 | 替代 |
+|---|---|
+| `saperm_watch_start` | `saperm_watch({ action:'start' })` |
+| `saperm_watch_stop` | `saperm_watch({ action:'stop' })` |
+| `saperm_watch_status` | `saperm_watch({ action:'status' })` |
+| `saperm_watch_link` | `saperm_watch({ action:'link' })` |
+| `saperm_watch_unlink` | `saperm_watch({ action:'unlink' })` |
+| `saperm_watch_focus` | `saperm_watch({ action:'focus', clear? })` |
+
+参数合并为统一 schema（`intervalMs` / `ttlSec` / `keepOverlay` / `wake` / `shot` / `focus` / `clear`）。
+
+### 三、结果
+```text
+工具数 61 → 57（-6 watch_* +1 saperm_watch +1 saperm_look）
+源码声明 57 = 运行时加载 57（实测一致，无悬空）
+```
+
+### 四、当前状态
+| 工具 | 状态 |
+|---|---|
+| `saperm_watch` | ✅ 已加载可用 |
+| `saperm_look` | ⚪ 已加载，但 `fetch failed` —— 依赖的 Ollama 环境已不存在 |
+| `saperm_vlm` | ⚪ 同上 |
+
+`saperm_look` / `saperm_vlm` 要恢复需重装 Ollama + `qwen2.5vl:3b`（约 4.8GB）。
+
 ## v1.17.0 (2026-11-07) — 正式注册：本地视觉理解 + 同框字幕
 
 ### 新增 `saperm_vlm`（正式可用）

@@ -1681,54 +1681,6 @@ export function apply(ctx) {
   })
 
   register({
-    name: 'saperm_watch_start',
-    description: '启动持续屏幕采集（AI 控频：intervalMs 最小 50ms，默认 1000ms）。采集帧实时显示在小窗上（观察类，无需审批）',
-    parameters: {
-      type: 'object',
-      properties: {
-        intervalMs: { type: 'integer', description: '采集间隔毫秒（默认 1000，最小 50）' },
-        ttlSec: { type: 'integer', description: '无操作自动关闭秒数（默认 120 秒，到期自动停止观察并关闭小窗）' },
-      },
-    },
-    execute: async (args) => {
-      state.autoWatch = false
-      armAutoCleanup(args.ttlSec || 120)
-      const r = await helperCall('watch_start', { intervalMs: args.intervalMs })
-      if (r && r.watching) {
-        holdHelper('watch')
-        state.watchConfig = { active: true, intervalMs: args.intervalMs || 1000, focus: (state.watchConfig && state.watchConfig.focus) || null }
-      }
-      return r
-    },
-  })
-
-  register({
-    name: 'saperm_watch_stop',
-    description: '停止持续屏幕采集（观察类，无需审批）',
-    parameters: {
-      type: 'object',
-      properties: {
-        keepOverlay: { type: 'boolean', description: '是否保留注意力小窗（默认 false 自动关闭）' },
-      },
-    },
-    execute: async (args) => {
-      state.autoWatch = false
-      state.watchConfig = null
-      const r = await helperCall('watch_stop')
-      releaseHold('watch')
-      let overlayClosed = false
-      if (!args || !args.keepOverlay) {
-        try { await helperCall('overlay_close', {}) } catch {}
-        if (state.autoWatch) { state.autoWatch = false; try { await helperCall('watch_stop', {}) } catch {}; releaseHold('watch') }
-        state.overlayOpen = false
-        overlayClosed = true
-      }
-      clearAutoCleanupIfIdle()
-      return overlayClosed ? { ...(r || {}), overlayClosed: true } : r
-    },
-  })
-
-  register({
     name: 'saperm_observe',
     description: '取当前屏幕变化快照：运动区域坐标、变化率、区域 OCR 识别文本（≤600 字符）。静止时返回 motion=false。屏幕无变化时该工具几乎瞬时返回（观察类，无需审批）',
     parameters: empty,
@@ -1736,59 +1688,6 @@ export function apply(ctx) {
       refreshAutoCleanup()
       return helperCall('watch_snapshot')
     },
-  })
-
-  register({
-    name: 'saperm_watch_link',
-    description: '开启屏幕持续观察并联动：启动 watch（默认 800ms，运动时自动加速到 100ms），屏幕变化时自动把变化摘要注入当前会话——inject 模式不打断对话（默认），wake 模式用 steer 唤醒 AI 立即响应。可选 focus 限定关注区域（如对话窗口），此时以区域内 OCR 文本增量为变化摘要。返回当前运动状态',
-    parameters: {
-      type: 'object',
-      properties: {
-        intervalMs: { type: 'integer', description: '静止时采集间隔毫秒（默认 800，最小 100）' },
-        wake: { type: 'boolean', description: 'true=变化时 steer 唤醒 AI 立即响应；false(默认)=inject 排队不打断' },
-        shot: { type: 'boolean', description: '变化时附带画面（默认 true）——AI 才能真正"看到"变化而不是只读文字摘要；关了更省 token' },
-        focus: { type: 'object', description: '关注区域 {x,y,w,h}（屏幕坐标），限定观察范围（如对话窗口区域，用于感知对话输出）', properties: { x: { type: 'integer' }, y: { type: 'integer' }, w: { type: 'integer' }, h: { type: 'integer' } } },
-      },
-    },
-    execute: async (args) => {
-      const iv = Number.isFinite(args.intervalMs) ? args.intervalMs : 800
-      state.link = true
-      state.linkWake = !!args.wake
-      state.linkShot = args.shot !== false
-      state.autoWatch = false   // 显式启动 → 关闭小窗时不停 watch
-      if (args.focus && Number.isFinite(args.focus.x)) {
-        await helperCall('watch_focus', args.focus)
-      }
-      const r = await helperCall('watch_start', { intervalMs: iv })
-      const st = await helperCall('watch_status')
-      return { ...r, linked: true, wake: state.linkWake, ...(st || {}) }
-    },
-  })
-
-  register({
-    name: 'saperm_watch_focus',
-    description: '设置/清除观察焦点区域：只对指定屏幕区域做 OCR 文本增量感知（如对话窗口——实时察觉 AI 自己输出的对话内容）；clear=true 恢复全屏。观察类，无需审批',
-    parameters: {
-      type: 'object',
-      properties: {
-        x: { type: 'integer', description: '区域左上 x（屏幕坐标）' },
-        y: { type: 'integer', description: '区域左上 y（屏幕坐标）' },
-        w: { type: 'integer', description: '区域宽' },
-        h: { type: 'integer', description: '区域高' },
-        clear: { type: 'boolean', description: 'true=清除焦点，恢复全屏观察' },
-      },
-    },
-    execute: async (args) => {
-      if (args.clear) return helperCall('watch_focus', { clear: true })
-      return helperCall('watch_focus', { x: args.x, y: args.y, w: args.w, h: args.h })
-    },
-  })
-
-  register({
-    name: 'saperm_watch_unlink',
-    description: '关闭屏幕变化自动注入联动（可继续 watch 或停止观察）',
-    parameters: empty,
-    execute: async () => { state.link = false; return { linked: false } },
   })
 
   register({
@@ -2003,16 +1902,6 @@ export function apply(ctx) {
     },
   })
 
-  register({
-    name: 'saperm_watch_status',
-    description: '查看采集与运动状态：是否采集中、采集间隔、是否运动、运动区域（观察类，无需审批）',
-    parameters: empty,
-    execute: async () => {
-      refreshAutoCleanup()
-      const st = await helperCall('watch_status')
-      return { ...(st || {}), linked: state.link, wake: state.linkWake }
-    },
-  })
   register({
     name: 'saperm_stop',
     description: '急停：立即锁定全部鼠标/键盘注入工具（锁操作永远可用，恢复才需用户确认）',
@@ -3011,6 +2900,143 @@ export function apply(ctx) {
         size: { w: ww, h: hh },
         within2s: (Date.now() - t0) <= 2000,
       }
+    },
+  })
+  // ============ 联动入口：一次调用完成「看 → 理解 → 说」 ============
+  // 串起 view/scan + saperm_vlm + overlay_set，调用方不必手动拼三步。
+  register({
+    name: 'saperm_look',
+    description: '看并说出来（联动入口）：抓画面 → 本地 VLM 理解 → 字幕推到浮窗，一次调用完成。默认看全屏，可指定窗口或区域。返回画面描述。L0 观察',
+    parameters: {
+      type: 'object',
+      properties: {
+        hwnd: { type: 'integer', description: '看这个窗口（优先于区域）' },
+        x: { type: 'integer' }, y: { type: 'integer' },
+        w: { type: 'integer' }, h: { type: 'integer' },
+        prompt: { type: 'string', description: '问什么（默认：一句话描述画面内容）' },
+        show: { type: 'boolean', description: '把结果推到浮窗字幕（默认 true）' },
+        speak: { type: 'boolean', description: '同时朗读（默认 false）' },
+        maxTokens: { type: 'integer', description: '最多生成 token（默认 80）' },
+      },
+    },
+    execute: async (args) => {
+      const t0 = Date.now()
+      let b64 = null, ww = 0, hh = 0
+      if (args.hwnd) {
+        const r = await helperCall('window_capture', { hwnd: args.hwnd, maxW: 900 })
+        if (r && r.jpegB64) { b64 = r.jpegB64; ww = r.w; hh = r.h }
+      } else {
+        const g = await helperCall('screenshot', args.x != null
+          ? { x: args.x, y: args.y, w: args.w, h: args.h, maxW: 900 }
+          : { maxW: 900 })
+        if (g && g.jpegB64) { b64 = g.jpegB64; ww = g.w; hh = g.h }
+      }
+      if (!b64) throw new Error('取图失败（窗口无效或截图失败）')
+      const shotMs = Date.now() - t0
+      const res = await fetch(OLLAMA_URL + '/api/generate', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: OLLAMA_MODEL,
+          prompt: args.prompt || '一句话描述这个画面里有什么',
+          images: [b64], stream: false,
+          options: { num_predict: clampInt(args.maxTokens, 80, 16, 400), temperature: 0.2 },
+        }),
+        signal: AbortSignal.timeout(120000),
+      })
+      if (!res.ok) throw new Error('VLM HTTP ' + res.status + '：先确认 ollama serve 在跑')
+      const j = await res.json()
+      const text = String(j.response || '').trim()
+      const vlmMs = Date.now() - t0 - shotMs
+      // 联动：把结果直接变成浮窗字幕（省掉调用方再调一次 overlay_set）
+      let shown = false, subLen = 0
+      if (args.show !== false && text) {
+        try {
+          const region = args.hwnd ? undefined
+            : (args.x != null ? { x: args.x, y: args.y, w: args.w, h: args.h } : undefined)
+          const st = await helperCall('overlay_set', {
+            region, subtitle: text,
+            note: '看并说',
+          })
+          shown = true; subLen = (st && st.subtitleLen) || text.length
+          if (args.speak) { try { await helperCall('say', { text, speak: true, ms: 6000 }) } catch {} }
+        } catch {}
+      }
+      return {
+        text, totalMs: Date.now() - t0, shotMs, vlmMs,
+        tokens: j.eval_count, model: OLLAMA_MODEL,
+        size: { w: ww, h: hh }, shown, subtitleLen: subLen,
+        within2s: (Date.now() - t0) <= 2000,
+      }
+    },
+  })
+  // ============ 观察统一入口（原 watch_start/stop/status/link/unlink/focus 六合一）============
+  // understand=true 时，开启后将 saperm_look 的判断阈值与浮窗字幕联动：由调用方按需串联。
+  register({
+    name: 'saperm_watch',
+    description: '观察控制（统一入口）：action=start 启动采集 | stop 停止 | status 查状态 | link 变化联动注入 | unlink 断开联动 | focus 设焦点区域。比分开的 watch_* 少记 5 个工具名。L0 观察',
+    parameters: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['start', 'stop', 'status', 'link', 'unlink', 'focus'], description: '操作类型' },
+        intervalMs: { type: 'integer', description: 'start/link 用：采集间隔毫秒' },
+        ttlSec: { type: 'integer', description: 'start 用：无操作自动关闭秒数（默认 120）' },
+        keepOverlay: { type: 'boolean', description: 'stop 用：是否保留小窗（默认关）' },
+        wake: { type: 'boolean', description: 'link 用：true=steer 唤醒，false=inject 排队' },
+        shot: { type: 'boolean', description: 'link 用：变化时附带画面（默认 true）' },
+        focus: { type: 'object', description: 'focus/link 用：关注区域', properties: { x: { type: 'integer' }, y: { type: 'integer' }, w: { type: 'integer' }, h: { type: 'integer' } } },
+        x: { type: 'integer' }, y: { type: 'integer' }, w: { type: 'integer' }, h: { type: 'integer' },
+        clear: { type: 'boolean', description: 'focus 用：清除焦点' },
+      },
+      required: ['action'],
+    },
+    execute: async (args) => {
+      const act = String(args.action || '')
+      if (act === 'start') {
+        state.autoWatch = false
+        armAutoCleanup(args.ttlSec || 120)
+        const r = await helperCall('watch_start', { intervalMs: args.intervalMs })
+        if (r && r.watching) {
+          holdHelper('watch')
+          state.watchConfig = { active: true, intervalMs: args.intervalMs || 1000, focus: (state.watchConfig && state.watchConfig.focus) || null }
+        }
+        return r
+      }
+      if (act === 'stop') {
+        state.autoWatch = false
+        state.watchConfig = null
+        const r = await helperCall('watch_stop')
+        releaseHold('watch')
+        let overlayClosed = false
+        if (!args.keepOverlay) {
+          try { await helperCall('overlay_close', {}) } catch {}
+          state.overlayOpen = false
+          overlayClosed = true
+        }
+        clearAutoCleanupIfIdle()
+        return overlayClosed ? { ...(r || {}), overlayClosed: true } : r
+      }
+      if (act === 'status') {
+        refreshAutoCleanup()
+        const st = await helperCall('watch_status')
+        return { ...(st || {}), linked: state.link, wake: state.linkWake }
+      }
+      if (act === 'unlink') { state.link = false; return { linked: false } }
+      if (act === 'focus') {
+        if (args.clear) return helperCall('watch_focus', { clear: true })
+        return helperCall('watch_focus', { x: args.x, y: args.y, w: args.w, h: args.h })
+      }
+      if (act === 'link') {
+        const iv = Number.isFinite(args.intervalMs) ? args.intervalMs : 800
+        state.link = true
+        state.linkWake = !!args.wake
+        state.linkShot = args.shot !== false
+        state.autoWatch = false
+        if (args.focus && Number.isFinite(args.focus.x)) { await helperCall('watch_focus', args.focus) }
+        const r = await helperCall('watch_start', { intervalMs: iv })
+        const st = await helperCall('watch_status')
+        return { ...r, linked: true, wake: state.linkWake, ...(st || {}) }
+      }
+      throw new Error('action 必须是: start | stop | status | link | unlink | focus')
     },
   })
   register({
