@@ -2550,15 +2550,8 @@ export function apply(ctx) {
         const r = await helperCall('interpret_stop', {})
         releaseHold('obs')
         state.obsMode = null
-        let overlayClosed = false
-        if (!args.keepOverlay) {
-          try { await helperCall('overlay_close', {}) } catch {}
-          if (state.autoWatch) { state.autoWatch = false; try { await helperCall('watch_stop', {}) } catch {}; releaseHold('watch') }
-          state.overlayOpen = false
-          overlayClosed = true
-        }
         clearAutoCleanupIfIdle()
-        return { ...r, injection: injectSummary(state.interpretInject), ...(overlayClosed ? { overlayClosed: true } : {}) }
+        return { ...r, injection: injectSummary(state.interpretInject), }
       }
       throw new Error('action 必须是: start | status | stop')
     },
@@ -2623,15 +2616,8 @@ export function apply(ctx) {
         const r = await helperCall('infer_stop', {})
         releaseHold('obs')
         state.obsMode = null
-        let overlayClosed = false
-        if (!args.keepOverlay) {
-          try { await helperCall('overlay_close', {}) } catch {}
-          if (state.autoWatch) { state.autoWatch = false; try { await helperCall('watch_stop', {}) } catch {}; releaseHold('watch') }
-          state.overlayOpen = false
-          overlayClosed = true
-        }
         clearAutoCleanupIfIdle()
-        return { ...r, injection: injectSummary(state.inferInject), ...(overlayClosed ? { overlayClosed: true } : {}) }
+        return { ...r, injection: injectSummary(state.inferInject), }
       }
       throw new Error('action 必须是: start | status | stop')
     },
@@ -2950,14 +2936,8 @@ export function apply(ctx) {
         state.watchConfig = null
         const r = await helperCall('watch_stop')
         releaseHold('watch')
-        let overlayClosed = false
-        if (!args.keepOverlay) {
-          try { await helperCall('overlay_close', {}) } catch {}
-          state.overlayOpen = false
-          overlayClosed = true
-        }
         clearAutoCleanupIfIdle()
-        return overlayClosed ? { ...(r || {}), overlayClosed: true } : r
+        return r
       }
       if (act === 'status') {
         refreshAutoCleanup()

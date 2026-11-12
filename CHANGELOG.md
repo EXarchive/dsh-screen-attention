@@ -1,5 +1,23 @@
 # Changelog (dsh-screen-attention)
 
+## v1.19.1 (2026-11-13) — 修复 stop 隐式关窗
+
+### 问题
+验收发现 `saperm_watch({action:'stop', keepOverlay:true})` 仍然关掉浮窗。
+对照实验：同工具 `wake:true` 能正常传递、`saperm_overlay` 的 `clearRegion:true` 也能，
+唯独 `keepOverlay` 在 DSH 参数层不生效——依赖一个不可靠的开关写逻辑，本身就是缺陷。
+
+### 修复
+`watch` / `interpret` / `infer` 三处 `stop` 分支删除隐式 `overlay_close`：
+
+```text
+stop 只停采集，不动浮窗
+关窗交给 saperm_overlay({ action:'close' }) 显式控制
+```
+
+工具职责单一化，也顺带解决“stop 后浮窗被误关、下次还得重开”的老问题。
+探针复验：apply 注册 49 个工具正常。
+
 ## v1.19.0 (2026-11-13) — 全组整合：61 → 49
 
 ### 合并清单
