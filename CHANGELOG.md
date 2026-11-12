@@ -1,5 +1,31 @@
 # Changelog (dsh-screen-attention)
 
+## v1.20.1 (2026-11-13) — 内置 VLM 运行时打通
+
+### 落地
+```text
+vendor/ollama/ollama.exe     39MB   免安装版（解压自 ollama-windows-amd64.zip）
+vendor/models/               2.98GB qwen2.5vl:3b
+vendor/run-ollama.cmd               插件自动生成，含 OLLAMA_MODELS/OLLAMA_HOST
+vendor/setup-runtime.ps1            一键装配（解压 + pull）
+```
+
+### 实测
+| 阶段 | 耗时 | 结果 |
+|---|---|---|
+| 冷启动（首次加载模型） | 73.3s | 正确识别网页与 URL |
+| 热启动 第 1 次 | **847ms** | “华为云认证页面，显示了用户已通过的多个认证项目” |
+| 热启动 第 2 次 | **161ms** | 同上（前缀缓存命中） |
+
+### 自动管理
+- `saperm_vlm` / `saperm_look` 调用前 `ensureOllama()`：探测 11434 → 未运行则拉起内置 exe
+- 用 **WMI Win32_Process.Create** 启动，逃逸 DSH Job Object
+- 模型目录经 `OLLAMA_MODELS` 指向 `vendor/models`，与系统 Ollama 完全隔离
+
+### 踩坑
+`setup-runtime.ps1` 放在 `vendor/` 里却又 `Join-Path $root 'vendor'`，
+导致解压到 `vendor/vendor/ollama/`。**脚本自身所在目录就是 vendor**，已修正。
+
 ## v1.20.0 (2026-11-13) — 视觉组统一为 saperm_see（49 → 46）
 
 ### 新入口
