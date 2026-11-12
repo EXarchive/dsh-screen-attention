@@ -1,5 +1,27 @@
 # Changelog (dsh-screen-attention)
 
+## v1.20.4 (2026-11-13) — 环境自适应
+
+### 一、不要按自己的卡删 CUDA
+我曾按本机 RTX 5070 Ti（Blackwell）删掉 `cuda_v12`，**这是错的**：
+RTX 20/30/40 系全靠它，删了会让他们的卡静默掉回 CPU（慢 10-20 倍）。
+已从原始 zip 恢复（14 文件 / 1134MB）。两套都保留，由 ollama 自行探测。
+
+### 二、ensureOllama 三重环境检测
+```text
+非 Windows        → 提示设置 SA_OLLAMA_URL（内置 exe 不可用）
+vendor 缺失        → 给出装配命令，不再静默失败
+服务在但缺模型     → 提示 ollama pull <model>
+```
+错误信息统一带 `｜ 修复：<可复制命令>`，调用方直接照做。
+
+### 三、实测
+```text
+cuda_v13 单独    → 100% GPU (2633MB / 2633MB)
+cuda_v12 恢复后  → vendor 5.1GB，两套齐全
+tokenizer        → 偶发 @@@@ 属 ollama 已知问题，重启即恢复
+```
+
 ## v1.20.3 (2026-11-13) — 生命周期全绑定 + 零控制台
 
 ### 一、运行时全静默（不弹任何控制台）

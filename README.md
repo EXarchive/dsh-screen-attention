@@ -248,3 +248,35 @@ Get-Process ollama | Select-Object Id, Path
 
 > 唯一会出现在用户目录的是 `~/.ollama`（密钥对 + 推荐缓存，约 3 个文件 <3KB）。
 > 这是 ollama 二进制自身的行为，删掉后下次启动会自动重建，不装任何东西。
+## 环境适配
+
+内置运行时按实际环境自适应，不假设「和作者那台一样」：
+
+| 环境 | 行为 |
+|---|---|
+| Windows + vendor 完整 | 自动拉起 `vendor/ollama/ollama.exe`，走内置模型 |
+| Windows + 已有 ollama 在 11434 | 直接复用，不重复启动 |
+| Windows + vendor 缺失 | 报错并给出装配命令，不静默失败 |
+| 服务在跑但缺模型 | 提示 `ollama pull qwen2.5vl:3b` |
+| macOS / Linux | 内置 exe 不可用，提示设置 `SA_OLLAMA_URL` 指向外部实例 |
+
+环境变量：
+
+| 变量 | 作用 |
+|---|---|
+| `SA_OLLAMA_URL` | 覆盖 ollama 地址（默认 `http://127.0.0.1:11434`） |
+| `SA_VLM_MODEL` | 覆盖模型名（默认 `qwen2.5vl:3b`） |
+| `SA_HELPER_EXE` | 覆盖 SaHelper 路径 |
+
+### GPU 后端
+
+`vendor/ollama/lib/ollama/` 同时保留两套 CUDA：
+
+```text
+cuda_v12/   约 1.1GB   RTX 20/30/40 系（Ampere/Ada）
+cuda_v13/   约 0.9GB   RTX 50 系（Blackwell）
+vulkan/     约 40MB    AMD / Intel 核显
+```
+
+**不要按自己显卡删其中一套** —— 删了会让其他用户的卡掉回 CPU。
+ollama 启动时自行探测，选可用的那套。

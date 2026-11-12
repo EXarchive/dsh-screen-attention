@@ -2856,22 +2856,69 @@ export function apply(ctx) {
     } catch { ollamaProbe = { at: now, ok: false }; return false }
   }
 
-  // 用 WMI 创建进程：逃逸 DSH 的 Job Object，否则 DSH 退出时 ollama 被连带杀死
+  async function ollamaModelNames() {
+    try {
+      const r = await fetch(OLLAMA_URL + '/api/tags', { signal: AbortSignal.timeout(2000) })
+      if (!r.ok) return null
+      const j = await r.json()
+      return ((j && j.models) || []).map((m) => String(m.name || ''))
+    } catch { return null }
+  }
+
+  function hasOurModel(names) {
+    if (!names) return null
+    return names.some((n) => n === OLLAMA_MODEL || n.startsWith(OLLAMA_MODEL + ':'))
+  }
+
+  // 环境适配：不同用户的环境差异必须显式处理，不能假设「和我这台一样」
+  //   1) 非 Windows：内置 exe 不可用，交给 SA_OLLAMA_URL 指向外部 ollama
+  //   2) vendor 未装配：给出一行可复制的装配命令，不静默失败
+  //   3) 服务在跑但没有我们的模型：提示怎么拉，而不是让 VLM 报 fetch failed
   async function ensureOllama() {
-    if (await ollamaAlive(false)) return { running: true, started: false, via: 'existing' }
-    if (!existsSync(OLLAMA_EXE)) return { running: false, started: false, reason: 'vendor/ollama/ollama.exe 不存在' }
+    if (process.platform !== 'win32') {
+      if (await ollamaAlive(false)) return { running: true, started: false, via: 'external', platform: process.platform }
+      return {
+        running: false, started: false, platform: process.platform,
+        reason: '内置运行时只支持 Windows；当前平台：' + process.platform,
+        fix: '自行安装 ollama 后设置环境变量 SA_OLLAMA_URL=http://127.0.0.1:11434',
+      }
+    }
+    if (await ollamaAlive(false)) {
+      const models = await ollamaModelNames()
+      const has = hasOurModel(models)
+      return {
+        running: true, started: false, via: 'existing',
+        hasModel: has, models,
+        ...(has ? {} : { reason: 'ollama 在运行但没有模型 ' + OLLAMA_MODEL, fix: 'ollama pull ' + OLLAMA_MODEL }),
+      }
+    }
+    if (!existsSync(OLLAMA_EXE)) {
+      return {
+        running: false, started: false,
+        reason: '内置运行时未装配：vendor/ollama/ollama.exe 不存在',
+        fix: 'powershell -ExecutionPolicy Bypass -File vendor/setup-runtime.ps1',
+        exeExpectedAt: OLLAMA_EXE,
+      }
+    }
     if (!writeOllamaLauncher()) return { running: false, started: false, reason: '无法写启动脚本' }
     try {
-      const { execFile } = await import('node:child_process')
-      // wscript.exe 本身无窗口，再配 windowsHide 才是真正静默
       const ps = 'Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{CommandLine=\'wscript.exe "' + OLLAMA_LAUNCHER + '"\'}'
       await new Promise((res) => execFile('powershell', ['-NoProfile', '-WindowStyle', 'Hidden', '-Command', ps], { timeout: 8000, windowsHide: true }, () => res(null)))
     } catch {}
     for (let i = 0; i < 20; i++) {
       await new Promise((r) => setTimeout(r, 700))
-      if (await ollamaAlive(true)) { hookExitOnce(); return { running: true, started: true, via: 'vendor', waitedMs: (i + 1) * 700 } }
+      if (await ollamaAlive(true)) {
+        hookExitOnce()
+        const models = await ollamaModelNames()
+        const has = hasOurModel(models)
+        return {
+          running: true, started: true, via: 'vendor', waitedMs: (i + 1) * 700,
+          hasModel: has, models,
+          ...(has ? {} : { reason: '内置 ollama 已启动但没有模型 ' + OLLAMA_MODEL, fix: 'ollama pull ' + OLLAMA_MODEL }),
+        }
+      }
     }
-    return { running: false, started: true, reason: '启动后 14 秒仍未就绪' }
+    return { running: false, started: true, reason: '启动后 14 秒仍未就绪', fix: '检查 vendor/ollama 是否被安全软件拦截' }
   }
 
   function ollamaRuntimeInfo() {
@@ -2900,7 +2947,8 @@ export function apply(ctx) {
     },
     execute: async (args) => {
       const _rt = await ensureOllama()
-      if (!_rt.running) throw new Error('VLM 运行时不可用: ' + (_rt.reason || 'ollama 未启动') + '（vendor/ollama 缺失？）')
+      if (!_rt.running) throw new Error('VLM 运行时不可用：' + (_rt.reason || 'ollama 未启动') + (_rt.fix ? ' ｜ 修复：' + _rt.fix : ''))
+      if (_rt.hasModel === false) throw new Error('模型未就绪：' + (_rt.reason || (OLLAMA_MODEL + ' 不在已拉取列表')) + (_rt.fix ? ' ｜ 修复：' + _rt.fix : ''))
       const t0 = Date.now()
       let buf = null, ww = 0, hh = 0
       if (args.hwnd) {
@@ -2957,7 +3005,8 @@ export function apply(ctx) {
     },
     execute: async (args) => {
       const _rt = await ensureOllama()
-      if (!_rt.running) throw new Error('VLM 运行时不可用: ' + (_rt.reason || 'ollama 未启动') + '（vendor/ollama 缺失？）')
+      if (!_rt.running) throw new Error('VLM 运行时不可用：' + (_rt.reason || 'ollama 未启动') + (_rt.fix ? ' ｜ 修复：' + _rt.fix : ''))
+      if (_rt.hasModel === false) throw new Error('模型未就绪：' + (_rt.reason || (OLLAMA_MODEL + ' 不在已拉取列表')) + (_rt.fix ? ' ｜ 修复：' + _rt.fix : ''))
       const t0 = Date.now()
       let b64 = null, ww = 0, hh = 0
       if (args.hwnd) {
