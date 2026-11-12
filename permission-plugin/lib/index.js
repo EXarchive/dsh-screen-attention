@@ -2272,61 +2272,80 @@ export function apply(ctx) {
   })
 
   register({
-    name: 'saperm_scan',
-    description: '一次识别调用完成多路感知（2s 预算内）：只截一张图 → OCR 文字+坐标，可选 scene 场景 / objects 物体，返回合并结果与分阶段耗时 elapsedMs/withinBudget。默认扫前台窗口（快 3~10 倍），full=true 全屏。观察类，无需审批',
+    name: 'saperm_see',
+    description: '看一次（统一入口，替代 scan/detect/scene/ocr_file）：一张图同时出【文字+坐标】【物体】【场景】【运动变化】，默认自动开浮窗并写讲解字幕，可强制推送到会话。默认看前台窗口（快 3~10 倍），full=true 全屏，path=对图片文件识别。L0 观察',
     parameters: {
       type: 'object',
       properties: {
+        path: { type: 'string', description: '对图片文件识别（优先于屏幕截图）' },
+        hwnd: { type: 'integer', description: '看指定窗口' },
         x: { type: 'integer' }, y: { type: 'integer' }, w: { type: 'integer' }, h: { type: 'integer' },
-        full: { type: 'boolean', description: 'true=整屏识别；默认只扫前台窗口' },
-        scene: { type: 'boolean', description: '附带 CLIP 场景分类（约 +50ms）' },
-        objects: { type: 'boolean', description: '附带 YOLO 物体检测（约 +100~500ms）' },
-        maxTexts: { type: 'integer', description: '返回文字条数（默认 80，最大 200）' },
-        scale: { type: 'number', description: 'OCR 放大倍数（默认 1）' },
-        mode: { type: 'string', description: 'local（默认，只本地识别，0 token）/ vision（额外给出可直传的画面 + token 估算）/ auto（按环境探测结果自动选）' },
+        full: { type: 'boolean', description: 'true=整屏；默认前台窗口' },
+        text: { type: 'boolean', description: 'OCR 文字（默认 true）' },
+        objects: { type: 'boolean', description: '物体检测（默认 false，+100~500ms）' },
+        scene: { type: 'boolean', description: '场景分类（默认 false，+50ms）' },
+        motion: { type: 'boolean', description: '附带屏幕运动变化（默认 false）' },
+        show: { type: 'boolean', description: '自动开浮窗并写字幕（默认 true）' },
+        inject: { type: 'boolean', description: '把结果强制推送到当前会话（默认 false）' },
+        note: { type: 'string', description: '浮窗底部短标签' },
+        maxTexts: { type: 'integer', description: '返回文字条数（默认 80）' },
+        scale: { type: 'number', description: 'OCR 放大倍数' },
+        mode: { type: 'string', description: 'local（默认）/ vision / auto' },
       },
     },
     execute: async (args) => {
       const t0 = Date.now()
-      const budget = 1900
       const stages = {}
       let rect = null
-      const rgLoc = await resolveObserveRect(args)
-      if (rgLoc) rect = { x: rgLoc.x, y: rgLoc.y, w: rgLoc.w, h: rgLoc.h }
-      else if (!args.full) {
-        try {
-          const w = await helperCall('windows')
-          const fg = ((w && w.windows) || []).find((x) => x.fg)
-          if (fg && fg.w >= 160 && fg.h >= 120) rect = { x: fg.x, y: fg.y, w: fg.w, h: fg.h }
-        } catch {}
-      }
-      // 方案选择必须**先于截图**：vision 模式要把图直接缩到 1260（42×30 = 591 token），
-      // 否则按原分辨率 2582×1550 出图会撞 1024 token 上限，白烧一倍。
+      let path = null
+      let imgW = 0, imgH = 0
       const wantMode = String(args.mode || 'local')
       let profile = null
       let wantImage = wantMode === 'vision'
-      if (wantMode === 'auto') {
-        profile = await getProfile(false)
-        wantImage = profile.recommended !== 'local'
+      if (wantMode === 'auto') { profile = await getProfile(false); wantImage = profile.recommended !== 'local' }
+
+      if (args.path) {
+        path = args.path
+      } else {
+        const rgLoc = args.hwnd ? null : await resolveObserveRect(args)
+        if (rgLoc) rect = { x: rgLoc.x, y: rgLoc.y, w: rgLoc.w, h: rgLoc.h }
+        else if (!args.full) {
+          try {
+            const w = await helperCall('windows')
+            const fg = ((w && w.windows) || []).find((x) => x.fg)
+            if (fg && fg.w >= 160 && fg.h >= 120) rect = { x: fg.x, y: fg.y, w: fg.w, h: fg.h }
+          } catch {}
+        }
+        const tShot = Date.now()
+        let shot
+        if (args.hwnd) {
+          shot = await helperCall('window_capture', { hwnd: args.hwnd, maxW: wantImage ? snapWidth(1260) : 1600 })
+          if (shot && shot.rect) rect = shot.rect
+        } else {
+          const shotArgs = rect ? { ...rect } : {}
+          if (wantImage) shotArgs.maxW = snapWidth(1260)
+          shot = await helperCall('screenshot', shotArgs)
+        }
+        path = saveShot(shot.jpegB64, 'see')
+        imgW = shot.bw || shot.w; imgH = shot.bh || shot.h
+        stages.shot = Date.now() - tShot
       }
-      const tShot = Date.now()
-      const shotArgs = rect ? { ...rect } : {}
-      if (wantImage) shotArgs.maxW = snapWidth(1260)
-      const shot = await helperCall('screenshot', shotArgs)
-      const path = saveShot(shot.jpegB64, 'scan')
-      const imgW = shot.bw || shot.w, imgH = shot.bh || shot.h
-      stages.shot = Date.now() - tShot
-      const tOcr = Date.now()
+
+      // 文字
       let texts = []
-      try {
-        const effScale = pickScale(rect, args.scale)
-        const o = await helperCall('ocr_file', { path, scale: effScale })
-        stages.scale = effScale
-        const dx = rect ? rect.x : 0, dy = rect ? rect.y : 0
-        texts = ((o && o.items) || []).slice(0, clampInt(args.maxTexts, 80, 1, 200))
-          .map((it) => ({ text: it.text, x: dx + (it.x || 0), y: dy + (it.y || 0), w: it.w || 0, h: it.h || 0 }))
-      } catch (e) { stages.ocrError = ((e && e.message) || String(e)).slice(0, 80) }
-      stages.ocr = Date.now() - tOcr
+      if (args.text !== false) {
+        const tOcr = Date.now()
+        try {
+          const effScale = pickScale(rect, args.scale)
+          const o = await helperCall('ocr_file', { path, scale: effScale })
+          stages.scale = effScale
+          const dx = rect ? rect.x : 0, dy = rect ? rect.y : 0
+          texts = ((o && o.items) || []).slice(0, clampInt(args.maxTexts, 80, 1, 200))
+            .map((it) => ({ text: it.text, x: dx + (it.x || 0), y: dy + (it.y || 0), w: it.w || 0, h: it.h || 0 }))
+        } catch (e) { stages.ocrError = ((e && e.message) || String(e)).slice(0, 80) }
+        stages.ocr = Date.now() - tOcr
+      }
+      // 场景 / 物体
       let scene = null, objects = null
       if (args.scene) {
         const t = Date.now()
@@ -2338,31 +2357,51 @@ export function apply(ctx) {
         try { const r = await helperCall('detect', { path, model: 'n' }); objects = { count: r.count, items: (r.items || []).slice(0, 10) } } catch {}
         stages.detect = Date.now() - t
       }
+      // 运动
+      let motion = null
+      if (args.motion) {
+        const t = Date.now()
+        try {
+          refreshAutoCleanup()
+          const snap = await helperCall('watch_snapshot')
+          motion = { motion: !!snap.motion, ratio: snap.ratio || 0, rect: snap.rect || null }
+        } catch {}
+        stages.motion = Date.now() - t
+      }
+
+      // 汇总成一句人话
+      const parts = []
+      if (scene && scene.top && scene.top[0]) parts.push(String(scene.top[0].label || scene.top[0].name || ''))
+      if (objects && objects.count) parts.push(objects.count + ' 个物体')
+      if (motion && motion.motion) parts.push('画面在动')
+      if (texts.length) parts.push('文字：' + texts.slice(0, 5).map((t) => t.text).filter(Boolean).join(' / '))
+      const summary = parts.filter(Boolean).join(' · ') || '这幅画面里没识别到文字或明显物体'
+
+      // 自动开浮窗 + 写字幕
+      let shown = false, subLen = 0
+      if (args.show !== false) {
+        try {
+          await helperCall('overlay_open', {})
+          const st = await helperCall('overlay_set', { region: rect || undefined, subtitle: summary, note: args.note || '看一次' })
+          shown = true; subLen = (st && st.subtitleLen) || summary.length
+        } catch {}
+      }
+      // 强制推送到会话
+      let injected = false
+      if (args.inject) {
+        try { await injectToSession('[看一次] ' + summary, null); injected = true } catch {}
+      }
+
       const elapsedMs = Date.now() - t0
       return {
-        elapsedMs, withinBudget: elapsedMs < budget, budgetMs: budget, region: rect,
+        summary, elapsedMs, withinBudget: elapsedMs < 1900, region: rect,
+        texts: { count: texts.length, items: texts },
+        objects, scene, motion,
         mode: wantImage ? 'vision' : 'local',
         recommended: profile ? profile.recommended : undefined,
-        local: { count: texts.length, texts, scene, objects, stages },
         image: wantImage ? { path, w: imgW, h: imgH, tokens: imageTokens(imgW, imgH) } : null,
+        shown, subtitleLen: subLen, injected, stages,
       }
-    },
-  })
-
-  register({
-    name: 'saperm_ocr_file',
-    description: '对图片文件做 PaddleOCR（本地，中文/数字）：返回文字+坐标。用于从文件夹数据图片提取数据。L0 观察，无需审批',
-    parameters: {
-      type: 'object',
-      properties: {
-        path: { type: 'string', description: '图片文件绝对路径' },
-        scale: { type: 'number', description: '放大倍数（小字用 2，默认 1）' },
-      },
-      required: ['path'],
-    },
-    execute: async (args) => {
-      const r = await helperCall('ocr_file', { path: args.path, scale: args.scale || 1 })
-      return { file: args.path, imageW: r.imageW, imageH: r.imageH, ms: r.ms, items: (r.items || []).map(h => ({ text: h.text, x: h.rect.x, y: h.rect.y, w: h.rect.w, h: h.rect.h, score: h.score })) }
     },
   })
 
@@ -2670,38 +2709,6 @@ export function apply(ctx) {
       rows = rows.slice(-limit)
       if (String(args.format || 'lines') === 'json') return { count: rows.length, status: streamStatus(), rows }
       return { count: rows.length, status: streamStatus(), text: rows.map(formatStreamLine).join('\n') }
-    },
-  })
-
-  register({
-    name: 'saperm_detect',
-    description: '目标检测（YOLOv8n，本地）：返回画面中的物体（中英文标签+置信度+坐标）。不传 path=当前屏幕；传 path=图片文件。L0 观察，无需审批',
-    parameters: {
-      type: 'object',
-      properties: {
-        path: { type: 'string', description: '图片文件路径（可选，缺省=当前屏幕）' },
-        model: { type: 'string', description: '检测模型：n=快速(默认) / m=精确' },
-      },
-    },
-    execute: async (args) => {
-      const r = await helperCall('detect', Object.assign(args.path ? { path: args.path } : {}, args.model ? { model: args.model } : {}))
-      return { count: r.count, summary: r.summary, items: r.items, ms: r.ms, backend: r.backend, engine: r.engine, rect: r.rect }
-    },
-  })
-
-  register({
-    name: 'saperm_scene',
-    description: '场景语义分类（Chinese-CLIP 零样本，含 ACG 标签：二次元游戏/视觉小说/VTuber/动漫等）：返回 top 标签+分数。不传 path=当前屏幕。L0 观察',
-    parameters: {
-      type: 'object',
-      properties: {
-        path: { type: 'string', description: '图片路径（可选，缺省=当前屏幕）' },
-        topK: { type: 'integer', description: '返回标签数（默认 5）' },
-      },
-    },
-    execute: async (args) => {
-      const r = await helperCall('scene', { path: args.path, topK: args.topK || 5 })
-      return { top: r.top, labels: r.labels, ms: r.ms, backend: r.backend, rect: r.rect }
     },
   })
 

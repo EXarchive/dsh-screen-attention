@@ -1,5 +1,33 @@
 # Changelog (dsh-screen-attention)
 
+## v1.20.0 (2026-11-13) — 视觉组统一为 saperm_see（49 → 46）
+
+### 新入口
+`saperm_see` 一次调用完成 **文字 + 物体 + 场景 + 运动** 四路感知，并**自动开浮窗、写字幕**，可 `inject:true` 强制推送到会话。
+
+```js
+saperm_see({ path?, hwnd?, x,y,w,h?, full?,
+            text?, objects?, scene?, motion?,
+            show?: true, inject?: false, note? })
+// → { summary, texts, objects, scene, motion, shown, subtitleLen, injected }
+```
+
+### 合并
+| 已删除 | 并入 |
+|---|---|
+| `saperm_scan` | `saperm_see`（text 默认开） |
+| `saperm_detect` | `saperm_see({ objects:true })` |
+| `saperm_scene` | `saperm_see({ scene:true })` |
+| `saperm_ocr_file` | `saperm_see({ path })` |
+
+净变化：49 − 4 + 1 = **46**。
+
+### 踩坑记录（重要）
+按「register 块边界」批量删除会**连带吃掉块之间的常量定义**：
+删 `ocr_file` 时带走了 `FILL_DIR`/`FILL_ACTIONS`，删 `scene` 时带走了 `CHAR_ACTIONS`，
+表现为 `X is not defined` 导致整个 apply 失败、所有工具消失。
+**规则**：批量删 register 块后，必须用真实 ctx 跑一次 apply 探针，不能只靠 `node --check`。
+
 ## v1.19.1 (2026-11-13) — 修复 stop 隐式关窗
 
 ### 问题
