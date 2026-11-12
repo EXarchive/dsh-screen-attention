@@ -2788,6 +2788,70 @@ export function apply(ctx) {
   // 这是唯一能给「画面内容」而非「文字/标签」的本地通道。
   const OLLAMA_URL = process.env.SA_OLLAMA_URL || 'http://127.0.0.1:11434'
   const OLLAMA_MODEL = process.env.SA_VLM_MODEL || 'qwen2.5vl:3b'
+
+  // ===== 内置运行时（vendor/）：插件自带 ollama.exe + 模型，不依赖外部安装 =====
+  const VENDOR_DIR = join(PACKAGE_ROOT, '..', 'vendor')
+  const OLLAMA_DIR = join(VENDOR_DIR, 'ollama')
+  const OLLAMA_MODELS_DIR = join(VENDOR_DIR, 'models')
+  const OLLAMA_EXE = join(OLLAMA_DIR, 'ollama.exe')
+  const OLLAMA_LAUNCHER = join(VENDOR_DIR, 'run-ollama.cmd')
+
+  function writeOllamaLauncher() {
+    try {
+      if (!existsSync(OLLAMA_EXE)) return false
+      mkdirSync(VENDOR_DIR, { recursive: true })
+      // .cmd 必须纯 ASCII（cmd.exe 按 ANSI 读，中文会拆成命令）
+      const bat = [
+        '@echo off',
+        'set "OLLAMA_MODELS=' + OLLAMA_MODELS_DIR + '"',
+        'set "OLLAMA_HOST=127.0.0.1:11434"',
+        'set "OLLAMA_KEEP_ALIVE=30m"',
+        'start "" /B "' + OLLAMA_EXE + '" serve',
+      ].join('\r\n')
+      writeFileSync(OLLAMA_LAUNCHER, bat, 'ascii')
+      return true
+    } catch { return false }
+  }
+
+  let ollamaProbe = { at: 0, ok: false }
+  async function ollamaAlive(force) {
+    const now = Date.now()
+    if (!force && ollamaProbe.ok && now - ollamaProbe.at < 5000) return true
+    try {
+      const r = await fetch(OLLAMA_URL + '/api/tags', { signal: AbortSignal.timeout(1500) })
+      ollamaProbe = { at: now, ok: r.ok }
+      return r.ok
+    } catch { ollamaProbe = { at: now, ok: false }; return false }
+  }
+
+  // 用 WMI 创建进程：逃逸 DSH 的 Job Object，否则 DSH 退出时 ollama 被连带杀死
+  async function ensureOllama() {
+    if (await ollamaAlive(false)) return { running: true, started: false, via: 'existing' }
+    if (!existsSync(OLLAMA_EXE)) return { running: false, started: false, reason: 'vendor/ollama/ollama.exe 不存在' }
+    if (!writeOllamaLauncher()) return { running: false, started: false, reason: '无法写启动脚本' }
+    try {
+      const { execFile } = await import('node:child_process')
+      const ps = 'Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{CommandLine=\'"' + OLLAMA_LAUNCHER + '"\'}'
+      await new Promise((res) => execFile('powershell', ['-NoProfile', '-Command', ps], { timeout: 8000 }, () => res(null)))
+    } catch {}
+    for (let i = 0; i < 20; i++) {
+      await new Promise((r) => setTimeout(r, 700))
+      if (await ollamaAlive(true)) return { running: true, started: true, via: 'vendor', waitedMs: (i + 1) * 700 }
+    }
+    return { running: false, started: true, reason: '启动后 14 秒仍未就绪' }
+  }
+
+  function ollamaRuntimeInfo() {
+    return {
+      url: OLLAMA_URL,
+      model: OLLAMA_MODEL,
+      exePresent: existsSync(OLLAMA_EXE),
+      modelsDir: OLLAMA_MODELS_DIR,
+      modelsDirPresent: existsSync(OLLAMA_MODELS_DIR),
+      launcher: OLLAMA_LAUNCHER,
+      alive: !!ollamaProbe.ok,
+    }
+  }
   register({
     name: 'saperm_vlm',
     description: '本地视觉理解（Qwen2.5-VL）：直接问画面里有什么，返回中文描述。热启动约 0.8 秒。可指定窗口(hwnd)或屏幕区域，不给则全屏。与 saperm_scan 不同——它给的是「画面内容」不是「文字/标签」。L0 观察',
@@ -2802,6 +2866,8 @@ export function apply(ctx) {
       },
     },
     execute: async (args) => {
+      const _rt = await ensureOllama()
+      if (!_rt.running) throw new Error('VLM 运行时不可用: ' + (_rt.reason || 'ollama 未启动') + '（vendor/ollama 缺失？）')
       const t0 = Date.now()
       let buf = null, ww = 0, hh = 0
       if (args.hwnd) {
@@ -2857,6 +2923,8 @@ export function apply(ctx) {
       },
     },
     execute: async (args) => {
+      const _rt = await ensureOllama()
+      if (!_rt.running) throw new Error('VLM 运行时不可用: ' + (_rt.reason || 'ollama 未启动') + '（vendor/ollama 缺失？）')
       const t0 = Date.now()
       let b64 = null, ww = 0, hh = 0
       if (args.hwnd) {

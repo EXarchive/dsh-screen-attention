@@ -202,3 +202,31 @@ saperm_health {}
 - **运行性能**：
   - 单模式 Infer（含 OCR、YOLOv8m、CLIP 场景、动漫脸）：**6.7 ~ 6.9 fps**（DirectML 环境）。
   - 静止画面自适应降频模式：CPU 占用率从 80% 降至 <10%。
+## 内置运行时（VLM，可选）
+
+`saperm_vlm` / `saperm_look` 需要本地视觉模型。默认走**插件自带的 vendor/ 运行时**，不依赖系统安装 Ollama。
+
+```text
+vendor/
+  ollama/ollama.exe      ollama 免安装版
+  models/                qwen2.5vl:3b（约 3.2GB）
+  run-ollama.cmd         插件自动生成，启动时用
+  setup-runtime.ps1      一键装配（解压 + 拉模型）
+```
+
+### 装配
+
+```powershell
+# 1) 下载免安装包（约 1.4GB）
+Invoke-WebRequest -Uri 'https://github.com/ollama/ollama/releases/latest/download/ollama-windows-amd64.zip' -OutFile "$env:TEMP\ollama-win.zip" -Proxy http://127.0.0.1:7891
+
+# 2) 解压 + 拉模型（约 3.2GB）
+powershell -ExecutionPolicy Bypass -File vendor/setup-runtime.ps1
+```
+
+### 自动管理
+
+- 调用 `saperm_vlm` / `saperm_look` 前自动探测 11434，未运行则拉起 `vendor/ollama/ollama.exe serve`
+- 用 **WMI 创建进程**启动，逃逸 DSH 的 Job Object（否则 DSH 退出会连带杀死）
+- 模型目录通过 `OLLAMA_MODELS` 指向 `vendor/models`，与系统安装的 Ollama 完全隔离
+- `vendor/` 已加入 `.gitignore`（体积原因），克隆后跑一次 `setup-runtime.ps1` 即可重建
