@@ -230,3 +230,21 @@ powershell -ExecutionPolicy Bypass -File vendor/setup-runtime.ps1
 - 用 **WMI 创建进程**启动，逃逸 DSH 的 Job Object（否则 DSH 退出会连带杀死）
 - 模型目录通过 `OLLAMA_MODELS` 指向 `vendor/models`，与系统安装的 Ollama 完全隔离
 - `vendor/` 已加入 `.gitignore`（体积原因），克隆后跑一次 `setup-runtime.ps1` 即可重建
+### 与系统彻底隔离（实测）
+
+```text
+注册表卸载项    无
+Windows 服务    无
+开始菜单快捷方式 无
+环境变量        无
+PATH            无 ollama 条目
+```
+
+运行时 100% 来自 `vendor/ollama/ollama.exe`，进程路径可核：
+```powershell
+Get-Process ollama | Select-Object Id, Path
+# -> ...\dsh-screen-attention\vendor\ollama\ollama.exe
+```
+
+> 唯一会出现在用户目录的是 `~/.ollama`（密钥对 + 推荐缓存，约 3 个文件 <3KB）。
+> 这是 ollama 二进制自身的行为，删掉后下次启动会自动重建，不装任何东西。
