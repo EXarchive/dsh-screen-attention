@@ -2921,6 +2921,30 @@ export function apply(ctx) {
     return { running: false, started: true, reason: '启动后 14 秒仍未就绪', fix: '检查 vendor/ollama 是否被安全软件拦截' }
   }
 
+  // ollama 0.40 + qwen2.5vl 有个已知退化：返回全 "@@@@"（tokenizer 状态坏了）。
+  // 现象是模型还在、服务还活、只有输出坏了；唯一可靠解法是重启 serve。
+  function looksBroken(text) {
+    const t = String(text || '').trim()
+    if (!t) return true
+    if (/^[@\s]+$/.test(t)) return true
+    const ats = (t.match(/@/g) || []).length
+    return ats / t.length > 0.4
+  }
+
+  let _restartAt = 0
+  async function restartOllama() {
+    const now = Date.now()
+    if (now - _restartAt < 60000) return { skipped: true, reason: '60 秒内已重启过，避免抖动' }
+    _restartAt = now
+    try {
+      for (const pid of ollamaPidsSync()) {
+        try { execFileSync('taskkill', ['/PID', String(pid), '/F'], { windowsHide: true, timeout: 6000 }) } catch {}
+      }
+    } catch {}
+    await new Promise((r) => setTimeout(r, 1500))
+    ollamaProbe = { at: 0, ok: false }
+    return ensureOllama()
+  }
   function ollamaRuntimeInfo() {
     return {
       url: OLLAMA_URL,
@@ -2969,20 +2993,30 @@ export function apply(ctx) {
         stream: false,
         options: { num_predict: clampInt(args.maxTokens, 80, 16, 400), temperature: 0.2 },
       })
-      const t1 = Date.now()
-      const res = await fetch(OLLAMA_URL + '/api/generate', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, body,
-        signal: AbortSignal.timeout(120000),
-      })
-      if (!res.ok) throw new Error('VLM HTTP ' + res.status + '：先确认 ollama serve 在跑')
-      const j = await res.json()
-      const vlmMs = Date.now() - t1
+      const ask = async () => {
+        const t1 = Date.now()
+        const res = await fetch(OLLAMA_URL + '/api/generate', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body,
+          signal: AbortSignal.timeout(120000),
+        })
+        if (!res.ok) throw new Error('VLM HTTP ' + res.status + '：先确认 ollama serve 在跑')
+        const j = await res.json()
+        return { text: String(j.response || '').trim(), tokens: j.eval_count, ms: Date.now() - t1 }
+      }
+      // tokenizer 退化时（全 @@@@）自动重启 serve 再问一次，避免把坏结果交给上层
+      let r = await ask()
+      let recovered = null
+      if (looksBroken(r.text)) {
+        recovered = await restartOllama()
+        if (recovered && recovered.running) r = await ask()
+      }
       return {
-        text: String(j.response || '').trim(),
-        totalMs: Date.now() - t0, shotMs, vlmMs,
-        tokens: j.eval_count, model: OLLAMA_MODEL,
+        text: r.text,
+        totalMs: Date.now() - t0, shotMs, vlmMs: r.ms,
+        tokens: r.tokens, model: OLLAMA_MODEL,
         size: { w: ww, h: hh },
         within2s: (Date.now() - t0) <= 2000,
+        ...(recovered ? { recoveredTokenizer: !!recovered.started, degraded: looksBroken(r.text) } : {}),
       }
     },
   })
@@ -3020,19 +3054,29 @@ export function apply(ctx) {
       }
       if (!b64) throw new Error('取图失败（窗口无效或截图失败）')
       const shotMs = Date.now() - t0
-      const res = await fetch(OLLAMA_URL + '/api/generate', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: OLLAMA_MODEL,
-          prompt: args.prompt || '一句话描述这个画面里有什么',
-          images: [b64], stream: false,
-          options: { num_predict: clampInt(args.maxTokens, 80, 16, 400), temperature: 0.2 },
-        }),
-        signal: AbortSignal.timeout(120000),
+      const body = JSON.stringify({
+        model: OLLAMA_MODEL,
+        prompt: args.prompt || '一句话描述这个画面里有什么',
+        images: [b64], stream: false,
+        options: { num_predict: clampInt(args.maxTokens, 80, 16, 400), temperature: 0.2 },
       })
-      if (!res.ok) throw new Error('VLM HTTP ' + res.status + '：先确认 ollama serve 在跑')
-      const j = await res.json()
-      const text = String(j.response || '').trim()
+      const ask = async () => {
+        const res = await fetch(OLLAMA_URL + '/api/generate', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body,
+          signal: AbortSignal.timeout(120000),
+        })
+        if (!res.ok) throw new Error('VLM HTTP ' + res.status + '：先确认 ollama serve 在跑')
+        const jj = await res.json()
+        return { text: String(jj.response || '').trim(), tokens: jj.eval_count }
+      }
+      // 同上：tokenizer 退化时自动重启再问一次
+      let got = await ask()
+      let recovered = null
+      if (looksBroken(got.text)) {
+        recovered = await restartOllama()
+        if (recovered && recovered.running) got = await ask()
+      }
+      const text = got.text
       const vlmMs = Date.now() - t0 - shotMs
       // 联动：把结果直接变成浮窗字幕（省掉调用方再调一次 overlay_set）
       let shown = false, subLen = 0
@@ -3050,7 +3094,7 @@ export function apply(ctx) {
       }
       return {
         text, totalMs: Date.now() - t0, shotMs, vlmMs,
-        tokens: j.eval_count, model: OLLAMA_MODEL,
+        tokens: got.tokens, model: OLLAMA_MODEL,
         size: { w: ww, h: hh }, shown, subtitleLen: subLen,
         within2s: (Date.now() - t0) <= 2000,
       }

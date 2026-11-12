@@ -1,5 +1,23 @@
 # Changelog (dsh-screen-attention)
 
+## v1.20.5 (2026-11-13) — tokenizer 退化自动恢复
+
+### 问题
+ollama 0.40 + qwen2.5vl 偶发返回整段 `@@@@@@@@`：服务活着、模型在显存里、
+只有输出坏掉。之前只能人工重启 serve，否则每次调用都是垃圾结果。
+
+### 修复
+```text
+looksBroken(text)   → 全 @ / @ 占比 > 40% 判定为退化
+restartOllama()     → 杀掉 vendor ollama 并重新拉起（60 秒内只做一次，防抖动）
+vlm / look          → 命中退化时自动重启 + 重问一次，返回里带 recoveredTokenizer
+```
+
+调用方不需要感知：正常情况行为不变，退化时多花一次冷启动时间自愈。
+
+### 同时修掉
+`saperm_look` 重构后残留 `j.eval_count` 引用（`j` 已不在作用域内），会在运行时报错。已改为 `got.tokens`。
+
 ## v1.20.4 (2026-11-13) — 环境自适应
 
 ### 一、不要按自己的卡删 CUDA
