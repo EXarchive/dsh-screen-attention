@@ -17,16 +17,16 @@ const ok = (n, c, d) => { if (!c) { console.log('FAIL ' + n + ' -> ' + JSON.stri
 ok('工具已注册 saperm_stream', !!tools.get('saperm_stream'))
 
 // 制造真实屏幕变化的小窗
-await tools.get('saperm_overlay_open').execute({ x: 300, y: 260, w: 420, h: 260 })
-await tools.get('saperm_infer_start').execute({ maxBoxes: 40, objects: true, scene: true, accurate: false, animeface: true, sceneEvery: 4, faceEvery: 2, streamMs: 700 })
+await tools.get('saperm_overlay').execute({ action: 'open', x: 300, y: 260, w: 420, h: 260 })
+await tools.get('saperm_infer').execute({ action: 'start', maxBoxes: 40, objects: true, scene: true, accurate: false, animeface: true, sceneEvery: 4, faceEvery: 2, streamMs: 700 })
 
 for (let i = 0; i < 5; i++) {
-  await tools.get('saperm_overlay_set').execute({ note: 'stream probe ' + i + ' ' + Date.now() })
+  await tools.get('saperm_overlay').execute({ action: 'set', note: 'stream probe ' + i + ' ' + Date.now() })
   await new Promise(r => setTimeout(r, 800))
 }
 
 const streamRes = await tools.get('saperm_stream').execute({ limit: 20 })
-const statusRes = await tools.get('saperm_infer_status').execute({ limit: 1 })
+const statusRes = await tools.get('saperm_infer').execute({ action: 'status', limit: 1 })
 
 ok('stream 有输出行', streamRes.count >= 2, 'count=' + streamRes.count)
 ok('stream 行含窗口字段 W=', /W=/.test(streamRes.text || ''), (streamRes.text || '').split('\n')[0])
@@ -45,9 +45,9 @@ ok('latest.txt 已生成', !!fileRes.file && fsExists(fileRes.file), fileRes.fil
 
 function fsExists(p) { try { const fs = require('node:fs'); return fs.existsSync(p) } catch { return false } }
 
-await tools.get('saperm_infer_stop').execute({})
+await tools.get('saperm_infer').execute({ action: 'stop' })
 await new Promise(r => setTimeout(r, 300))
-const after = await tools.get('saperm_infer_stop').execute({}).catch(() => null)
+const after = await tools.get('saperm_infer').execute({ action: 'stop' }).catch(() => null)
 const health = await tools.get('saperm_health').execute({})
 ok('infer_stop 自动停流', health.stream && health.stream.running === false, JSON.stringify(health.stream))
 

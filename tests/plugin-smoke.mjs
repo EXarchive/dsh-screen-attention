@@ -21,13 +21,13 @@ let alive = 0
 try { alive = Number(String(execSync('powershell -NoProfile -Command "(Get-Process SaHelper -ErrorAction SilentlyContinue | Measure-Object).Count"')).trim()) } catch {}
 console.log('helper alive after 3s idle:', alive)
 // 互斥：先 infer 再 interpret → interpret 应 autoStopped=infer
-const inf = await tools.get('saperm_infer_start').execute({ objects: false, scene: false, maxBoxes: 20 })
+const inf = await tools.get('saperm_infer').execute({ action: 'start', objects: false, scene: false, maxBoxes: 20 })
 console.log('infer_start:', JSON.stringify({ running: inf.running }))
 await new Promise(r => setTimeout(r, 2500))
-const itp = await tools.get('saperm_interpret_start').execute({ intervalMs: 800 })
+const itp = await tools.get('saperm_interpret').execute({ action: 'start', intervalMs: 800 })
 console.log('interpret_start:', JSON.stringify({ running: itp.running, autoStopped: itp.autoStopped }))
-await tools.get('saperm_interpret_stop').execute({})
-await tools.get('saperm_infer_stop').execute({})
+await tools.get('saperm_interpret').execute({ action: 'stop' })
+await tools.get('saperm_infer').execute({ action: 'stop' })
 const h2 = await tools.get('saperm_health').execute({})
 console.log('after stop observation:', JSON.stringify(h2.observation))
 if (typeof dispose === 'function') { try { await dispose() } catch {} }

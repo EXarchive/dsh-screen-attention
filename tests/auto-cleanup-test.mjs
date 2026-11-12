@@ -27,11 +27,11 @@ const ctx = {
 mod.apply(ctx)
 await new Promise((r) => setTimeout(r, 800))
 
-console.log('=== Test 1: saperm_overlay_open + saperm_infer_start -> saperm_infer_stop 自动关闭 overlay ===')
-const openRes = await tools.get('saperm_overlay_open').execute({})
+console.log('=== Test 1: overlay open + infer start -> stop 不关浮窗（v1.19.1 语义），显式 close 才关 ===')
+const openRes = await tools.get('saperm_overlay').execute({ action: 'open' })
 console.log('overlay_open:', JSON.stringify(openRes))
 
-const start1 = await tools.get('saperm_infer_start').execute({
+const start1 = await tools.get('saperm_infer').execute({ action: 'start',
   objects: false,
   scene: false,
   maxBoxes: 10,
@@ -40,7 +40,7 @@ console.log('infer_start (Test 1):', JSON.stringify({ running: start1.running })
 
 await new Promise((r) => setTimeout(r, 500))
 
-const stop1 = await tools.get('saperm_infer_stop').execute({})
+const stop1 = await tools.get('saperm_infer').execute({ action: 'stop' })
 console.log('infer_stop (Test 1):', JSON.stringify(stop1))
 
 const health1 = await tools.get('saperm_health').execute({})
@@ -49,13 +49,19 @@ console.log('health after stop (Test 1):', JSON.stringify({
   observation: health1.observation,
 }))
 
-assert.equal(health1.overlayOpen, false, 'Test 1 failed: expected health.overlayOpen === false')
+assert.equal(health1.overlayOpen, true, 'Test 1 failed: stop 后浮窗应保持打开（显式 close 才关）')
 assert.equal(health1.observation.mode, null, 'Test 1 failed: expected observation.mode === null')
 assert.equal(health1.observation.holds, 0, 'Test 1 failed: expected observation.holds === 0')
+
+// 显式关闭浮窗
+const closeRes = await tools.get('saperm_overlay').execute({ action: 'close' })
+console.log('overlay close:', JSON.stringify(closeRes))
+const health1b = await tools.get('saperm_health').execute({})
+assert.equal(health1b.overlayOpen, false, 'Test 1 failed: close 后 expected overlayOpen === false')
 console.log('[PASS] Test 1 passed')
 
 console.log('=== Test 2: saperm_infer_start({ ttlSec: 3 }) -> 4200ms 无操作自动回收 ===')
-const start2 = await tools.get('saperm_infer_start').execute({
+const start2 = await tools.get('saperm_infer').execute({ action: 'start',
   ttlSec: 3,
   objects: false,
   scene: false,

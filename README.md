@@ -1,282 +1,181 @@
-# dsh-screen-attention (屏幕感知与智能注意力插件)
+# dsh-screen-attention
 
-[![Release](https://img.shields.io/github/v/release/EXarchive/dsh-screen-attention?label=release)](https://github.com/EXarchive/dsh-screen-attention/releases)
-[![Platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-0078d4)](#)
-[![.NET](https://img.shields.io/badge/.NET-9.0-512bd4)](#)
-[![Node](https://img.shields.io/badge/Node.js-%E2%89%A5%2020-339933)](#)
-[![License](https://img.shields.io/badge/license-see%20repo-lightgrey)](#)
+DSH 屏幕感知与桌面操作插件。C# helper（ONNX 本地推理 + WinForms 浮窗）+ JS 工具层（**45 个 `saperm_*` 工具**），通过 stdio JSON-RPC 通信。
 
-> DeepSeek Harness (DSH) 原生屏幕持续感知、ACG 角色识别与自动化操作插件。
-> 架构设计：Node.js DSH 插件门控（60+ 工具） + C# .NET 9 高性能原生推理辅助进程（SaHelper）。
+- 本地推理：OCR / 物体检测 / 场景分类 / 动漫脸 / 角色识别，0 token 消耗
+- 内置 VLM 运行时（vendor/，可选）：本地看懂画面内容，不依赖系统安装任何东西
+- 浮窗同框：画面 16:9 在上、讲解字幕在下、状态条最底，三分区不重叠
+- 运行时零控制台：所有子进程静默启动；生命周期全绑定，关一个全关
 
 ---
 
-## 一、核心特性
+## 安装
 
-1. **实时屏幕感知与理解**
-   - **单流采集**：FrameHub 100ms 单流采集（GDI BitBlt ~17.8ms），多引擎共享帧缓冲，无订阅自动休眠。
-   - **流式 OCR**：PaddleOCR PP-OCRv4 det+rec，基于 FNV 框签名缓存识别结果，每帧 OCR 耗时从 ~300ms 降至 70~110ms。
-   - **目标检测**：YOLOv8n / YOLOv8m 双模型（带人体位置检测与身份绑定）。
-   - **ACG 场景分类**：Chinese-CLIP ViT-L/14 (1.16GB ONNX, 768维向量)，内嵌 34 类二次元/游戏/VTuber/视觉小说语义标签。
-   - **动漫脸检测**：YOLOv8n-face (12MB ONNX, NMS 0.45, ~28ms)，针对 ACG 画面进行高精度人脸定位。
-   - **动态降频自适应**：静止画面自动跳过繁重模型计算（`staticSkipped` 计数可观测），每 10 帧（~1s）执行一次心跳兜底，首帧与场景未就绪帧立即执行全量推理；画面像素变动瞬时恢复实时推理。
+### 1. 装插件
 
-2. **角色识别与认知体系**
-   - **多参考画廊（Gallery）**：单个角色支持多张不同姿势/表情的 CLIP 裁剪特征嵌入，余弦相似度匹配（阈值 0.70）。
-   - **未知角色自动聚类**：陌生角色自动聚类分配为`未知角色#N`，支持一键晋升（promote）或忽略（ignore）。
-   - **角色知识库关联**：通过`saperm_char_note`写入背景知识，在识别到人物时一并输出（如 DeepSeek 蓝鲸拟人女仆）。
-   - **原子持久化**：角色库采用 Temp + File.Replace 机制，杜绝并发写入损坏。
-
-3. **注意力可视化小窗（overlay）**
-   - 无边框 TopMost + 屏幕缩略画面 + 注意力四角括号 + 注视同心圆 + `say` 圆角气泡 + 分层信息条（左状态圆点 / 右区域尺寸与帧率）；可拖动、双击关闭。
-   - 统一色板：深蓝底 `(10,16,34)` / 强调青蓝 `(96,196,255)` / 主文字 `(232,240,255)` / 次要 `(150,175,205)`。
-   - **抗闪三件套**：双缓冲 Form 子类（`OverlayForm`）+ 不擦背景（`OnPaintBackground` 空实现）+ 帧位图复用；
-     再叠加三重节流：标题只在 note 变化时改、`SetWindowPos` 降到 1s 一次、帧序号没换就不 `Invalidate`。
-   - `saperm_say` 让 AI 开口：文字进气泡 + Windows SAPI 朗读（系统有中文音色 Huihui）。
-
-4. **双观察模式与互斥调度**
-   - **连续解读（Interpret）**：~800ms 间隔，粗粒度帧差触发区域 OCR 与变化分类（内容变化 / 动态噪声 / 文字位移）。
-   - **逐帧融合（Infer）**：逐帧融合 OCR + 物体 + 角色身份 + 动漫脸 + 场景，单模式稳定帧率 6.7~6.9 fps。
-   - **互斥守护**：启动任一长时观察模式时，插件自动停止另一模式（返回 `autoStopped`），避免 DirectML/算力资源争用降级。
-
-4. **双运行方案（按环境自动选）**
-   - **local**：本地 ONNX 推理（OCR / 检测 / CLIP / 动漫脸）→ 文本与坐标，**0 token**，精度受模型限制；
-   - **vision**：画面本身交给多模态模型，保留图标/照片/视频原貌，**约 530~590 token/张**（1260 宽，42px 对齐）；
-   - **hybrid**：两者同时给 —— 文本给骨架，图给原貌；
-   - 选择依据只看三件真事：**可用执行器（TensorRT/CUDA/DirectML/CPU）、模型文件齐全度、CPU 线程数**。
-   - **手机竖屏适配**：竖屏画面（9:16）在横屏排法下会把画布撑成几千像素高，字反而更糊。
-     自动改成一行并肩铺开；`maxH`（默认 1600）兜底，超过就缩格子。
-     悬浮小窗也跟形状走：`aspect: portrait` 给 270×480 竖窗，画面才不被压成一条细缝。
-   - **按变化量选帧**（`cuts`）：HSV 64×36 网格打分 0–255，切点（分≥12 且 >2.5×邻居 且 mc≥20 且 ≥0.4s）+ 积分（4分×fps×3秒）双判据；静止画面天然只出 1 帧。`saperm_profile` 返回推荐与理由（缓存 60s），`saperm_scan({mode:"auto"})` 按推荐自动路由，`saperm_health.scheme` 每次自检直接给出结论。
-
-5. **审计与保活**
-   - **长时观察 Hold**：长时观察期间插件强制持有 Helper 引用，杜绝闲置被杀。
-   - **空闲保活**：调用结束后空闲 60 秒才延迟释放 Helper，避免连续调用反复产生 2.5s 冷启动。
-   - **看门狗崩溃告警与状态自愈**：Helper 异常退出时自动向会话注入告警、记录 `helper_crash` 审计日志，并在 ~800ms 内重启恢复原观察模式（`infer` / `interpret` / `watch`）与急停锁状态。
-   - **持久化审计日志**：自动按天轮转记录变化/崩溃/自愈事件至 `out/logs/observation-YYYY-MM-DD.jsonl`，提供 `saperm_history` 工具随时追溯。
-
-5. **AI 可读数据流（stream）**：每帧识别压成 ~110 字节紧凑行（TX 增量语义 / CH 变化去重），落盘 `out/logs/stream-*.jsonl` + `stream-latest.txt`，用 `saperm_stream` 增量读取；静止时自动降载（零推理心跳 + 采集降频 + 5s 落盘节流）。
-
-6. **四级权限门控与急停**
-   - **L0 观察类**：免审批（识别、取色、截图、窗口列表、健康检查）。
-   - **L2 普通输入**：会话级一次性授权（点击、滚动、文本输入、剪贴板、Excel 定位读写）。
-   - **L3 高危输入**：本会话一次性审批（拖拽、双击），与 L2 授权相互独立。
-- **长按输入**：`saperm_press` 按住鼠标/按键不放（10~10000ms），`saperm_click` 支持 `holdMs`。
-   - **急停机制**：支持物理热键 `Pause/Break` 或 `saperm_stop` 100ms 瞬时锁死所有鼠标键盘注入。
-
----
-
-## 二、目录结构
-
-```
-dsh-screen-attention/
-├── permission-plugin/        # DSH Node.js 插件包
-│   ├── package.json
-│   └── lib/index.js          # 插件入口，注册 60 个 saperm_* 工具
-├── helper/                   # C# .NET 9 高性能原生进程
-│   ├── SaHelper.csproj
-│   ├── Program.cs            # stdio JSON 行协议分发、FrameHub、Infer/Interpret 循环
-│   ├── Providers.cs          # ONNX 推理后端路由 (TensorRT > CUDA > DirectML > CPU)
-│   ├── PaddleOcr.cs          # PaddleOCR PP-OCRv4 识别引擎与 FNV 缓存
-│   ├── YoloDetect.cs         # YOLOv8n / YOLOv8m 物体检测
-│   ├── ClipScene.cs          # Chinese-CLIP ViT-L/14 场景分类与裁剪嵌入
-│   ├── AnimeFaceDetect.cs    # YOLOv8n-face 动漫人脸检测
-│   ├── CharId.cs             # 角色画廊匹配、未知聚类与原子持久化
-│   ├── Cuts.cs               # 变化分（HSV 64×36 网格 + 运动补偿），sheet 按变化量选帧
-│   ├── RegionPicker.cs       # 全屏拖框选区窗口
-│   ├── AudioCapture.cs       # WASAPI 回环/麦克风采集（设备音频与麦分路）
-│   └── deploy.ps1            # 部署脚本（全量同步 + 哈希校验）
-│   └── models/               # 本地模型目录
-│       ├── ch_PP-OCRv4_det_infer.onnx
-│       ├── ch_PP-OCRv4_rec_infer.onnx
-│       ├── yolov8n.onnx / yolov8m.onnx
-│       ├── animeface/model.onnx
-│       ├── chinese-clip-large/image_encoder.onnx
-│       ├── characters.json
-│       ├── characters-unknown.json
-│       └── characters-notes.json
-├── docs/                     # 架构蓝图与演进文档
-│   ├── continuous-interpretation.md
-│   ├── RETROSPECTIVE.md
-│   └── UNFINISHED.md
-├── tests/                    # 冒烟与回归测试脚本
-└── README.md
-```
-
----
-
-## 三、快速开始
-
-### 0. 安装插件
 ```powershell
 dsh plugin add dsh-screen-attention
 ```
-开发模式可在 profile 的 `cordis.patch.yml` 中指向本地 `permission-plugin` 目录；`patchReload: live` 支持热加载（需对 yml 做出真实内容变更才会触发重载）。
 
-### 0.5 准备模型
-`helper/models/` 下超过 50MB 的权重未纳入仓库（GitHub 单文件限制），需自行放置：
+开发模式：profile 的 `cordis.patch.yml` 指向本地 `permission-plugin` 目录。改了工具注册必须**重启 DSH**（热重载不刷新工具注册表）。
 
-| 文件 | 大小 | 用途 |
-|---|---|---|
-| `helper/models/chinese-clip*/image_encoder.onnx` | ~1.16 GB | CLIP 场景分类 / 角色特征嵌入 |
-| `helper/models/yolov8m.onnx` | ~50 MB | 精确物体检测（`saperm_detect model=m`） |
+### 2. 编译 helper
 
-PP-OCRv4 det/rec、YOLOv8n、动漫脸检测模型已随仓库提供。
-
-### 1. 编译 C# Helper
 ```powershell
 cd helper
 dotnet build -c Release
-```
-二进制生成在：`helper/bin/Release/net9.0-windows10.0.19041.0/SaHelper.exe`。
-
-### 2. DSH 插件生效
-若修改了插件或工具参数定义，需要重启 DSH 服务使 Web GUI 重新加载工具列表：
-```powershell
-# 重启 DSH Web 服务以更新插件
-dsh web
+# 产物: helper/bin/Release/net9.0-windows10.0.19041.0/SaHelper.exe
 ```
 
-### 3. 健康自检
-在 DSH 会话中调用：
-```json
-saperm_health {}
-```
-返回样例：
-```json
-{
-  "helper": { "online": true, "pid": 47124 },
-  "paused": false,
-  "observation": { "mode": null, "holds": 0 },
-  "models": {
-    "ch_PP-OCRv4_det_infer": true,
-    "ch_PP-OCRv4_rec_infer": true,
-    "yolov8m": true,
-    "animeface": true
-  },
-  "clip": "chinese-clip-large",
-  "faceModel": true,
-  "characters": 2,
-  "unknowns": 0,
-  "ok": true
-}
-```
+插件首次调用工具时自动拉起 helper，无需手动启动。
 
----
+### 3. 模型
 
-## 四、核心工具使用场景与策略
+**随仓库自带**（无需下载）：PP-OCRv4 det/rec、YOLOv8n、动漫脸检测。
 
-| 类别 | 工具名 | 说明 | 推荐使用方式 |
-|---|---|---|---|
-| **自检** | `saperm_health` | 投产自检 | 每次会话首次使用前执行确认模型与后端正常 |
-| **审计** | `saperm_history` | 历史日志读取 | 传入 `limit` 或 `type: "infer"|"interpret"` 查看历史变化 |
-| **轻量监控** | `saperm_interpret_start` | 连续屏幕解读 | 日常监控屏幕内容变化，低资源占用（默认 800ms） |
-| **深度理解** | `saperm_infer_start` | 逐帧融合分析 | 遇到游戏画面、动漫角色、复杂 UI 交互时切入 |
-| **小窗注意** | `saperm_overlay_open` | 打开悬浮小窗 | 480x270 屏幕右下角红框可视化 AI 当前视线与注视点 |
-| **角色管理** | `saperm_char_list` | 已知角色清单 | 查看当前画廊注册的角色列表 |
-|  | `saperm_char_register` | 注册角色特征 | 裁剪画面人物并写入特征与可选背景备注 |
-|  | `saperm_char_note` | 更新角色知识 | 记录或丰富角色的百科描述与上下文 |
-|  | `saperm_char_unknowns` | 查看未知聚类 | 检视陌生人物出现统计并决定是否 promote |
-|  | `saperm_char_promote` | 晋升未知角色 | 将 `未知角色#1` 命名为正式角色名 |
-| **方案探测** | `saperm_profile` | 环境探测与推荐 | 首次接入或换机器时先跑一次，看 `recommended` 与 `reasons` |
-| **双方案识别** | `saperm_scan({mode})` | local / vision / auto | 文本够用走 local（0 token）；要看图标/照片/视频原貌走 vision |
-| **多帧拼图** | `saperm_sheet` | 一次看一段时间的变化 | 价格按张算不按帧算：4 帧 591 token（每帧 148），比看 4 次省 75%；**按变化量选帧**，静止画面只出 1 张 |
-| **拖框选区** | `saperm_region` | 用户拖框定区域 | 说"框这块"就弹半透明覆盖窗，拖完自动存，不用量像素；返回 `orientation` 标明竖屏还是横屏 |
-| **看懂画面** | `saperm_vlm` | 问「画面里有什么」 | 本地 Qwen2.5-VL，**1.5-1.7 秒**出中文描述；不是标签，是内容 |
-| **同框讲解** | `saperm_overlay_set` | 画面 + 字幕一起看 | `subtitle` 参数：画面 16:9 在上，字幕独立在下，状态条最底 |
-| **看后台窗口** | `saperm_window` | 被遮住/在后台的软件 | `PrintWindow` 直接向窗口要画面，不靠屏幕；浏览器网页区需配合 `saperm_web` |
-| **看网页** | `saperm_web` | 我不打扰你自己去看 | 无头浏览器渲染截图，全程不建窗口、不抢焦点 |
-| **开口说话** | `saperm_say` | AI 边看边说 | 文字进小窗圆角气泡 + Windows 自带 SAPI 朗读（系统有中文音色 Huihui）；`speak:false` 只显示不出声 |
-| **锁定观察目标** | `saperm_target` | 只看某个窗口 | 锁定后 sheet/view/scan/locate 不传区域就只看它**客户区**（自动去标题栏边框，窗口移动跟随）；实测同一段视频全屏变化分 6、只抓窗口 81 —— 差 13 倍 |
-| **听声音** | `saperm_audio` | 分辨谁在出声 | `source: device`（系统输出回环）/ `mic`（麦克风）/ `both`（两路并行，返回"谁在出声"）|
-| **自动化输入** | `saperm_click` / `press` / `type` / `hotkey` | 鼠标键盘操作（含长按 holdMs） | 基于 OCR 坐标或 UIA 控件进行前台自动化交互 |
-| **急停** | `saperm_stop` | 立即急停 | 锁定输入注入；恢复需 `saperm_resume` 并经由用户明确授权 |
+**需手动放置**（>50MB 不入 git）：
 
----
+| 文件 | 大小 | 用途 |
+|---|---|---|
+| `helper/models/chinese-clip*/image_encoder.onnx` | ~1.16GB | 场景分类 / 角色特征嵌入 |
+| `helper/models/yolov8m.onnx` | ~50MB | 精确物体检测（`infer accurate:true`） |
 
-## 五、运行指标与资源要求
-
-- **算力平台**：支持 DirectML（本机 iGPU/CPU 兼容）与 CUDA/TensorRT（自动检测）。
-- **内存占用**：Helper 全模型加载后 WorkingSet 约 2.5GB。
-- **磁盘占用**：ONNX 运行时模型约 1.6GB。
-- **运行性能**：
-  - 单模式 Infer（含 OCR、YOLOv8m、CLIP 场景、动漫脸）：**6.7 ~ 6.9 fps**（DirectML 环境）。
-  - 静止画面自适应降频模式：CPU 占用率从 80% 降至 <10%。
-## 内置运行时（VLM，可选）
-
-`saperm_vlm` / `saperm_look` 需要本地视觉模型。默认走**插件自带的 vendor/ 运行时**，不依赖系统安装 Ollama。
-
-```text
-vendor/
-  ollama/ollama.exe      ollama 免安装版
-  models/                qwen2.5vl:3b（约 3.2GB）
-  run-ollama.cmd         插件自动生成，启动时用
-  setup-runtime.ps1      一键装配（解压 + 拉模型）
-```
-
-### 装配
+**可选：VLM 运行时**（`saperm_vlm` / `saperm_look` 需要，共 ~4.3GB）：
 
 ```powershell
-# 1) 下载免安装包（约 1.4GB）
-Invoke-WebRequest -Uri 'https://github.com/ollama/ollama/releases/latest/download/ollama-windows-amd64.zip' -OutFile "$env:TEMP\ollama-win.zip" -Proxy http://127.0.0.1:7891
+# 1) 下载 ollama 免安装版（~1.5GB）到 %TEMP%\ollama-win.zip
+Invoke-WebRequest -Uri "https://github.com/ollama/ollama/releases/latest/download/ollama-windows-amd64.zip" \
+  -OutFile "$env:TEMP\ollama-win.zip"
 
-# 2) 解压 + 拉模型（约 3.2GB）
+# 2) 一键装配：解压到 vendor/ollama + 拉取 qwen2.5vl:3b 到 vendor/models
 powershell -ExecutionPolicy Bypass -File vendor/setup-runtime.ps1
 ```
 
-### 自动管理
+装配后**无需任何手动启动**：插件调用 VLM 工具时自动探测并静默拉起 `vendor/ollama/ollama.exe`；DSH 退出时自动回收（`dispose` + exit hook）。模型目录经 `OLLAMA_MODELS` 指向 `vendor/models`，与系统安装的 Ollama 完全隔离——本插件不写注册表、不装服务、不进 PATH。
 
-- 调用 `saperm_vlm` / `saperm_look` 前自动探测 11434，未运行则拉起 `vendor/ollama/ollama.exe serve`
-- 用 **WMI 创建进程**启动，逃逸 DSH 的 Job Object（否则 DSH 退出会连带杀死）
-- 模型目录通过 `OLLAMA_MODELS` 指向 `vendor/models`，与系统安装的 Ollama 完全隔离
-- `vendor/` 已加入 `.gitignore`（体积原因），克隆后跑一次 `setup-runtime.ps1` 即可重建
-### 与系统彻底隔离（实测）
+### 4. 验证
 
-```text
-注册表卸载项    无
-Windows 服务    无
-开始菜单快捷方式 无
-环境变量        无
-PATH            无 ollama 条目
-```
+会话里调用 `saperm_health {}`：`helper.online=true`、`ollama.exePresent=true`（装了 VLM 时）、`ok=true` 即就绪。
 
-运行时 100% 来自 `vendor/ollama/ollama.exe`，进程路径可核：
-```powershell
-Get-Process ollama | Select-Object Id, Path
-# -> ...\dsh-screen-attention\vendor\ollama\ollama.exe
-```
+---
 
-> 唯一会出现在用户目录的是 `~/.ollama`（密钥对 + 推荐缓存，约 3 个文件 <3KB）。
-> 这是 ollama 二进制自身的行为，删掉后下次启动会自动重建，不装任何东西。
+## 工具清单（45 个）
+
+### 看懂屏幕（L0 观察，免审批）
+
+| 工具 | 用途 |
+|---|---|
+| `see` | **看一次（首选）**：一张图同时出文字+坐标 / 物体 / 场景 / 运动，自动开浮窗写字幕，可 `inject:true` 推送会话 |
+| `look` | **看并说出来**：抓画面 → VLM 理解 → 字幕推浮窗，一次调用完成 |
+| `narrate` | **实时讲解**：循环在插件内跑，按节奏抓最新帧→VLM→浮窗字幕；一次调用驱动全程，停止即关窗 |
+| `vlm` | 本地视觉理解（Qwen2.5-VL）：问"画面里有什么"，热态 ~0.8s 出中文描述 |
+| `view` | 截指定区域返回图片路径（多尺度观察，配合 rect 对应大图坐标） |
+| `glance` | 全屏缩略大图（~560 token），快速语义浏览 |
+| `sheet` | 多帧拼图：按画面变化选帧拼一张网格，一次看清一段时间 |
+| `recognize` | OCR 文字 + UIA 控件一次返回（带坐标） |
+| `locate` | 按关键字找屏幕元素坐标（"哔哩哔哩"按钮在哪） |
+| `window` | `list` 列窗口 / `shot` 抓**后台被遮挡**窗口（PrintWindow，不靠屏幕） |
+| `web` | 无头浏览器渲染网页截图，不建窗口不抢焦点 |
+| `animeface` | 动漫脸检测（框+置信度） |
+| `audio` | 听系统输出/麦克风：电平、是否人声（判断"有没有人在说话"） |
+
+> 本地图片文件 OCR 用 `see({ path })`；旧版 scan/detect/scene/ocr_file 均已并入 `see`。
+
+### 持续观察（L0）
+
+| 工具 | 用途 |
+|---|---|
+| `watch` | 统一入口：`start/stop/status/link/unlink/focus`。自适应采样（AIMD，200-1600ms），`link` 把屏幕变化事件注入会话 |
+| `interpret` | 连续解读：`start/status/stop`。变化区域 OCR + 内容/噪声分类，节流注入 |
+| `infer` | 逐帧识别：`start/status/stop`。每帧检测+识别+角色身份，结果进数据流 |
+| `stream` | AI 可读数据流：`read/start/stop`。每帧一行紧凑文本，token 极省 |
+| `observe` | 单次变化快照（运动区域/变化率/区域文字），静止时瞬时返回 |
+| `observe_task` / `observe_task_stop` | 定时持续观察任务（防打断模式，自动汇报+抓图注入） |
+| `frames` | 高帧率采集流水线（默认 60fps 逐帧记录，不丢帧） |
+| `calibrate` | 自动标定最优采样间隔（逐档实测能否抓到变化） |
+| `target` | 锁定观察目标窗口（后续观察工具只看它的客户区，自动跟随） |
+| `region` | 让用户拖框选区，之后观察工具复用 |
+| `history` | 观察审计日志（JSONL 落盘，跨重启可追溯） |
+
+### 输出与表达（L0）
+
+| 工具 | 用途 |
+|---|---|
+| `overlay` | 浮窗统一入口：`open/close/set`。红框标记注意力区域、注视点、底部标签、**讲解字幕**（与画面同框分区显示） |
+| `say` | 气泡文字 + Windows SAPI 朗读（`speak:false` 只显示不出声） |
+| `speech_voices` | 列出系统 TTS 音色 |
+
+### 桌面输入（L2 会话级授权 / L3 高危单独授权）
+
+| 工具 | 用途 |
+|---|---|
+| `click` / `doubleclick`(L3) | 点击 / 双击屏幕坐标（`holdMs` 长按） |
+| `press` | 按住不放（鼠标键或键盘键，游戏移动/长按菜单） |
+| `drag`(L3) | 坐标拖拽 |
+| `scroll` | 滚轮（自动先移光标到目标窗口） |
+| `type` / `hotkey` | 输入文本 / 组合键（`["CTRL","C"]`） |
+| `clipboard` | 剪贴板 `get/set` |
+| `focus` / `topmost` | 激活窗口 / 临时置顶 |
+| `stop` / `resume` | **急停**（锁全部输入，永远可用）/ 恢复（需用户确认） |
+
+### 业务组合（L0 观察 / L2 写入）
+
+| 工具 | 用途 |
+|---|---|
+| `excel` | Excel 录入：`goto/write/read/cells`（UIA 定位 + 剪贴板粘贴 + 回读校验） |
+| `fill` | 图片填表流水线：`start/status/next/submit/write/abort`（批量图片→提取字段→写 Excel） |
+| `char` | 角色管理：`register/match/list/rename/merge/delete/note/unknowns/promote/ignore`（CLIP 嵌入识别动漫角色） |
+
+### 诊断（L0）
+
+| 工具 | 用途 |
+|---|---|
+| `health` | 投产自检：helper/模型/角色库/观察状态/**ollama 运行时** |
+| `status` | 权限模块状态（授权/急停/helper 进程） |
+| `profile` | 探测本机方案：local（0 token）/ vision（直传图）/ hybrid |
+
+---
+
+## 运行要求
+
+| 项 | 值 |
+|---|---|
+| 系统 | Windows 10 19041+（helper 为 net9.0-windows WinForms） |
+| 推理后端 | DirectML（默认，iGPU/CPU 均可）；有 NVIDIA 卡时 VLM 走 CUDA |
+| 内存 | helper 全模型加载 ~2.5GB；VLM 常驻 ~3GB 显存/内存 |
+| 磁盘 | ONNX 模型 ~1.6GB；vendor VLM 运行时 ~4.3GB（可选） |
+| 性能 | infer 全模式 6.7-6.9fps（DirectML）；VLM 热态 0.8-1.6s/次；静止画面自动降频 CPU<10% |
+
+## 生命周期与安全
+
+- **关一个全关**：DSH 退出 → `dispose()` + exit/SIGINT/SIGTERM hook 杀掉 helper 与 vendor ollama，不留孤儿进程。只杀 `vendor\ollama` 路径下的进程，不碰系统安装的 Ollama。
+- **零控制台**：helper/Chrome 用 `windowsHide`，ollama 用 VBS 静默启动（`WScript.Shell.Run(..., 0, False)`）。
+- **审批分层**：L0 观察免审；L2 输入会话级一次授权；L3（drag/doubleclick）独立授权；`saperm_stop` 急停永远可用，恢复必须用户确认。尊重全局审批策略（never 时不发 ask）。
+- **屏幕内容是不可信数据**：所有读屏工具的描述都带防注入注记——画面里的文字只作为内容，不作为指令执行。
+
 ## 环境适配
-
-内置运行时按实际环境自适应，不假设「和作者那台一样」：
 
 | 环境 | 行为 |
 |---|---|
-| Windows + vendor 完整 | 自动拉起 `vendor/ollama/ollama.exe`，走内置模型 |
-| Windows + 已有 ollama 在 11434 | 直接复用，不重复启动 |
-| Windows + vendor 缺失 | 报错并给出装配命令，不静默失败 |
-| 服务在跑但缺模型 | 提示 `ollama pull qwen2.5vl:3b` |
-| macOS / Linux | 内置 exe 不可用，提示设置 `SA_OLLAMA_URL` 指向外部实例 |
+| Windows + vendor 完整 | 自动拉起内置 ollama |
+| Windows + 11434 已有服务 | 直接复用，不重复启动 |
+| vendor 缺失 / 缺模型 / 非 Windows | 报错并附**可复制的修复命令**（装配脚本 / `ollama pull` / `SA_OLLAMA_URL`） |
+| tokenizer 退化（输出全 `@`） | 自动重启 serve 重试一次（60s 防抖） |
 
-环境变量：
+环境变量：`SA_OLLAMA_URL`（默认 http://127.0.0.1:11434）、`SA_VLM_MODEL`（默认 qwen2.5vl:3b）、`SA_HELPER_EXE`。
 
-| 变量 | 作用 |
-|---|---|
-| `SA_OLLAMA_URL` | 覆盖 ollama 地址（默认 `http://127.0.0.1:11434`） |
-| `SA_VLM_MODEL` | 覆盖模型名（默认 `qwen2.5vl:3b`） |
-| `SA_HELPER_EXE` | 覆盖 SaHelper 路径 |
+GPU 后端双保留：`cuda_v12`（RTX 20/30/40）+ `cuda_v13`（RTX 50）+ `vulkan`（AMD/Intel），ollama 启动时自行探测，**勿按自己显卡删任何一套**。
 
-### GPU 后端
+## 开发
 
-`vendor/ollama/lib/ollama/` 同时保留两套 CUDA：
+```powershell
+# helper 改动后部署（同步 + MD5 校验）
+cd helper && dotnet build -c Release -o bin\Release\next && .\deploy.ps1
 
-```text
-cuda_v12/   约 1.1GB   RTX 20/30/40 系（Ampere/Ada）
-cuda_v13/   约 0.9GB   RTX 50 系（Blackwell）
-vulkan/     约 40MB    AMD / Intel 核显
+# 静态体检（类尺寸 / JS↔C# 接口一致性）
+node scripts/audit.mjs
 ```
 
-**不要按自己显卡删其中一套** —— 删了会让其他用户的卡掉回 CPU。
-ollama 启动时自行探测，选可用的那套。
+- 改工具注册后必须重启 DSH；热重载只换模块不刷新工具表。
+- 批量增删 register 块后必须跑 apply 探针（真实 ctx 注册一遍），`node --check` 查不出未定义引用。
+- 历史教训见 `docs/RETROSPECTIVE.md`，版本记录见 `CHANGELOG.md`。

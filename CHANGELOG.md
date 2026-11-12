@@ -1,5 +1,29 @@
 # Changelog (dsh-screen-attention)
 
+## v1.20.6 (2026-11-13) — 实时讲解下沉进插件（修 DSH 崩溃）
+
+### 事故
+把讲解循环放在调用方（run_code 里每帧调一次工具）会把 harness 当循环引擎：
+30 秒 ~90 次工具调用、每次携带 JSON+图片路径，DSH 直接崩了一次。
+**结论：循环引擎不允许放在调用方。**
+
+### 新增 `saperm_narrate`（循环在插件进程内）
+```js
+saperm_narrate({ action:'start', seconds:60, periodMs:2000, maxW:546 })
+saperm_narrate({ action:'status' }) / ({ action:'stop' })
+```
+- 插件内部闭环：`helperCall('screenshot')` → `fetch(ollama)` → `helperCall('overlay_set')`
+- 一次调用驱动全程，**零逐帧工具流量**
+- 自动开浮窗；停止/到期自动关窗消失（浮窗生命周期与工具绑定）
+- tokenizer 退化自动重启 ollama 重试；连续失败不空转
+- 讲解节奏可调（periodMs ≥500），抓帧宽度可调（maxW，越小越快）
+
+### 同时修
+- `stopStream()` 未清 `streamTtlTimer` → start(ttl)→stop→start 时旧 timer 误杀新流
+- effect 清理补 `stopNarrate` / `stopStream` / streamTtlTimer
+- `observe_task_stop` 引用未定义变量 `shots`（B1，合并残留）
+- `writeOllamaLauncher` 用未导入的 `resolve`（B2，导致内置 ollama 冷启动永远失败）
+
 ## v1.20.5 (2026-11-13) — tokenizer 退化自动恢复
 
 ### 问题
