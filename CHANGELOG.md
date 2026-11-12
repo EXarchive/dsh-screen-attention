@@ -1,5 +1,39 @@
 # Changelog (dsh-screen-attention)
 
+## v1.20.3 (2026-11-13) — 生命周期全绑定 + 零控制台
+
+### 一、运行时全静默（不弹任何控制台）
+| 启动点 | 原状 | 现在 |
+|---|---|---|
+| helper | `spawn(..., windowsHide:true)` | 不变 ✅ |
+| Chrome 无头 | `spawn(..., windowsHide:true)` | 不变 ✅ |
+| ollama | `cmd /c start /B` + `execFile(powershell)` 无 hide → **闪黑框** | **VBS + `windowsHide:true` + `-WindowStyle Hidden`** |
+
+ollama 改用 `vendor/run-ollama.vbs`：
+```vbs
+sh.Run """<ollama.exe>"" serve", 0, False   ' 0 = 窗口完全隐藏
+WScript.Quit 0                              ' wscript 立即退出，不留残影
+```
+
+### 二、关一个全关
+```text
+dispose()              → kill helper + kill vendor/ollama
+process.on('exit')     → 同上兜底
+SIGINT / SIGTERM       → 同上 + process.exit
+```
+只杀 **Path 含 vendor\ollama** 的 ollama，不碰系统安装的。
+
+### 三、实测
+```text
+apply ctx → OK 45 个工具
+dispose() → { helper: true, ollama: 1 }
+之后：ollama PIDs 空 / wscript 空 / API 已停
+```
+
+### 四、踩坑
+`killAllRuntime` 第一版被插进了 `apply()` 内部，模块级 `dispose` 取不到它，
+报 `killAllRuntime is not defined`，**dispose 静默失败、进程全留**。已移到模块级并复验。
+
 ## v1.20.2 (2026-11-13) — 修复 saperm_see 文字坐标丢失
 
 ### 问题

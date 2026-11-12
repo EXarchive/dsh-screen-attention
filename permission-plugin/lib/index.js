@@ -3,7 +3,7 @@
 // 门控全部走 DSH 原生审批链（tools/pre-execute ask）；注入执行接 SaHelper 进程。
 // 审计对 approval/asked + approval/decided 由框架自动落会话日志。
 
-import { spawn } from 'node:child_process'
+import { spawn, execFile, execFileSync } from 'node:child_process'
 import { existsSync, writeFileSync, mkdirSync, readdirSync, readFileSync, unlinkSync, appendFileSync, statSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -403,6 +403,42 @@ export function sanitizeJson(v) {
 }
 
 // ============ 插件主体 ============
+  // ===== 生命周期绑定：关一个全关 =====
+  // DSH 退出 → helper 随 stdio 断开自然退；ollama 是 WMI 拉起的（逃逸了 Job Object），
+  // 不会随父进程死，必须显式收尸，否则留下孤儿占端口和 3GB 内存。
+  function ollamaPidsSync() {
+    try {
+      const out = execFileSync('powershell', ['-NoProfile', '-Command',
+        "Get-Process ollama -ErrorAction SilentlyContinue | Where-Object { $_.Path -like '*vendor*ollama*' } | ForEach-Object { $_.Id }"],
+        { windowsHide: true, timeout: 6000, encoding: 'utf8' })
+      return String(out || '').split(/\s+/).filter(Boolean).map(Number).filter((n) => n > 0)
+    } catch { return [] }
+  }
+
+  function killAllRuntime() {
+    const r = { helper: false, ollama: 0 }
+    try { const p = helperSingleton.proc; if (p && !p.killed) { p.kill(); r.helper = true } } catch {}
+    try {
+      for (const pid of ollamaPidsSync()) {
+        try { execFileSync('taskkill', ['/PID', String(pid), '/F'], { windowsHide: true, timeout: 6000 }); r.ollama++ } catch {}
+      }
+    } catch {}
+    return r
+  }
+
+  let _exitHooked = false
+  function hookExitOnce() {
+    if (_exitHooked) return
+    _exitHooked = true
+    process.on('exit', () => { try { killAllRuntime() } catch {} })
+    process.on('SIGINT', () => { try { killAllRuntime() } catch {}; process.exit(0) })
+    process.on('SIGTERM', () => { try { killAllRuntime() } catch {}; process.exit(0) })
+  }
+
+export function dispose() {
+  return killAllRuntime()
+}
+
 export function apply(ctx) {
   const state = {
     l2: new Map(),
@@ -2786,21 +2822,25 @@ export function apply(ctx) {
   const OLLAMA_DIR = join(VENDOR_DIR, 'ollama')
   const OLLAMA_MODELS_DIR = join(VENDOR_DIR, 'models')
   const OLLAMA_EXE = join(OLLAMA_DIR, 'ollama.exe')
-  const OLLAMA_LAUNCHER = join(VENDOR_DIR, 'run-ollama.cmd')
+  const OLLAMA_LAUNCHER = join(VENDOR_DIR, 'run-ollama.vbs')
 
   function writeOllamaLauncher() {
     try {
+      // VBS 里写绝对反斜杠路径，避免 "C:/a/b\c" 这种混合形态
+      const win = (p) => resolve(p).replace(/\//g, '\\')
       if (!existsSync(OLLAMA_EXE)) return false
       mkdirSync(VENDOR_DIR, { recursive: true })
-      // .cmd 必须纯 ASCII（cmd.exe 按 ANSI 读，中文会拆成命令）
-      const bat = [
-        '@echo off',
-        'set "OLLAMA_MODELS=' + OLLAMA_MODELS_DIR + '"',
-        'set "OLLAMA_HOST=127.0.0.1:11434"',
-        'set "OLLAMA_KEEP_ALIVE=30m"',
-        'start "" /B "' + OLLAMA_EXE + '" serve',
+      // 用 .vbs 而不是 .cmd：WScript.Shell.Run(name, 0, False) 的 0 = 窗口完全隐藏。
+      // cmd 的 start /B 仍会闪黑框，用户明确要求运行时不要弹出任何控制台。
+      const vbs = [
+        'Set sh = CreateObject("WScript.Shell")',
+        'sh.Environment("Process")("OLLAMA_MODELS") = "' + win(OLLAMA_MODELS_DIR) + '"',
+        'sh.Environment("Process")("OLLAMA_HOST") = "127.0.0.1:11434"',
+        'sh.Environment("Process")("OLLAMA_KEEP_ALIVE") = "30m"',
+        'sh.Run """' + win(OLLAMA_EXE) + '"" serve", 0, False',
+        'WScript.Quit 0',
       ].join('\r\n')
-      writeFileSync(OLLAMA_LAUNCHER, bat, 'ascii')
+      writeFileSync(OLLAMA_LAUNCHER, vbs, 'ascii')
       return true
     } catch { return false }
   }
@@ -2823,12 +2863,13 @@ export function apply(ctx) {
     if (!writeOllamaLauncher()) return { running: false, started: false, reason: '无法写启动脚本' }
     try {
       const { execFile } = await import('node:child_process')
-      const ps = 'Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{CommandLine=\'"' + OLLAMA_LAUNCHER + '"\'}'
-      await new Promise((res) => execFile('powershell', ['-NoProfile', '-Command', ps], { timeout: 8000 }, () => res(null)))
+      // wscript.exe 本身无窗口，再配 windowsHide 才是真正静默
+      const ps = 'Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{CommandLine=\'wscript.exe "' + OLLAMA_LAUNCHER + '"\'}'
+      await new Promise((res) => execFile('powershell', ['-NoProfile', '-WindowStyle', 'Hidden', '-Command', ps], { timeout: 8000, windowsHide: true }, () => res(null)))
     } catch {}
     for (let i = 0; i < 20; i++) {
       await new Promise((r) => setTimeout(r, 700))
-      if (await ollamaAlive(true)) return { running: true, started: true, via: 'vendor', waitedMs: (i + 1) * 700 }
+      if (await ollamaAlive(true)) { hookExitOnce(); return { running: true, started: true, via: 'vendor', waitedMs: (i + 1) * 700 } }
     }
     return { running: false, started: true, reason: '启动后 14 秒仍未就绪' }
   }
