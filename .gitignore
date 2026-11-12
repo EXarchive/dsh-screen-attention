@@ -29,5 +29,6 @@ helper/models/yolov8m.onnx
 *.bin
 .commitmsg.txt
 
-vendor/
-# embedded VLM runtime (ollama.exe + models, ~5GB) - rebuild via vendor/setup-runtime.ps1
+vendor/*
+!vendor/setup-runtime.ps1
+# embedded VLM runtime (ollama.exe + models, ~3GB) - rebuild via vendor/setup-runtime.ps1
