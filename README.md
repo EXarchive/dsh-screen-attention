@@ -150,16 +150,23 @@ powershell -ExecutionPolicy Bypass -File vendor/setup-runtime.ps1
 
 ## 已知限制：VLM 输出 `@@@@`
 
-现象：`qwen2.5vl:3b` 偶发只吐 `@`，且**会粘住整个 serve**（之后每张图都坏，直到卸载模型或重启）。实测结论（RTX 5070 Ti / ollama 0.40.16）：
+现象：`qwen2.5vl:3b` 偶发只吐 `@`，且**会传染**——一次坏之后不清状态，后续请求会连环坏，直到卸载模型或重启 serve。实测（RTX 5070 Ti / ollama 0.40.16）：
 
 | 条件 | 结果 |
 |---|---|
 | `num_ctx=4096`（ollama 默认） | 第一张图之后必坏，永久持续 |
-| `num_ctx=8192` | 大幅收敛（14 轮连续正常） |
-| 送图宽 546 / 672 | 稳定（10/10） |
-| 送图宽 1000+ | 密集截图 0/3 正常，必坏 |
+| `num_ctx=8192`（插件固定值） | 大幅收敛，但单张图仍会偶发翻车 |
+| 送图宽 672 / 470 / 329（同一张密集截图） | **三档都坏** —— 宽度只降低概率，不是保证 |
+| 送图宽 546 / 672（普通桌面画面） | 多数稳定（10/10 量级） |
+| 并发两个请求 | 12/12 正常（并发不是诱因） |
 
-所以插件侧固定做三件事：请求带 `num_ctx=8192`、送图宽度默认 672（上限 798）、坏结果先卸载重载重试（`narrate` 只重载不重启，避免 30s 冷加载打断讲解）。
+插件侧的处置（每层有上限，最坏 ~6s 收敛，不再无限爬）：
+
+1. 请求固定带 `num_ctx=8192`；送图宽度默认 672、上限 798。
+2. 坏结果先**换一张更小的图重问**（~200ms），再**卸载重载重试**（~4.5s）。
+3. 重启 serve 只在调用方显式 `allowRestart:true` 时才做（冷加载实测 30s+）。
+4. `state.vlmPoisoned` 传染性防守：上次坏过，下一次请求前先卸载一次。
+5. 坏文本**永不交给上层**：返回空串 + `degraded:true`；`saperm_vision` 另带 `vlm:{attempts, shrinks, effectiveW}` 便于排查。
 
 ## 生命周期与安全
 
@@ -177,7 +184,7 @@ powershell -ExecutionPolicy Bypass -File vendor/setup-runtime.ps1
 | Windows + vendor 完整 | 自动拉起内置 ollama |
 | Windows + 11434 已有服务 | 直接复用，不重复启动 |
 | vendor 缺失 / 缺模型 / 非 Windows | 报错并附**可复制的修复命令**（装配脚本 / `ollama pull` / `SA_OLLAMA_URL`） |
-| VLM 输出全 `@`（退化） | 实测与 `num_ctx` 和图宽相关：统一请求 `num_ctx=8192`、送图宽度 ≤672，仍退化则先卸载重载重试一次，再不行才重启 serve；绝不把 `@` 当结果交给上层 |
+| VLM 输出全 `@`（退化） | 有界重试阶梯：缩图重问 → 卸载重载 →（显式才）重启 serve；带毒状态守卫；坏结果置空并标 `degraded`，绝不把 `@` 当结果交给上层 |
 
 环境变量：`SA_OLLAMA_URL`（默认 http://127.0.0.1:11434）、`SA_VLM_MODEL`（默认 qwen2.5vl:3b）、`SA_HELPER_EXE`。
 
@@ -189,10 +196,25 @@ GPU 后端双保留：`cuda_v12`（RTX 20/30/40）+ `cuda_v13`（RTX 50）+ `vul
 # helper 改动后部署（同步 + MD5 校验）
 cd helper && dotnet build -c Release -o bin\Release\next && .\deploy.ps1
 
+# 全量回归（7 个套件，各自起 helper，串行，约 2 分钟）
+node tests/run-all.mjs        # --list 只看清单
+
 # 静态体检（类尺寸 / JS↔C# 接口一致性）
 node scripts/audit.mjs
 ```
 
-- 改工具注册后必须重启 DSH；热重载只换模块不刷新工具表。
+- 改工具注册后必须重启 DSH；热重载不可靠（实测线上可能停在旧模块），判别式自检与重启步骤见 `docs/RESTART.md`。
 - 批量增删 register 块后必须跑 apply 探针（真实 ctx 注册一遍），`node --check` 查不出未定义引用。
+
+### 回归套件（`node tests/run-all.mjs`）
+
+| 套件 | 覆盖 |
+|---|---|
+| `plugin-smoke` | 47 工具注册 / health / infer↔interpret 互斥 |
+| `prod-readiness` | 投产自检 21 项（watchdog 自愈、角色备注迁移、诊断字段、保留清理） |
+| `state-drift-test` | `refs` 归零 / 浮窗状态与 helper 对齐 / 快档屏幕坐标 |
+| `thread-gen-test` | 采集线程世代号（停后立刻启不双线程，`stats.loops`） |
+| `shared-buffer-smoke` | 60fps 采集下 7 个慢消费者不撕裂 |
+| `narrate-budget` | 短窗口讲解（首轮不计入时长预算） |
+| `vision-probe` | `saperm_vision` 识图（零副作用） |
 - 历史教训见 `docs/RETROSPECTIVE.md`，版本记录见 `CHANGELOG.md`。
