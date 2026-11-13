@@ -40,7 +40,7 @@ dotnet build -c Release
 | `helper/models/chinese-clip*/image_encoder.onnx` | ~1.16GB | 场景分类 / 角色特征嵌入 |
 | `helper/models/yolov8m.onnx` | ~50MB | 精确物体检测（`infer accurate:true`） |
 
-**可选：VLM 运行时**（`saperm_vlm` / `saperm_look` 需要，共 ~4.3GB）：
+**可选：VLM 运行时**（`saperm_vision` / `saperm_vlm` / `saperm_look` / `saperm_narrate` 需要，共 ~4.3GB）：
 
 ```powershell
 # 1) 下载 ollama 免安装版（~1.5GB）到 %TEMP%\ollama-win.zip
@@ -59,7 +59,7 @@ powershell -ExecutionPolicy Bypass -File vendor/setup-runtime.ps1
 
 ---
 
-## 工具清单（45 个）
+## 工具清单（47 个）
 
 ### 看懂屏幕（L0 观察，免审批）
 
@@ -69,6 +69,7 @@ powershell -ExecutionPolicy Bypass -File vendor/setup-runtime.ps1
 | `look` | **看并说出来**：抓画面 → VLM 理解 → 字幕推浮窗，一次调用完成 |
 | `narrate` | **实时讲解**：循环在插件内跑，按节奏抓最新帧→VLM→浮窗字幕；一次调用驱动全程，停止即关窗 |
 | `vlm` | 本地视觉理解（Qwen2.5-VL）：问"画面里有什么"，热态 ~0.8s 出中文描述 |
+| `vision` | **识图（只识别，零副作用）**：喂图片文件(`path`)或屏幕区域/窗口，只调识别引擎返回结果——不开浮窗、不推送会话、不启动采集。`engine` = `vlm`(默认) / `ocr` / `both` |
 | `view` | 截指定区域返回图片路径（多尺度观察，配合 rect 对应大图坐标） |
 | `glance` | 全屏缩略大图（~560 token），快速语义浏览 |
 | `sheet` | 多帧拼图：按画面变化选帧拼一张网格，一次看清一段时间 |
@@ -79,7 +80,8 @@ powershell -ExecutionPolicy Bypass -File vendor/setup-runtime.ps1
 | `animeface` | 动漫脸检测（框+置信度） |
 | `audio` | 听系统输出/麦克风：电平、是否人声（判断"有没有人在说话"） |
 
-> 本地图片文件 OCR 用 `see({ path })`；旧版 scan/detect/scene/ocr_file 均已并入 `see`。
+> 只想读图、不要任何副作用：`vision({ path })`（看图说话）/ `vision({ path, engine:'ocr' })`（只要文字）。
+> 旧版 scan/detect/scene/ocr_file 均已并入 `see`。
 
 ### 持续观察（L0）
 
@@ -146,6 +148,19 @@ powershell -ExecutionPolicy Bypass -File vendor/setup-runtime.ps1
 | 磁盘 | ONNX 模型 ~1.6GB；vendor VLM 运行时 ~4.3GB（可选） |
 | 性能 | infer 全模式 6.7-6.9fps（DirectML）；VLM 热态 0.8-1.6s/次；静止画面自动降频 CPU<10% |
 
+## 已知限制：VLM 输出 `@@@@`
+
+现象：`qwen2.5vl:3b` 偶发只吐 `@`，且**会粘住整个 serve**（之后每张图都坏，直到卸载模型或重启）。实测结论（RTX 5070 Ti / ollama 0.40.16）：
+
+| 条件 | 结果 |
+|---|---|
+| `num_ctx=4096`（ollama 默认） | 第一张图之后必坏，永久持续 |
+| `num_ctx=8192` | 大幅收敛（14 轮连续正常） |
+| 送图宽 546 / 672 | 稳定（10/10） |
+| 送图宽 1000+ | 密集截图 0/3 正常，必坏 |
+
+所以插件侧固定做三件事：请求带 `num_ctx=8192`、送图宽度默认 672（上限 798）、坏结果先卸载重载重试（`narrate` 只重载不重启，避免 30s 冷加载打断讲解）。
+
 ## 生命周期与安全
 
 - **关一个全关**：DSH 退出 → `dispose()` + exit/SIGINT/SIGTERM hook 杀掉 helper 与 vendor ollama，不留孤儿进程。只杀 `vendor\ollama` 路径下的进程，不碰系统安装的 Ollama。
@@ -160,7 +175,7 @@ powershell -ExecutionPolicy Bypass -File vendor/setup-runtime.ps1
 | Windows + vendor 完整 | 自动拉起内置 ollama |
 | Windows + 11434 已有服务 | 直接复用，不重复启动 |
 | vendor 缺失 / 缺模型 / 非 Windows | 报错并附**可复制的修复命令**（装配脚本 / `ollama pull` / `SA_OLLAMA_URL`） |
-| tokenizer 退化（输出全 `@`） | 自动重启 serve 重试一次（60s 防抖） |
+| VLM 输出全 `@`（退化） | 实测与 `num_ctx` 和图宽相关：统一请求 `num_ctx=8192`、送图宽度 ≤672，仍退化则先卸载重载重试一次，再不行才重启 serve；绝不把 `@` 当结果交给上层 |
 
 环境变量：`SA_OLLAMA_URL`（默认 http://127.0.0.1:11434）、`SA_VLM_MODEL`（默认 qwen2.5vl:3b）、`SA_HELPER_EXE`。
 

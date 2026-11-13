@@ -1,5 +1,45 @@
 # Changelog (dsh-screen-attention)
 
+## v1.20.8 (2026-11-13) — 新工具 `saperm_vision`（只识别、零副作用）+ 定位 `@@@@` 根因
+
+### 新工具：`saperm_vision`（识图，46 → 47）
+调用方经常只需要「把这张图读出来」，但 `see` 会开浮窗、`look` 会写字幕、`vlm` 只能抓屏幕喂不了文件。
+新工具只做三件事：取图 → 识别 → 返回，**不开浮窗、不推送到会话、不启动采集、不写采集状态**。
+
+| 参数 | 作用 |
+|---|---|
+| `path` | 图片文件路径（jpg/png/webp/bmp）；给了就不抓屏 |
+| `hwnd` / `x,y,w,h` / `full` | 不给 path 时的取图范围（默认前台窗口） |
+| `engine` | `vlm`(默认，看图说话) / `ocr`(文字+坐标) / `both` |
+| `prompt` / `maxTokens` / `maxTexts` / `scale` / `maxW` | 各引擎参数 |
+
+图片文件走新增的 helper 动作 `image_embed`（解码 + 按 `maxW` 缩放 + JPEG 编码），
+避免把 4K PNG 原图整段塞进请求；纯 `vlm` 模式不落盘，只有 `ocr` 需要写临时 jpg。
+实测（全屏 672 宽）：10/10 正常，热态平均 1.4s；`engine:both` 一次给出 OCR 5 条 + 一句画面描述 1.7s。
+
+### 定位并大幅收敛：VLM 一直吐 `@@@@`
+老注释把它当成「tokenizer 退化，唯一解法重启 serve」，实测不是。证据链：
+
+| 变量 | 实测 |
+|---|---|
+| `num_ctx=4096`（默认） | 第一张图之后**永久**坏，连续 14 次全 `@` |
+| `num_ctx=8192` | 14 轮连续正常（第 2 轮起命中 prompt cache 147ms） |
+| 送图宽 546 / 672 | 稳定（10/10） |
+| 送图宽 1000（同一张密集截图） | 0/3 正常 |
+| 卸载模型（`keep_alive:0`）后重载 | 能换一次采样，坏图可能转好 |
+| 并发两个请求 | 12/12 正常（并发不是诱因） |
+
+配套改动：
+- 四个 VLM 调用点（`vlm`/`vision`/`look`/`narrate`）收敛到共享 `vlmAsk()`：固定 `num_ctx=8192`、坏结果两级重试（卸载重载 → 重启 serve）、**坏文本永不交给上层**（返回空串 + `degraded:true`）。
+- 送图宽度：新增 `VLM_SAFE_W=672` / `VLM_MAX_W=798`；`vlm`/`look`/`vision` 的抓图与 `maxW` 全部压到 672，`narrate` 保持 546。
+- launcher 增加 `OLLAMA_CONTEXT_LENGTH=8192`，避免首个请求触发重载。
+- `narrate` 走 `noRestart`：只卸载重载、不重启 serve（重启后冷加载实测 30s+，代价远大于丢一帧）。
+
+### 验收
+- `saperm_vision`：47 个工具正常注册；非法 engine 报错；`ocr` 8 条 / `both` 1.7s；`overlayOpen=false`、`holds=0`（确认零副作用）。
+- 全屏 672 宽连续 10 轮：10/10 正常，平均 1.4s。
+- `narrate` 20 秒：8 条、0 错误（≈2s 一条）。
+- helper 重新编译部署（`image_embed`），deploy 14 dll 校验通过。
 ## v1.20.7 (2026-11-13) — C# 三个必修项
 
 ### B-1 `frames_stop` 打死采集（工具组合可达）

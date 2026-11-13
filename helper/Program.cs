@@ -3148,6 +3148,28 @@ class Program
                     return ImageFile.Ocr(path, scale);
                 }
 
+            case "image_embed":
+                {
+                    // 图片文件 -> 缩放后的 JPEG base64（给 VLM / 识图入口用）。
+                    // 走 helper 解码而不是让调用方直接 base64 原图：4K PNG 原图 ~8MB，
+                    // 塞进请求体只是浪费带宽，模型反正要缩到 ~1024。
+                    string embPath = req.GetProperty("path").GetString();
+                    if (string.IsNullOrWhiteSpace(embPath) || !System.IO.File.Exists(embPath))
+                        return new { ok = false, error = "file not found: " + embPath };
+                    int embMaxW = req.TryGetProperty("maxW", out var pmwe) ? pmwe.GetInt32() : 1260;
+                    var (embBuf, embW, embH0) = ImageFile.Load(embPath);
+                    int embW2 = (embMaxW > 0 && embMaxW < embW) ? embMaxW : embW;
+                    int embH2 = Math.Max(1, (int)Math.Round(embH0 * (double)embW2 / embW));
+                    byte[] embUse = embW2 < embW ? Gdi.ScaleBuffer(embBuf, embW, embH0, embW2, embH2) : embBuf;
+                    string embTmp = Path.Combine(Path.GetTempPath(), "sa-img-" + Guid.NewGuid().ToString("N") + ".jpg");
+                    var embJpg = GdiPlus.EncodeJpeg(embUse, embW2, embH2, embTmp);
+                    return new
+                    {
+                        ok = true, path = embPath,
+                        w = embW2, h = embH2, srcW = embW, srcH = embH0,
+                        jpegB64 = Convert.ToBase64String(embJpg), bytes = embJpg.Length,
+                    };
+                }
             case "click":
                 {
                     GuardInject();
