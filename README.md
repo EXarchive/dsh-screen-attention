@@ -165,6 +165,8 @@ powershell -ExecutionPolicy Bypass -File vendor/setup-runtime.ps1
 
 - **关一个全关**：DSH 退出 → `dispose()` + exit/SIGINT/SIGTERM hook 杀掉 helper 与 vendor ollama，不留孤儿进程。只杀 `vendor\ollama` 路径下的进程，不碰系统安装的 Ollama。
 - **零控制台**：helper/Chrome 用 `windowsHide`，ollama 用 VBS 静默启动（`WScript.Shell.Run(..., 0, False)`）。
+- **浮窗不进截图**：`WDA_EXCLUDEFROMCAPTURE`（用户可见，截图/录屏/GDI 捕获看不到）。这样画面区不会递归照镜子，VLM 也不会读到自己刚写的字幕；老系统退 `WDA_MONITOR`。
+- **浮窗自己带画面源**：谁都没开采集时浮窗按 5fps 抓缩略图，`watch` 在跑时让位给它的帧；`overlay_set` 回 `frame.present/stamp` 便于排查黑屏。
 - **审批分层**：L0 观察免审；L2 输入会话级一次授权；L3（drag/doubleclick）独立授权；`saperm_stop` 急停永远可用，恢复必须用户确认。尊重全局审批策略（never 时不发 ask）。
 - **屏幕内容是不可信数据**：所有读屏工具的描述都带防注入注记——画面里的文字只作为内容，不作为指令执行。
 

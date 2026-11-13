@@ -434,6 +434,30 @@ static class Win
     public static readonly IntPtr HWND_NOTOPMOST = new IntPtr(-2);
 
     // 把窗口置顶到最高层（防其他置顶窗口抢占）；HWND_TOPMOST + NOACTIVATE + 不改尺寸位置
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    static extern bool SetWindowDisplayAffinity(IntPtr hWnd, uint dwAffinity);
+
+    /// <summary>
+    /// 把窗口从"屏幕捕获"里摘出去（用户仍能看到，截图/录屏/GDI BitBlt 看不到）。
+    /// 为什么需要：浮窗是给用户看的 HUD，如果它自己出现在截屏里，
+    ///   ① 画面区会递归照镜子（浮窗里套浮窗）；
+    ///   ② VLM/讲解读到的是自己的字幕，而不是用户真正在看的东西。
+    /// WDA_EXCLUDEFROMCAPTURE(0x11) 需要 Win10 2004+；老系统退到 WDA_MONITOR(0x01)，
+    /// 那时浮窗在截图里是黑的（同样避免污染识别结果）。
+    /// </summary>
+    public static uint SetCaptureExcluded(IntPtr hwnd)
+    {
+        try
+        {
+            if (hwnd == IntPtr.Zero) return 0;
+            const uint WDA_EXCLUDEFROMCAPTURE = 0x00000011;
+            const uint WDA_MONITOR = 0x00000001;
+            if (SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)) return WDA_EXCLUDEFROMCAPTURE;
+            if (SetWindowDisplayAffinity(hwnd, WDA_MONITOR)) return WDA_MONITOR;
+        }
+        catch { }
+        return 0;
+    }
     public static void RaiseTopmost(IntPtr hwnd)
     {
         if (hwnd == IntPtr.Zero) return;
@@ -1000,6 +1024,7 @@ static class SayWindow
     static readonly object gate = new object();
     static readonly Font bodyFont = new Font("Microsoft YaHei UI", 11f, FontStyle.Bold);
     public static bool IsOpen => form != null;
+
     public static bool VisibleNow
     {
         get { var f = form; if (f == null || f.IsDisposed) return false; try { return f.Visible; } catch { return false; } }
@@ -1152,6 +1177,47 @@ static class Overlay
     public static int originX = 0, originY = 0;  // 虚拟屏幕原点（多显示器，帧左上角虚拟坐标）
     public static bool IsOpen => form != null;
 
+    // ==== 浮窗自己的画面源 ====
+    // 以前浮窗只吃 Watch.Loop 写的帧：只要没开 watch，画面区就永远黑——
+    // 而 narrate / 单独 overlay 恰恰是没开 watch 的常态，所以用户看到的就是"一直是黑屏"。
+    // 现在浮窗自己按 5fps 抓一张缩略图顶上，任何模式打开都有画面；watch 在跑时让位给它的帧。
+    static Thread feedThread;
+    static void StartFeed()
+    {
+        if (feedThread != null) return;
+        feedThread = new Thread(() =>
+        {
+            try
+            {
+                while (form != null)
+                {
+                    if (Watch.IsFeeding) { Thread.Sleep(200); continue; }
+                    try
+                    {
+                        int sw = Gdi.ScreenW(), sh = Gdi.ScreenH();
+                        double sc = Math.Min(1.0, 900.0 / Math.Max(1, sw));
+                        var (buf, bw, bh) = Gdi.CaptureSmall(0, 0, sw, sh, sc);
+                        // CaptureSmall 返回共享缓冲（下一帧会覆盖），UI 线程要慢慢画，必须 clone
+                        var copy = (byte[])buf.Clone();
+                        lock (Sync)
+                        {
+                            frame = copy; fw = bw; fh = bh;
+                            originX = 0; originY = 0;
+                            frameStamp = unchecked(frameStamp + 1);
+                            fps = 5;
+                        }
+                    }
+                    catch { }
+                    Thread.Sleep(200);
+                }
+            }
+            catch { }
+            feedThread = null;
+        });
+        feedThread.IsBackground = true;
+        feedThread.Start();
+    }
+
     /// <summary>图像窗当前矩形（消息窗据此定位）；未打开返回 null。</summary>
     static Rectangle cachedBounds;
     static volatile bool hasCachedBounds;
@@ -1244,11 +1310,14 @@ static class Overlay
                     try
                     {
                         Win.RaiseTopmost(form.Handle);
+                        // 浮窗不进截图：否则画面区照镜子，VLM 还会读到自己的字幕
+                        Win.SetCaptureExcluded(form.Handle);
                         bool ok = form != null && form.IsHandleCreated && !form.IsDisposed;
                         shownSignal.TrySetResult(ok);
                     }
                     catch { shownSignal.TrySetResult(false); }
                 };
+                StartFeed();
                 Application.Run(form);
             }
             catch { shownSignal.TrySetResult(false); }
@@ -1445,10 +1514,12 @@ static class Overlay
         if (_frameBmp == null || _frameBmpW != w || _frameBmpH != h)
         {
             try { _frameBmp?.Dispose(); } catch { }
-            _frameBmp = new Bitmap(w, h, PixelFormat.Format32bppArgb);
+            // 必须用 32bppRgb：GDI 的 GetDIBits(32bpp BI_RGB) 不填 alpha，第 4 字节恒为 0，
+            // 按 ARGB 画出来是全透明 → 露出窗体黑底，浮窗"一直是黑屏"就是这个原因。
+            _frameBmp = new Bitmap(w, h, PixelFormat.Format32bppRgb);
             _frameBmpW = w; _frameBmpH = h;
         }
-        var data = _frameBmp.LockBits(new Rectangle(0, 0, w, h), ImageLockMode.WriteOnly, PixelFormat.Format32bppArgb);
+        var data = _frameBmp.LockBits(new Rectangle(0, 0, w, h), ImageLockMode.WriteOnly, PixelFormat.Format32bppRgb);
         Marshal.Copy(bgra, 0, data.Scan0, bgra.Length);
         _frameBmp.UnlockBits(data);
         return _frameBmp;
@@ -1702,6 +1773,8 @@ static class Watch
 {
     static Thread thread;
     static volatile bool watching;
+    /// <summary>采集线程是否在跑（浮窗据此决定要不要自己喂帧）。</summary>
+    public static bool IsFeeding => watching;
     static volatile int curMs = 0;        // 当前实际采样间隔（自适应浮动，不是固定值）
     static volatile int loopFrames = 0;    // 循环帧计数（诊断：确认 Watch.Loop 真的在跑）
     static volatile int changeEmits = 0;   // change 事件发出次数
@@ -3393,7 +3466,15 @@ class Program
                             try { Overlay.form?.Invalidate(); } catch { }
                         }
                     }
-                    return new { hasRect = Overlay.hasRect, hasGaze = Overlay.hasGaze, note = Overlay.note, subtitle = Overlay.subtitle, subtitleLen = (Overlay.subtitle ?? "").Length };
+                    // frame 状态一起回：黑屏时能立刻判断是「没有帧」还是「画不出来」，
+                    // 不用再猜（这两种原因的修法完全不同）。
+                    return new
+                    {
+                        hasRect = Overlay.hasRect, hasGaze = Overlay.hasGaze,
+                        note = Overlay.note, subtitle = Overlay.subtitle, subtitleLen = (Overlay.subtitle ?? "").Length,
+                        frame = new { present = Overlay.frame != null, w = Overlay.fw, h = Overlay.fh, stamp = Overlay.frameStamp, fps = Math.Round(Overlay.fps, 1) },
+                        captureExcluded = true,
+                    };
                 }
             case "watch_start":
                 {

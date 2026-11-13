@@ -1,5 +1,34 @@
 # Changelog (dsh-screen-attention)
 
+## v1.20.9 (2026-11-13) — 修浮窗一直是黑屏（两个独立根因）
+
+### 根因 1：画面是全透明的，只剩窗体黑底
+`BgraToBitmap` 把 GDI 的 BGRA 拷进 `PixelFormat.Format32bppArgb` 位图。
+GDI 的 `GetDIBits`（32bpp / BI_RGB）**不填 alpha**，第 4 字节恒为 0，
+于是 DrawImage 画出来整张图 alpha=0 = 全透明，露出 `BackColor=Black` —— 视觉上就是黑屏。
+改：位图与 `LockBits` 都用 `Format32bppRgb`（GDI+ 忽略 alpha），零额外开销。
+
+### 根因 2：没有采集时根本没有帧
+`Overlay.frame` 只有 `Watch.Loop()` 会写。`narrate` 和单独用 `overlay` 时 watch 没跑，
+`PaintFrame` 里 `frame == null`，只画出信息条和字幕 → 画面区还是黑的。
+改：`Overlay.StartFeed()`——浮窗自己按 5fps 抓 900px 缩略图（clone 后再交给 UI 线程），
+watch 在跑时让位给它的帧，浮窗关闭即退出。实测讲解期间 `frame.stamp` 25 → 32、`fps=5`，有画面。
+
+### 顺带：浮窗不再进截图
+`SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)`（Win10 2004+，老系统退 `WDA_MONITOR`）。
+解决两件事：画面区不会递归照镜子；VLM/讲解读到的不是自己的字幕，而是用户真正在看的内容。
+实测：浮窗 760×520 开着时抓同一块区域，只看到桌面内容，没有浮窗/字幕/镜子。
+
+### 诊断增强
+`overlay_set` 现在回 `frame: { present, w, h, stamp, fps }` —— 黑屏时能直接判断是「没有帧」还是「画不出来」。
+
+### 验收
+| 项 | 结果 |
+|---|---|
+| 修 alpha 后抓浮窗区域 | 画面区显示桌面内容 + 字幕条 + 状态条（不再是黑块） |
+| watch 停掉后 | 自供帧接管（900×562、`fps=5`、stamp 递增） |
+| 浮窗排除捕获 | 抓同一区域只见桌面，无浮窗、无字幕、无镜像 |
+| 讲解 16 秒 | 4 条、0 错误，期间帧持续更新，停止后 `overlayOpen=false` |
 ## v1.20.8 (2026-11-13) — 新工具 `saperm_vision`（只识别、零副作用）+ 定位 `@@@@` 根因
 
 ### 新工具：`saperm_vision`（识图，46 → 47）
