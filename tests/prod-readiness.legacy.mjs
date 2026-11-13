@@ -1,3 +1,7 @@
+// LEGACY：这一版针对合并前的 61 工具 API（saperm_infer_start / saperm_overlay_open / saperm_char_register …）
+// 以及已不存在的 health 字段（watchdog / fgTitle）。合并成 action 入口后这里会直接抛 undefined。
+// 保留原因：它覆盖的行为仍值得回归（watchdog 崩溃自愈、隐私遮蔽、char 备注迁移）。
+// 迁移前不要放进回归集；迁移时按新 API 重写：saperm_infer({action:status}) / saperm_overlay({action:open}) / saperm_char({action:register})。
 import assert from 'node:assert/strict'
 
 const mod = await import('file:///C:/Users/Administrator/PycharmProjects/dsh-screen-attention/permission-plugin/lib/index.js')

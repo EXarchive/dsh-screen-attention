@@ -298,6 +298,31 @@ static class Gdi
         return (ScaleBuffer(src, sw, sh, dw, dh), dw, dh);
     }
 
+    /// <summary>
+    /// 抓一份**调用方独占**的画面。推理类消费者（OCR/检测/CLIP/动漫脸/JPEG 编码）要跑几十到几千毫秒，
+    /// 期间采集线程会继续用 Gdi.Capture 覆写共享 _capBuf —— 同尺寸（全屏）时就是同一块内存，
+    /// 读到撕裂帧的表现是"OCR 结果时好时坏、偶尔串行错乱"，极难复现。
+    /// 这里在锁内克隆一份，成本 16MB 一次，只给慢消费者用；快路径（运动差分、FrameHub 立即拷贝）保持零拷贝。
+    /// </summary>
+    public static (byte[] buf, int w, int h) CaptureOwn(int x, int y, int w, int h)
+    {
+        lock (CapLock)
+        {
+            var (buf, bw, bh) = Capture(x, y, w, h);   // 同一线程重入锁，安全
+            return (ReferenceEquals(buf, _capBuf) ? (byte[])buf.Clone() : buf, bw, bh);
+        }
+    }
+
+    /// <summary>缩放版独占抓图（screenshot 编码 JPEG 前用）。</summary>
+    public static (byte[] buf, int w, int h) CaptureScaledOwn(int x, int y, int w, int h, double scale)
+    {
+        var (buf, bw, bh) = CaptureOwn(x, y, w, h);
+        if (Math.Abs(scale - 1.0) < 0.01) return (buf, bw, bh);
+        int dw = Math.Max(1, (int)Math.Round(bw * scale));
+        int dh = Math.Max(1, (int)Math.Round(bh * scale));
+        return (ScaleBuffer(buf, bw, bh, dw, dh), dw, dh);
+    }
+
     [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr hwnd, IntPtr hdc, uint flags);
     [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr h);
 
@@ -1619,7 +1644,9 @@ static class FrameHub
             if (!running)
             {
                 running = true;
-                thread = new Thread(Loop) { IsBackground = true };
+                gen++;                 // 换代：上一代线程在下一轮循环自己退出
+                int myGen = gen;
+                thread = new Thread(() => Loop(myGen)) { IsBackground = true };
                 thread.Start();
             }
         }
@@ -1684,7 +1711,8 @@ static class FrameHub
                 gaps = Gaps,
                 maxGapMs = MaxGapMs,
                 dropped = Gaps,
-                expectedFrames = (long)Math.Round(el * TargetFps / 1000.0)
+                expectedFrames = (long)Math.Round(el * TargetFps / 1000.0),
+                loops = loops,          // 采集循环数：>1 说明旧线程没退出（世代号失效）
             };
         }
     }
@@ -1693,14 +1721,24 @@ static class FrameHub
     {
         // 强制停：引用计数一并清零，否则下次 Acquire 只把 refs 加到 2，
         // 「refs==1 && !running」永不成立 → 采集线程再也起不来。
-        lock (L) { running = false; refs = 0; System.Threading.Monitor.PulseAll(L); }
+        lock (L) { running = false; refs = 0; gen++; System.Threading.Monitor.PulseAll(L); }
     }
 
-    static void Loop()
+    // 世代号：stop→立刻 start 时，旧线程可能还在 WaitNext/拷贝里没退出。
+    // 只靠 volatile bool 会让两条采集线程并存（重复帧、重复 change 事件、双倍 CPU）。
+    static int gen;
+    // 同时在跑的采集循环数：世代号修复后恒为 1。用吞吐推断双线程不可靠（Capture 有锁会互相串行化），
+    // 所以直接把这个数暴露出去，成为可断言的证据。
+    static int loops;
+
+    static void Loop(int myGen)
     {
         int sw = Gdi.ScreenW(), sh = Gdi.ScreenH();
         long fpsTs = Environment.TickCount64, fpsFrames = 0;
-        while (running)
+        System.Threading.Interlocked.Increment(ref loops);
+        try
+        {
+        while (running && myGen == gen)
         {
             var t0 = Stopwatch.StartNew();
             long dt = 0; int ms = 0;
@@ -1766,6 +1804,8 @@ static class FrameHub
             if (sleep > 0) Thread.Sleep(sleep);
             else if (sleep < -2) { /* 落后于目标帧率：记一次欠帧 */ }
         }
+        }
+        finally { System.Threading.Interlocked.Decrement(ref loops); }
     }
 }
 
@@ -1807,12 +1847,14 @@ static class Watch
         curMs = IntervalMs;               // 从基准起步，之后自己浮动
         if (watching) return;
         watching = true;
+        gen++;
+        int myGen = gen;
         FrameHub.Acquire();
-        thread = new Thread(Loop) { IsBackground = true };
+        thread = new Thread(() => Loop(myGen)) { IsBackground = true };
         thread.Start();
     }
 
-    public static void Stop() { watching = false; FrameHub.Release(); }
+    public static void Stop() { watching = false; gen++; FrameHub.Release(); }
 
     // 稀疏网格采样（步长 32px）：当前帧与上一帧逐格比较，统计变化率与包围盒
     static readonly int[] RecentChanges = new int[6];  // 近 6 帧变化点数（滑动窗口）
@@ -1888,7 +1930,9 @@ static class Watch
         return changes;
     }
 
-    static void Loop()
+    static int gen;
+
+    static void Loop(int myGen)
     {
         long lastSeen = 0;
         long lastTick = 0;
@@ -1968,7 +2012,7 @@ static class Watch
             {
                 int x = Math.Max(0, ocrRect.X - 8), y = Math.Max(0, ocrRect.Y - 8);
                 int w = Math.Min(sw - x, ocrRect.Width + 16), h = Math.Min(sh - y, ocrRect.Height + 16);
-                var (buf, fw, fh) = Gdi.Capture(x, y, w, h);
+                var (buf, fw, fh) = Gdi.CaptureOwn(x, y, w, h);
                 var res = Ocr.Run(buf, fw, fh, 2.0);
                 var items = (res.TryGetValue("items", out var iv) && iv is List<Dictionary<string, object>> list) ? list : new List<Dictionary<string, object>>();
                 var texts = items.Select(t => t.TryGetValue("text", out var tv) ? Convert.ToString(tv) : "").Where(s => !string.IsNullOrEmpty(s)).ToList();
@@ -2016,12 +2060,14 @@ static class Interpret
             ticks = 0; ocrRuns = 0; totalOcrMs = 0; prevBuf = null;
         }
         running = true;
+        gen++;
+        int myGen = gen;
         FrameHub.Acquire();
-        thread = new Thread(Loop) { IsBackground = true };
+        thread = new Thread(() => Loop(myGen)) { IsBackground = true };
         thread.Start();
     }
 
-    public static void Stop() { running = false; FrameHub.Release(); }
+    public static void Stop() { running = false; gen++; FrameHub.Release(); }
 
     static long Percentile(int p)
     {
@@ -2090,11 +2136,13 @@ static class Interpret
         return new Rectangle(x, y, w, h);
     }
 
-    static void Loop()
+    static int gen;
+
+    static void Loop(int myGen)
     {
         long lastSeen = 0;
         int sw = Gdi.ScreenW(), sh = Gdi.ScreenH();
-        while (running)
+        while (running && myGen == gen)
         {
             var t0 = Stopwatch.StartNew();
             try
@@ -2118,7 +2166,7 @@ static class Interpret
                     int pad = 12;
                     int x = Math.Max(0, rect.X - pad), y = Math.Max(0, rect.Y - pad);
                     int cw = Math.Min(sw - x, rect.Width + pad * 2), ch = Math.Min(sh - y, rect.Height + pad * 2);
-                    var (rb, rw, rh) = Gdi.Capture(x, y, cw, ch);
+                    var (rb, rw, rh) = Gdi.CaptureOwn(x, y, cw, ch);
                     // 区域限幅：大区域降 scale + 限制识别框数（控制单次 OCR 预算）
                     long area = (long)cw * ch;
                     double scale = 1.5;
@@ -2267,12 +2315,14 @@ static class Infer
         if (withScene || withObjects) ClipScene.WarmupAsync();
         if (running) return;
         running = true;
+        gen++;
+        int myGen = gen;
         FrameHub.Acquire();
-        thread = new Thread(Loop) { IsBackground = true };
+        thread = new Thread(() => Loop(myGen)) { IsBackground = true };
         thread.Start();
     }
 
-    public static void Stop() { running = false; FrameHub.Release(); }
+    public static void Stop() { running = false; gen++; FrameHub.Release(); }
 
     static double IouDet(System.Collections.Generic.Dictionary<string, object> d, Track t)
     {
@@ -2514,11 +2564,13 @@ static class Infer
         }
     }
 
-    static void Loop()
+    static int gen;
+
+    static void Loop(int myGen)
     {
         long lastSeen = 0;
         long fpsTs = Environment.TickCount64, fpsCount = 0;
-        while (running)
+        while (running && myGen == gen)
         {
             var frame = FrameHub.WaitNext(lastSeen, 300, out int w, out int h, out long seq, out _);
             if (frame == null) { lock (L) latestErr = "等待新帧超时（采集已停止？）"; continue; }
@@ -2981,7 +3033,7 @@ class Program
                     double scale = userScale > 0 ? userScale : (maxW > 0 && w > maxW ? (double)maxW / w : 1.0);
                     if (w <= 0) w = 1;
                     if (h <= 0) h = 1;
-                    var (buf, bw, bh) = Gdi.CaptureScaled(x, y, w, h, scale);
+                    var (buf, bw, bh) = Gdi.CaptureScaledOwn(x, y, w, h, scale);
                     string tmpDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Temp");
                     Directory.CreateDirectory(tmpDir);
                     string tmp = Path.Combine(tmpDir, "sa-" + Guid.NewGuid().ToString("N") + ".jpg");
@@ -3202,7 +3254,7 @@ class Program
                     int w = req.TryGetProperty("w", out var pw) ? pw.GetInt32() : sw - x;
                     int h = req.TryGetProperty("h", out var ph) ? ph.GetInt32() : sh - y;
                     double scale = req.TryGetProperty("scale", out var ps) ? ps.GetDouble() : 1.0;
-                    var (buf, bw, bh) = Gdi.Capture(x, y, w, h);
+                    var (buf, bw, bh) = Gdi.CaptureOwn(x, y, w, h);
                     var res = Ocr.Run(buf, bw, bh, scale);
                     var d = new Dictionary<string, object>(res) { { "rect", new { x, y, w, h } } };
                     return d;
@@ -3513,7 +3565,7 @@ class Program
                     string path = req.TryGetProperty("path", out var pcr) ? pcr.GetString() : null;
                     byte[] buf; int w, h;
                     if (!string.IsNullOrEmpty(path)) { var (b, ww, hh) = ImageFile.Load(path); buf = b; w = ww; h = hh; }
-                    else { int sw = Gdi.ScreenW(), sh = Gdi.ScreenH(); (buf, w, h) = Gdi.Capture(0, 0, sw, sh); }
+                    else { int sw = Gdi.ScreenW(), sh = Gdi.ScreenH(); (buf, w, h) = Gdi.CaptureOwn(0, 0, sw, sh); }
                     bool hasRegion = req.TryGetProperty("x", out _) && req.TryGetProperty("y", out _) && req.TryGetProperty("w", out _) && req.TryGetProperty("h", out _);
                     int rx = hasRegion ? req.GetProperty("x").GetInt32() : 0;
                     int ry = hasRegion ? req.GetProperty("y").GetInt32() : 0;
@@ -3580,7 +3632,7 @@ class Program
                     string path = req.TryGetProperty("path", out var pcm) ? pcm.GetString() : null;
                     byte[] buf; int w, h;
                     if (!string.IsNullOrEmpty(path)) { var (b, ww, hh) = ImageFile.Load(path); buf = b; w = ww; h = hh; }
-                    else { int sw = Gdi.ScreenW(), sh = Gdi.ScreenH(); (buf, w, h) = Gdi.Capture(0, 0, sw, sh); }
+                    else { int sw = Gdi.ScreenW(), sh = Gdi.ScreenH(); (buf, w, h) = Gdi.CaptureOwn(0, 0, sw, sh); }
                     bool hasRegion = req.TryGetProperty("x", out _) && req.TryGetProperty("y", out _) && req.TryGetProperty("w", out _) && req.TryGetProperty("h", out _);
                     var results = new List<Dictionary<string, object>>();
                     if (hasRegion)
@@ -3610,7 +3662,7 @@ class Program
                     string path = req.TryGetProperty("path", out var paf) ? paf.GetString() : null;
                     byte[] buf; int w, h;
                     if (!string.IsNullOrEmpty(path)) { var (b, ww, hh) = ImageFile.Load(path); buf = b; w = ww; h = hh; }
-                    else { int sw = Gdi.ScreenW(), sh = Gdi.ScreenH(); (buf, w, h) = Gdi.Capture(0, 0, sw, sh); }
+                    else { int sw = Gdi.ScreenW(), sh = Gdi.ScreenH(); (buf, w, h) = Gdi.CaptureOwn(0, 0, sw, sh); }
                     float cf = req.TryGetProperty("conf", out var pcf) ? (float)pcf.GetDouble() : 0.25f;
                     int mf = req.TryGetProperty("maxFaces", out var pmf) ? pmf.GetInt32() : 20;
                     var res = AnimeFaceDetect.Run(buf, w, h, cf, mf);
@@ -3717,7 +3769,7 @@ class Program
                     string path = req.TryGetProperty("path", out var psp) ? psp.GetString() : null;
                     byte[] buf; int w, h;
                     if (!string.IsNullOrEmpty(path)) { var (b, ww, hh) = ImageFile.Load(path); buf = b; w = ww; h = hh; }
-                    else { int sw = Gdi.ScreenW(), sh = Gdi.ScreenH(); (buf, w, h) = Gdi.Capture(0, 0, sw, sh); }
+                    else { int sw = Gdi.ScreenW(), sh = Gdi.ScreenH(); (buf, w, h) = Gdi.CaptureOwn(0, 0, sw, sh); }
                     int topK = req.TryGetProperty("topK", out var ptk) ? ptk.GetInt32() : 5;
                     var res = ClipScene.Run(buf, w, h, topK);
                     res["rect"] = new { x = 0, y = 0, w, h };
@@ -3728,7 +3780,7 @@ class Program
                     string path = req.TryGetProperty("path", out var pdp) ? pdp.GetString() : null;
                     byte[] buf; int w, h;
                     if (!string.IsNullOrEmpty(path)) { var (b, ww, hh) = ImageFile.Load(path); buf = b; w = ww; h = hh; }
-                    else { int sw = Gdi.ScreenW(), sh = Gdi.ScreenH(); (buf, w, h) = Gdi.Capture(0, 0, sw, sh); }
+                    else { int sw = Gdi.ScreenW(), sh = Gdi.ScreenH(); (buf, w, h) = Gdi.CaptureOwn(0, 0, sw, sh); }
                     bool accurate = req.TryGetProperty("model", out var pmd) && (pmd.GetString() == "m" || pmd.GetString() == "l" || pmd.GetString() == "x");
                     var res = YoloDetect.Run(buf, w, h, accurate);
                     res["rect"] = new { x = 0, y = 0, w, h };

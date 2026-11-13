@@ -187,7 +187,7 @@ helper 崩溃看门狗 3s 重启；协议握手版本号；单调时钟序号跨
 - **AI 自主视角（多尺度）**：`saperm_view`{x,y,w,h,scale,maxW,note} 任意区域+缩放截图→存 out/sa-view/*.jpg 返回 {path, rect}（统一虚拟屏幕坐标，小图 rect 即大图子区域）+自动同步 overlay 红框（小窗=AI 视线）；`saperm_glance` 全屏大图。实测 big(0,0,1920,1080)↔small(500,300,400,250)@2x 视觉对应正确。
 - **输出端汇报**：`watch_focus` + 焦点 OCR 增量 diff（added 字段）——对话滚动即感知 AI 自己的输出。
 - 命令：`overlay_open/overlay_close/overlay_set`、`watch_start/watch_stop/watch_status/watch_focus/watch_snapshot`、`screenshot`(区域 x/y/w/h+scale)。
-- 插件侧 L1 免审工具：`saperm_overlay_open/close/set`、`saperm_watch_start/stop/status/focus/link/unlink`、`saperm_observe`、`saperm_view`、`saperm_glance`。
+- 插件侧 L1 免审工具：`saperm_overlay({action:open|set|close})`、`saperm_watch({action:start|stop|status|focus|link|unlink})`、`saperm_observe`、`saperm_view`、`saperm_glance`。
 - 踩坑：①stdio 必须 UTF-8（helper 强制 Console.Input/OutputEncoding）；②小窗没画面=watch 未跑（捆绑自动启动解决）；③vision-router OVH 后端易 429，视觉用 read_image 兜底；④图片交付走文件+路径（不进模型上下文，按需 read_image）。
 
 ## H. 里程碑

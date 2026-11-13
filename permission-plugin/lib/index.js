@@ -1441,7 +1441,7 @@ export function apply(ctx) {
 
   register({
     name: 'saperm_target',
-    description: '锁定观察目标窗口：指定一个窗口后，saperm_sheet / saperm_view / saperm_scan / saperm_locate / saperm_watch_focus / saperm_observe_task 不传 x/y/w/h 时都自动只看这个窗口的**内容区**（自动去掉标题栏和边框，窗口移动/缩放会跟随）。不锁定时回退到拖框选区或全屏。action: set（默认，按 title 或 hwnd 锁定）/ info（看当前目标）/ clear（解除）。L0 观察，无需审批',
+    description: '锁定观察目标窗口：指定一个窗口后，saperm_sheet / saperm_view / saperm_see / saperm_locate / saperm_watch({action:focus}) / saperm_observe_task 不传 x/y/w/h 时都自动只看这个窗口的**内容区**（自动去掉标题栏和边框，窗口移动/缩放会跟随）。不锁定时回退到拖框选区或全屏。action: set（默认，按 title 或 hwnd 锁定）/ info（看当前目标）/ clear（解除）。L0 观察，无需审批',
     parameters: {
       type: 'object',
       properties: {
@@ -1504,7 +1504,7 @@ export function apply(ctx) {
         region,
         aspectRatio: Number(ar.toFixed(2)),
         orientation: ar > 1.2 ? 'landscape' : ar < 0.83 ? 'portrait' : 'square',
-        hint: ar < 0.83 ? '竖屏区域（手机/平板画面）：saperm_sheet 会自动改成一行铺开，saperm_overlay_open 用 aspect:"portrait" 才不会把画面压成细条' : '横屏区域',
+        hint: ar < 0.83 ? '竖屏区域（手机/平板画面）：saperm_sheet 会自动改成一行铺开，saperm_overlay({action:open}) 用 aspect:"portrait" 才不会把画面压成细条' : '横屏区域',
       }
     },
   })
@@ -3054,7 +3054,7 @@ export function apply(ctx) {
   }
   register({
     name: 'saperm_vlm',
-    description: '本地视觉理解（Qwen2.5-VL）：直接问画面里有什么，返回中文描述。热启动约 0.8 秒。可指定窗口(hwnd)或屏幕区域，不给则全屏。与 saperm_scan 不同——它给的是「画面内容」不是「文字/标签」。L0 观察',
+    description: '本地视觉理解（Qwen2.5-VL）：直接问画面里有什么，返回中文描述。热启动约 0.8 秒。可指定窗口(hwnd)或屏幕区域，不给则全屏。与 saperm_see 不同——它给的是「画面内容」不是「文字/标签」。L0 观察',
     parameters: {
       type: 'object',
       properties: {

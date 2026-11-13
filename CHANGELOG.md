@@ -1,6 +1,38 @@
 # Changelog (dsh-screen-attention)
 
-## v1.20.10 (2026-11-13) — 短窗口讲解出不来（首轮吃掉整个时长预算）
+## v1.20.11 (2026-11-13) — 采集线程世代号 + 共享缓冲独占（C# 两项正确性修复）
+
+### M-3 采集线程世代号：stop→立刻 start 会出现两条采集线程
+`Stop()` 只把 `running/watching` 置 false，`Start()` 又只看这个 bool，于是旧线程还没来得及看新标志，
+`Start()` 就把标志翻回 true 并另起一条线程 —— 两条线程并存，重复帧、重复 change 事件、双倍 CPU。
+修：FrameHub / Watch / Interpret / Infer 各加世代号 `gen`，线程带 `myGen` 启动，循环条件 `while (running && myGen == gen)`；
+`Start` 与 `Stop` 都 `gen++`，过期线程在下一轮自行退出（不阻塞式 Join，避免 Stop 卡住 UI 命令）。
+
+顺带把「几条采集循环在跑」变成可断言的事实：`FrameHub.loops`，`frames_stats.loops` 直接回。
+（用吞吐推断双线程不可靠——`Gdi.Capture` 有锁会互相串行化，实测旧版 34fps / 新版 26fps，差 1.3 倍根本不能当判据。）
+
+### M-4 共享采集缓冲被慢消费者裸用
+`Gdi.Capture` 返回的是进程级共享 `_capBuf`（锁内只保护拷贝）。OCR/CLIP/YOLO/动漫脸/JPEG 编码这些消费者要跑几十到几千毫秒，
+期间采集线程继续 Capture 同一尺寸（全屏）→ 同一块内存被覆写，读到撕裂帧。表现是「OCR 结果时好时坏、偶尔串行错乱」，极难复现。
+修：新增 `Gdi.CaptureOwn` / `Gdi.CaptureScaledOwn`（锁内克隆，慢消费者专用），切换 9 处：`screenshot`、`ocr`、
+`watch_snapshot` 区域 OCR、`interpret` 区域 OCR、`char_register`、`char_match`、`animeface`、`scene`、`detect`。
+快路径（运动差分、FrameHub 立即双缓冲拷贝）保持零拷贝。
+
+### 测试与文档
+- 新增 `tests/thread-gen-test.mjs`：5 轮 stop→立刻 start 后断言 `stats.loops === 1`，stop 后 `0`；watch/interpret 反复重启仍正常。
+- 新增 `tests/shared-buffer-smoke.mjs`：60fps 采集同时在跑时依次跑 recognize/char.match/animeface/scene/detect/screenshot/vlm，全部有结构化输出。
+- 清理旧工具名 28 处（`permission-plugin/README.md`、`docs/*.md`、`BLUEPRINT.md`、index.js 描述文案）。
+- `tests/prod-readiness.mjs` → `prod-readiness.legacy.mjs`：它整份针对合并前的 61 工具 API 与已删 health 字段，跑起来必抛；保留待迁移，不进回归集。
+
+### 验收
+| 项 | 结果 |
+|---|---|
+| 5 轮快速重启后 `stats.loops` | **1**（stop 后 **0**） |
+| watch / interpret 反复重启 | 仍能起、快照有条目、`holds` 归零 |
+| 60fps 采集 + 7 个慢消费者 | 7/7 通过，helper 未崩 |
+| `narrate({seconds:8})` 对照 | 6 条 / 0 错误，`firstCycleMs 2965` |
+| `plugin-smoke` | 47 工具、health ok、infer→interpret 互斥 + hold 归零 |
+
 
 ### 现象
 `saperm_narrate({ seconds: 8 })` 实测 **0 条 / 1 错误**。

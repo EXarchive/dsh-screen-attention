@@ -320,7 +320,7 @@ mismatch → 重选(ref) → Delete → 重写 → 回读 → 仍 mismatch → �
 
 ## 8. helper 协议新增命令（草案）
 
-> 已实现（2026-10）：`VkOf` 已支持 F1–F12/字母/数字；`hotkey`、`clipboard_get`、`clipboard_set`、`focus` 已在 helper 落地，并暴露为插件工具 `saperm_hotkey`/`saperm_clipboard`/`saperm_focus`/`saperm_windows`/`saperm_recognize`。
+> 已实现（2026-10）：`VkOf` 已支持 F1–F12/字母/数字；`hotkey`、`clipboard_get`、`clipboard_set`、`focus` 已在 helper 落地，并暴露为插件工具 `saperm_hotkey`/`saperm_clipboard`/`saperm_focus`/`saperm_window({action:'list'})`/`saperm_recognize`。
 
 | cmd | 参数 | 返回 | 说明 |
 |---|---|---|---|
@@ -393,10 +393,10 @@ mismatch → 重选(ref) → Delete → 重写 → 回读 → 仍 mismatch → �
 
 ### 11.2 Excel UIA 网格（L1）
 - 暴露 `DataGrid:网格` 1 个 + **DataItem 单元格 645 个**（A1@29,237、B5@98,311…）
-- **离屏单元格坐标为虚拟化假值**（如 A10@-21305,-20929）→ 必须过滤（插件 `saperm_excel_cells` 已过滤 x/y<0）
+- **离屏单元格坐标为虚拟化假值**（如 A10@-21305,-20929）→ 必须过滤（插件 `saperm_excel({action:cells})` 已过滤 x/y<0）
 - 结论：L1 可读可见单元格名+坐标；离屏必须走 L2 GoTo
 
 ### 11.3 已落地命令/工具
 - helper：`hotkey`（组合键）、`clipboard_get`、`clipboard_set`、`focus`（Alt 解锁 + SwitchToThisWindow 兜底）
-- 插件：`saperm_hotkey`、`saperm_clipboard`、`saperm_focus`、`saperm_windows`、`saperm_recognize`、`saperm_excel_goto`、`saperm_excel_write`、`saperm_excel_read`、`saperm_excel_cells`
+- 插件：`saperm_hotkey`、`saperm_clipboard`、`saperm_focus`、`saperm_window({action:'list'})`、`saperm_recognize`、`saperm_excel_goto`、`saperm_excel_write`、`saperm_excel_read`、`saperm_excel_cells`
 - 注：插件工具需重启 DSH 后生效。

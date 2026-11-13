@@ -19,7 +19,7 @@
 | `interpret_status {limit?}` | 运行状态 + 滚动历史 |
 | `interpret_stop` | 停止 |
 
-插件工具（L0 观察，无需审批）：`saperm_interpret_start/status/stop`
+插件工具（L0 观察，无需审批）：`saperm_interpret（action: start/status/stop）`
 
 ## 实测（2026-10-23，1920×1080）
 - 固定区域 1180×700，间隔 700ms，滚动制造变化：
@@ -79,7 +79,7 @@ FrameHub(每100ms一帧) → Infer 工作线程（每帧都处理）
 - `PaddleOcr.RunStreaming`：det 全量 + rec 增量缓存（2000 条，超限清空）
 - 「每一帧都送识别」，处理不过来时**丢帧并计数**（framesSeen / processed / dropped），不阻塞采集
 - helper 命令：`infer_start {maxBoxes?}` / `infer_status {limit?}` / `infer_stop`
-- 插件工具（L0）：`saperm_infer_start/status/stop`
+- 插件工具（L0）：`saperm_infer（action: start/status/stop）`
 
 ### 实测（1920×1080，UHD 770 DirectML，maxBoxes=60）
 | 指标 | 值 |
@@ -112,7 +112,7 @@ FrameHub(每100ms一帧) → Infer 工作线程（每帧都处理）
 - 输出每个物体：`{label, labelZh, conf, x, y, w, h, color}`（color=主色采样：红/橙/黄/绿/青/蓝/紫/粉/白/黑/灰）
 - 加 `summary`："人×2、笔记本电脑×1"
 - 命令：`detect {path?}`（缺省=当前屏幕）；`infer_start {objects:true}` 逐帧带物体检测
-- 插件工具：`saperm_detect {path?}`、`saperm_infer_start {objects:true}`
+- 插件工具：`saperm_see({path})`、`saperm_infer({action:'start', objects:true})`
 
 ### 实测（1920×1080，DirectML）
 | 项 | 结果 |
@@ -172,7 +172,7 @@ FrameHub(每100ms一帧) → Infer 工作线程（每帧都处理）
 - helper `ClipScene`：中心裁剪 224 → CLIP 归一化 → DirectML 推理 → 余弦相似度排序
 - 命令：`scene {path?, topK?}`（缺省=当前屏幕）
 - 逐帧：`infer_start {scene:true}` → 每帧输出场景标签
-- 插件工具：`saperm_scene`、`saperm_infer_start {scene:true}`
+- 插件工具：`saperm_see({scene:true})`、`saperm_infer({action:'start', scene:true})`
 
 ### 实测
 | 场景 | 结果 |
@@ -278,10 +278,10 @@ detect {model:"m"} → 人 0.925 => harness女仆 0.76 @ (1037,342)
 ### 开关（插件工具参数，默认关闭）
 | 工具 | 参数 | 默认 | 说明 |
 |---|---|---|---|
-| `saperm_interpret_start` | `inject` | `false` | 是否注入内容变化事件 |
+| `saperm_interpret({action:'start'})` | `inject` | `false` | 是否注入内容变化事件 |
 | | `minInjectMs` | `2000` | 两条注入的最小间隔（200–60000） |
 | | `kinds` | `["content_change"]` | 注入哪些变化类型（另可选 `text_shift` / `dynamic_noise` / `idle`） |
-| `saperm_infer_start` | `inject` | `false` | 是否注入角色出现/消失事件 |
+| `saperm_infer({action:'start'})` | `inject` | `false` | 是否注入角色出现/消失事件 |
 | | `injectChanges` | `true` | false=不注入变化（`inject` 打开时仍可用它临时静音） |
 | | `minInjectMs` | `2000` | 同上 |
 
@@ -294,10 +294,10 @@ detect {model:"m"} → 人 0.925 => harness女仆 0.76 @ (1037,342)
 - 格式：
   - `[解读] content_change @(x,y,w,h)：新增文本`
   - `[角色] harness女仆 出现 @(x,y,w,h)` / `[角色] harness女仆 消失`
-- `saperm_interpret_start/status/stop`、`saperm_infer_start/status/stop` 返回 `injection` 字段（inject/minInjectMs/kinds/pending/polling），`saperm_status` 同时汇总两者
+- `saperm_interpret`、`saperm_infer`（各含 action: start/status/stop）返回 `injection` 字段（inject/minInjectMs/kinds/pending/polling），`saperm_status` 同时汇总两者
 
 ### 停止与急停
-- `saperm_interpret_stop` / `saperm_infer_stop`：清理轮询定时器 + 清空待发队列（不补播旧事件）
+- `saperm_interpret({action:'stop'})` / `saperm_infer({action:'stop'})`：清理轮询定时器 + 清空待发队列（不补播旧事件）
 - helper 侧停止（`running=false`）被轮询发现时，也自动清理定时器
 - **急停/锁（`saperm_stop` 或 Pause 热键）只停注入、不停观察**：轮询继续推进游标并丢弃待发，观察/OCR 不受影响；解除后从当前时刻继续
 
@@ -305,12 +305,12 @@ detect {model:"m"} → 人 0.925 => harness女仆 0.76 @ (1037,342)
 - 语法：`node --input-type=module -e "import('file:///.../permission-plugin/lib/index.js')"` → SYNTAX OK（2026-10-23 实测通过）
 - 逻辑：用模拟 helper 状态驱动该段真实代码，覆盖首轮对齐、kinds 过滤、节流合并、≤200 字、暂停丢弃、停止清理、seq 游标、角色去重/消失（全部 PASS）
 - 真机：mock ctx + 真实 helper 跑 6s，会话侧收到 `[解读] content_change @(532,20,248,56)：…` 一条（节流生效）
-- **生效需重启 DSH**（插件改动不热更）；重启后 `saperm_interpret_start {inject:true}`，用记事本/浏览器制造文本变化即可在会话里看到 `[解读]` 摘要
+- **生效需重启 DSH**（插件改动不热更）；重启后 `saperm_interpret({action:'start', inject:true})`，用记事本/浏览器制造文本变化即可在会话里看到 `[解读]` 摘要
 
 ### 限制
-- 角色事件依赖 `saperm_infer_start {objects:true}`（无 objects 时不会产生出现/消失事件；返回里带 `injectionNote` 提示）
+- 角色事件依赖 `saperm_infer({action:'start', objects:true})`（无 objects 时不会产生出现/消失事件；返回里带 `injectionNote` 提示）
 - 1s 轮询粒度：两次轮询之间的极短变化仍会保留在历史里交由下一轮处理，但若历史窗口（解读 300 条 / 识别 300 条）在两次轮询间被冲掉，可能漏播（解读窗口 300 条按 800ms 间隔约 4 分钟，实际足够）
-- 注入是否唤醒对话取决于 `injectToSession`（inject 不唤醒）；需要 AI 立即响应时配合 `saperm_observe_task` 的 reportEvery 或 `saperm_watch_link {wake:true}`
+- 注入是否唤醒对话取决于 `injectToSession`（inject 不唤醒）；需要 AI 立即响应时配合 `saperm_observe_task` 的 reportEvery 或 `saperm_watch({action:'link', wake:true})`
 
 ## 19. ACG 动漫脸检测模型（方向2，2026-10-23）
 
@@ -585,7 +585,7 @@ while infer: {mode:"infer", holds:1} → after stop: {mode:null, holds:0}  ← h
 同时让"屏幕没变"时几乎不烧 CPU/GPU。
 
 ### 数据流（stream）
-- 每帧识别结果压成一行（实测 **111~117 字节/行**，对比 `saperm_infer_status` 全量 JSON **2574 字节/帧** → 约 **22× 压缩**）：
+- 每帧识别结果压成一行（实测 **111~117 字节/行**，对比 `saperm_infer({action:'status'})` 全量 JSON **2574 字节/帧** → 约 **22× 压缩**）：
   ```
   19:14:29 #151 W=SA 注意力 SC=视觉小说界面 OB=人(DeepSeek娘)×2 F=2 TX== CH=窗口切换 -> ... 1.9fps 277ms
   ```
@@ -593,7 +593,7 @@ while infer: {mode:"infer", holds:1} → after stop: {mode:null, holds:0}  ← h
   - `TX=` 文本摘要，**增量语义**：`=`(与上帧相同) / `+…`(尾部新增) / 全文(其它情况)
   - **CH 去重**：与上一行相同的变化事件不再重复携带
 - 落盘：`out/logs/stream-YYYY-MM-DD.jsonl`（逐行 JSON）+ `out/logs/stream-latest.txt`（滚动最近 200 行，AI 可直接 read）
-- 工具：`saperm_stream {limit,sinceSeq,format:lines|json,file}`、`saperm_stream_start/stop`
+- 工具：`saperm_stream({action:'read', limit, sinceSeq, format:lines|json, file})`、`saperm_stream({action:'start'|'stop'})`
   - `sinceSeq` 支持增量拉取；`file:true` 返回 latest.txt 路径
 
 ### 硬件效率（实测同一 worker 单核百分比）
