@@ -3357,6 +3357,9 @@ export function apply(ctx) {
     running: false, timer: null, startedAt: 0, lastText: '',
     count: 0, errs: 0, vlmMs: [], cycles: [],
     secs: 60, periodMs: 2000, maxW: 546, prompt: '', speak: false, overlayWasOpen: false,
+    // 预算起算点：首轮不计入时长。冷模型/退化重载的第一轮实测能吃掉 8 秒，
+    // 若把它算进预算，seconds:8 这种短窗口会一条都出不来（实测 0 条 / 1 错误）。
+    budgetStart: 0,
   }
 
   function stopNarrate(closeOverlay) {
@@ -3380,6 +3383,7 @@ export function apply(ctx) {
     const out = {
       done: true, narrations: narrate.count, errors: narrate.errs,
       elapsedMs: Date.now() - narrate.startedAt,
+      firstCycleMs: narrate.budgetStart ? narrate.budgetStart - narrate.startedAt : 0,
       avgVlmMs: avg, maxVlmMs: v.length ? v[v.length - 1] : -1,
       overlayClosed: !narrate.overlayWasOpen,
     }
@@ -3389,7 +3393,8 @@ export function apply(ctx) {
 
   async function narrateStep() {
     if (!narrate.running) return
-    if (Date.now() - narrate.startedAt >= narrate.secs * 1000) { await narrateFinish(); return }
+    const budgetFrom = narrate.budgetStart || narrate.startedAt
+    if (Date.now() - budgetFrom >= narrate.secs * 1000) { await narrateFinish(); return }
     const t0 = Date.now()
     let text = ''
     try {
@@ -3416,6 +3421,8 @@ export function apply(ctx) {
         await helperCall('overlay_set', { subtitle: text, note: '实时讲解 #' + narrate.count }, 6000)
       } catch {}
     }
+    // 首轮（含冷加载/退化重载）不计入预算：从这一轮结束开始算 seconds
+    if (!narrate.budgetStart) narrate.budgetStart = Date.now()
     const spent = Date.now() - t0
     if (narrate.running) narrate.timer = setTimeout(() => { narrateStep().catch(() => {}) }, Math.max(50, narrate.periodMs - spent))
   }
@@ -3449,6 +3456,7 @@ export function apply(ctx) {
         narrate.running = true
         narrate.startedAt = Date.now()
         narrate.count = 0; narrate.errs = 0; narrate.vlmMs = []; narrate.lastText = ''
+        narrate.budgetStart = 0
         narrate.secs = clampInt(args.seconds, 60, 5, 1800)
         narrate.periodMs = clampInt(args.periodMs, 2000, 500, 60000)
         narrate.maxW = clampInt(args.maxW, 546, 210, 1600)

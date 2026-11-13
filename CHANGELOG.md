@@ -1,6 +1,25 @@
 # Changelog (dsh-screen-attention)
 
-## v1.20.9 (2026-11-13) — 修浮窗一直是黑屏（两个独立根因）
+## v1.20.10 (2026-11-13) — 短窗口讲解出不来（首轮吃掉整个时长预算）
+
+### 现象
+`saperm_narrate({ seconds: 8 })` 实测 **0 条 / 1 错误**。
+
+### 根因
+预算用 `startedAt` 起算，而第一轮要付冷加载或 VLM 退化后的卸载重载（实测单轮 4.5–8s）。
+第一轮跑完时 `elapsed` 已经超过 `seconds×1000`，第二轮一进 `narrateStep` 就直接 `narrateFinish()`，一条都留不下。
+
+### 修法
+- 新增 `narrate.budgetStart`：**首轮不计入时长**，从首轮结束开始算 `seconds`（`budgetStart || startedAt` 作为预算起点）。
+- `narrateFinish` 输出补 `firstCycleMs`，日志里能直接看出首轮花了多少（实测 1826ms）。
+
+### 验收
+| 场景 | 结果 |
+|---|---|
+| 新回归 `tests/narrate-budget.mjs`（`seconds:8, periodMs:1500`） | 6 条 / 0 错误，wall 11.6s，`firstCycleMs:1826` |
+| 线上会话 `saperm_narrate({seconds:8, periodMs:1500})` | 5 条 / 0 错误，到点自动收工 |
+| `seconds:20` 对照 | 8 条 / 0 错误（未受影响） |
+
 
 ### 根因 1：画面是全透明的，只剩窗体黑底
 `BgraToBitmap` 把 GDI 的 BGRA 拷进 `PixelFormat.Format32bppArgb` 位图。
