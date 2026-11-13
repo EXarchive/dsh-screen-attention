@@ -2413,8 +2413,10 @@ export function apply(ctx) {
       if (args.text !== false) {
         const tOcr = Date.now()
         try {
-          const effScale = pickScale(rect, args.scale)
-          const o = await helperCall('ocr_file', { path, scale: effScale })
+          // 文件输入不要套"全屏降采样"那套启发式（pickScale 对无区域返回 0.7）：
+        // 文件本身往往已经是缩小过的截图，再压 0.7 只会让小字彻底读不出来（实测 40 条里有大量乱码）。
+        const effScale = args.path ? (Number.isFinite(args.scale) ? Number(args.scale) : 1.0) : pickScale(rect, args.scale)
+          const o = await helperCall('ocr_file', { path, scale: effScale, maxBoxes: clampInt(args.maxTexts, 60, 1, 200) })
           stages.scale = effScale
           const dx = rect ? rect.x : 0, dy = rect ? rect.y : 0
           texts = ((o && o.items) || []).slice(0, clampInt(args.maxTexts, 80, 1, 200))

@@ -892,10 +892,12 @@ static class ImageFile
         return (buf, w, h);
     }
 
-    public static Dictionary<string, object> Ocr(string path, double scale)
+    public static Dictionary<string, object> Ocr(string path, double scale, int maxBoxes = 0)
     {
         var (buf, w, h) = Load(path);
-        var res = PaddleOcr.Run(buf, w, h, scale);
+        // maxBoxes>0 时限制送 rec 的框数：det 限幅调回 736 后能检出几十条，
+        // 不设上限最坏要几秒（每框 rec ~100ms）。
+        var res = PaddleOcr.Run(buf, w, h, scale, maxBoxes);
         res["file"] = path;
         res["imageW"] = w;
         res["imageH"] = h;
@@ -3303,7 +3305,8 @@ class Program
                 {
                     string path = req.GetProperty("path").GetString();
                     double scale = req.TryGetProperty("scale", out var psf) ? psf.GetDouble() : 1.0;
-                    return ImageFile.Ocr(path, scale);
+                    int maxBoxes = req.TryGetProperty("maxBoxes", out var pmb) ? pmb.GetInt32() : 0;
+                    return ImageFile.Ocr(path, scale, maxBoxes);
                 }
 
             case "image_embed":

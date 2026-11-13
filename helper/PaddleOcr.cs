@@ -17,7 +17,11 @@ using Microsoft.ML.OnnxRuntime.Tensors;
 static class PaddleOcr
 {
     // ---- det 参数（RapidOCR 默认，short-side 放大到 736 的 32 倍数）----
-    const int DetLimitSide = 320;
+    // det 短边限幅按面积自适应（2026-11-13 修）：
+    //   原值 320 是性能优化留下的坑 —— 1280x720 图片被压到 568x320，10px 小字变 4px，
+    //   det 根本检不到：同一张满屏文字的截图只认出 3 条（"新会/设置/Q搜"）。
+    //   改成 ≤2M 像素用 736（文件/ROI，要精度），更大的全屏用 512（要速度，别把 interpret 拖死）。
+    static int DetLimitSideFor(long pixels) { return pixels >= 2_000_000 ? 512 : 736; }
     const float DetThresh = 0.3f;
     const float DetBoxThresh = 0.5f;
     const float DetUnclipRatio = 2.0f;
@@ -227,7 +231,8 @@ static class PaddleOcr
         // 标准 limit_type=max：任意一边超过阈值就整体缩小；否则放大到阈值。
         // 原实现写成 m < limit ? limit/m : 1.0，导致 1600px 高的屏永远按 1.0 全尺寸跑 det（4M 像素），
         // 单帧 det 就要 200ms+，识别速率被压到 4Hz。
-        ratio = m > DetLimitSide ? (double)DetLimitSide / m : 1.0;   // 只缩不放：小 ROI 保持原尺寸
+        int limitSide = DetLimitSideFor((long)sw * sh);
+        ratio = m > limitSide ? (double)limitSide / m : 1.0;   // 只缩不放：小 ROI 保持原尺寸
         int dw = Math.Max(32, (int)(Math.Round(sw * ratio / 32.0) * 32));
         int dh = Math.Max(32, (int)(Math.Round(sh * ratio / 32.0) * 32));
 
