@@ -48,7 +48,7 @@ Invoke-WebRequest -Uri "https://github.com/ollama/ollama/releases/latest/downloa
   -OutFile "$env:TEMP\ollama-win.zip"
 
 # 2) 一键装配：解压到 vendor/ollama + 拉取模型到 vendor/models
-#    qwen3-vl:4b（识图/看，3.3GB） + qwen2.5vl:3b（讲解，3.2GB；thinking 模型讲解太慢）
+#    qwen3-vl:4b（识图/看，3.3GB，零 @@@@ 但 thinking 慢） + qwen2.5vl:7b（讲解，6.0GB，非 thinking）
 powershell -ExecutionPolicy Bypass -File vendor/setup-runtime.ps1
 ```
 
@@ -146,38 +146,25 @@ powershell -ExecutionPolicy Bypass -File vendor/setup-runtime.ps1
 | 系统 | Windows 10 19041+（helper 为 net9.0-windows WinForms） |
 | 推理后端 | DirectML（默认，iGPU/CPU 均可）；有 NVIDIA 卡时 VLM 走 CUDA |
 | 内存 | helper 全模型加载 ~2.5GB；VLM 常驻 ~3GB 显存/内存 |
-| 磁盘 | helper 源码+build ~243MB（含 ONNX 模型 ~1.6GB）；vendor VLM 运行时 ollama 2.2GB + 模型 6.1GB（可选）；npm 包本身只有 60KB |
+| 磁盘 | helper 源码+build ~243MB（含 ONNX 模型 ~1.6GB）；vendor VLM 运行时 ollama 2.2GB + 模型 8.7GB（可选）；npm 包本身只有 60KB |
 | 性能 | infer 全模式 6.7-6.9fps（DirectML）；VLM 热态 0.8-1.6s/次；静止画面自动降频 CPU<10% |
 
 ## 已知限制：VLM 稳定性与延迟
 
-### 旧模型 `qwen2.5vl:3b` 的 `@@@@` 退化（仍在讲解通道使用）
+### `@@@@` 退化（全 `@` 输出）
 
-现象：偶发只吐 `@`，且**会传染**——一次坏之后不清状态，后续请求会连环坏，直到卸载模型或重启 serve。实测（RTX 5070 Ti / ollama 0.40.16）：
+`qwen2.5vl:3b` 十几轮后必坏且**会传染**（一次坏之后每轮都要卸载重载 → 单轮 14s+、输出为空，就是"讲解到后面卡死"）。已从仓库删除。
+剩下的组合实测：
 
-| 条件 | 结果 |
-|---|---|
-| `num_ctx=4096`（ollama 默认） | 第一张图之后必坏，永久持续 |
-| `num_ctx=8192`（插件固定值） | 大幅收敛，但单张图仍会偶发翻车 |
-| 送图宽 672 / 470 / 329（同一张密集截图） | **三档都坏** —— 宽度只降低概率，不是保证 |
-| 并发两个请求 | 12/12 正常（并发不是诱因） |
+| 模型 | `@@@@` | 单帧耗时 | 用途 |
+|---|---|---|---|
+| `qwen3-vl:4b` | 0/6 | 6–13s（thinking，`think:false` 被 ollama 忽略） | 识图 / 看 |
+| `qwen2.5vl:7b` | 0/7 | 1.5–8.3s（非 thinking） | 实时讲解 |
 
-处置（每层有上限，最坏 ~6s 收敛）：缩图重问（~200ms）→ 卸载重载（~4.5s）→ 显式 `allowRestart` 才重启 serve；
-`state.vlmPoisoned` 做传染防守；坏文本**永不交给上层**（空串 + `degraded:true`）。
-
-### 新模型 `qwen3-vl:4b` 没有 `@@@@`，但它是 thinking 模型
-
-实测（同一批真实屏幕帧，`think:false` 在该 ollama 版本上**被忽略**，顶层/generate/chat 都试过）：
-
-| 指标 | qwen3-vl:4b | qwen2.5vl:3b |
-|---|---|---|
-| `@@@@` 退化 | **0/6 复现** | 高（可传染） |
-| 单帧耗时（热态） | 6–13s（推理 300–900 字符 + 结论） | ~0.7–1.5s |
-| 描述质量 | 更细（能读出界面里的具体文字/元素） | 一般 |
-
-所以插件按用途分模型：**识图/看 → `qwen3-vl:4b`；实时讲解 → `qwen2.5vl:3b`**。
-两者都 `keep_alive` 常驻（4b 3.3GB + 3b 2.6GB ≈ 5.9GB 显存），实测讲解稳定 ~1.1s/条、识图 6–13s/次。
-要改：`SA_VLM_MODEL` / `SA_NARRATE_MODEL` 覆盖即可（例如都指向 `qwen3-vl:4b` 换质量、接受 6–13s）。
+### 每次识别都是"全新的"
+识别类调用（`saperm_vision` / `vlm` / `look`）默认 `keep_alive: 0`：请求结束即卸载模型，
+上一帧的 KV / 提示缓存不可能影响下一次，也顺手掐死 `@@@@` 的传染链。代价是每次多一次加载（7b ≈ 1–2s，4b ≈ 2–4s）。
+讲解不带"上次讲了什么"，每帧独立判断；讲解期间所有 VLM 调用复用讲解模型，避免两个模型在显存里互相驱逐。
 
 ## 生命周期与安全
 
@@ -197,7 +184,7 @@ powershell -ExecutionPolicy Bypass -File vendor/setup-runtime.ps1
 | vendor 缺失 / 缺模型 / 非 Windows | 报错并附**可复制的修复命令**（装配脚本 / `ollama pull` / `SA_OLLAMA_URL`） |
 | VLM 输出全 `@`（退化） | 有界重试阶梯：缩图重问 → 卸载重载 →（显式才）重启 serve；带毒状态守卫；坏结果置空并标 `degraded`，绝不把 `@` 当结果交给上层 |
 
-环境变量：`SA_OLLAMA_URL`（默认 http://127.0.0.1:11434）、`SA_VLM_MODEL`（识图/看用的模型，默认 `qwen3-vl:4b`）、`SA_NARRATE_MODEL`（讲解用，默认 `qwen2.5vl:3b`）、`SA_HELPER_EXE`。
+环境变量：`SA_OLLAMA_URL`（默认 http://127.0.0.1:11434）、`SA_VLM_MODEL`（识图/看，默认 `qwen3-vl:4b`）、`SA_NARRATE_MODEL`（讲解，默认 `qwen2.5vl:7b`）、`SA_VLM_FRESH`（默认 `1`：识别类请求用完即卸模型，保证每次识别都是全新上下文；设 `0` 换速度）、`SA_HELPER_EXE`。
 
 GPU 后端双保留：`cuda_v12`（RTX 20/30/40）+ `cuda_v13`（RTX 50）+ `vulkan`（AMD/Intel），ollama 启动时自行探测，**勿按自己显卡删任何一套**。
 

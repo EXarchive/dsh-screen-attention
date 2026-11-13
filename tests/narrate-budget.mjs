@@ -5,11 +5,12 @@ const ctx = { tools: { register(d) { tools.set(d.name, d); return d } }, on() {}
 mod.default ? mod.default(ctx) : mod.apply(ctx)
 await new Promise(r => setTimeout(r, 900))
 const n = tools.get('saperm_narrate')
-const s = await n.execute({ action: 'start', seconds: 8, periodMs: 1500 })
+// thinking 模型单条 6-13s：用 25 秒窗口 + 8s 节奏验证"短窗口也能出条"
+const s = await n.execute({ action: 'start', seconds: 25, periodMs: 6000 })
 console.log('start:', JSON.stringify(s))
 const polls = []
-for (let i = 0; i < 8; i++) {
-  await new Promise(r => setTimeout(r, 2000))
+for (let i = 0; i < 16; i++) {
+  await new Promise(r => setTimeout(r, 3000))
   const st = await n.execute({ action: 'status' })
   polls.push({ t: (i + 1) * 2, n: st.narrations, errs: st.errors, running: st.running })
   if (!st.running) break

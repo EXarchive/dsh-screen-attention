@@ -2875,9 +2875,10 @@ export function apply(ctx) {
   // 默认 qwen3-vl:4b（2026-11-13 切换）：更新一代，同样支持图像输入；旧默认 qwen2.5vl:3b 保留可用
   // （SA_VLM_MODEL=qwen2.5vl:3b 即可回退）。
   const OLLAMA_MODEL = process.env.SA_VLM_MODEL || 'qwen3-vl:4b'
-  // 讲解是 1-2 秒一条的节奏，thinking 模型（qwen3-vl）单帧要吃 500-800 个推理 token（实测 6-12s），
-  // 结构上撑不住；所以讲解默认用旧的快模型，识图/看一律走新的 qwen3-vl。
-  const NARRATE_MODEL = process.env.SA_NARRATE_MODEL || 'qwen2.5vl:3b'
+  // 讲解用 qwen2.5vl:7b：非 thinking（快），实测 7 帧零 @@@@、1.5-8.3s/帧。
+  // 淘汰的两个：qwen2.5vl:3b（跑十几轮进入 @@@@ 退化 → 每轮卸载重载 14s+ 且 0 输出，就是"到后面卡死"）；
+  //           qwen3-vl:4b（零退化，但 thinking 让它 10-42s/帧，讲解撑不住）。
+  const NARRATE_MODEL = process.env.SA_NARRATE_MODEL || 'qwen2.5vl:7b'
 
   // ===== 内置运行时（vendor/）：插件自带 ollama.exe + 模型，不依赖外部安装 =====
   const VENDOR_DIR = join(PACKAGE_ROOT, '..', 'vendor')
@@ -3007,6 +3008,10 @@ export function apply(ctx) {
   // 672 是“够看清 + 稳定”的折中；超过 798 已多次复现退化，所以参数上限就压到 798。
   const VLM_SAFE_W = 672
   const VLM_MAX_W = 798
+  // 识别类调用默认"每次全新"：请求带 keep_alive:0，模型用完即卸 ——
+  // 这样上一帧的 KV/提示缓存绝不可能影响下一次识别，也顺手掐死 @@@@ 的传染链。
+  // 代价是每次多一次模型加载（实测 7b ≈ 1-2s，4b ≈ 2-4s）。SA_VLM_FRESH=0 可关掉换速度。
+  const VLM_FRESH = String(process.env.SA_VLM_FRESH || '1') !== '0'
 
   // qwen3 系列是 thinking 模型：不关掉会先吐一段推理（拖慢且污染字幕）。
   // 非 thinking 模型传 think 会被 ollama 拒（does not support thinking），所以按模型名判断。
@@ -3032,7 +3037,9 @@ export function apply(ctx) {
 
   async function vlmAsk(opts) {
     const t0 = Date.now()
-    const model = String(opts.model || OLLAMA_MODEL)
+    // 讲解运行时不要再拉第二个模型：4b+3b 同时在显存里会互相驱逐
+    // （实测讲解期间调一次识图，讲解直接掉到 0 条/9s，并出现 18.5s 的识图 + 25s 超时）。
+    const model = String(opts.model || (narrate.running ? NARRATE_MODEL : OLLAMA_MODEL))
     // thinking 模型：调用方给 40 也要抬到 900（推理 500-800 + 结论），否则永远是空回复
     const wanted = clampInt(opts.maxTokens, 96, 8, 400)
     const maxTokens = isThinkingModel(model) ? Math.max(wanted, 900) : wanted
@@ -3051,18 +3058,26 @@ export function apply(ctx) {
       prompt: String(opts.prompt || '一句话描述这个画面里有什么'),
       images: [curImage],
       stream: false,
-      ...(opts.keepAlive != null ? { keep_alive: opts.keepAlive } : {}),
+      ...((opts.fresh === true || (opts.fresh !== false && VLM_FRESH && opts.keepAlive == null))
+        ? { keep_alive: 0 }
+        : (opts.keepAlive != null ? { keep_alive: opts.keepAlive } : {})),
       options: { num_predict: maxTokens, temperature, num_ctx: VLM_NUM_CTX },
     })
+    // 任何请求都不许把异常抛给上层：超时（AbortError）/ 连接断开都折算成"这一帧没结果"。
+    // 之前 narrate 在一次 25s 超时上抛过未捕获 rejection，直接把宿主拖到卡死。
     const once = async () => {
       const t = Date.now()
-      const res = await fetch(OLLAMA_URL + '/api/generate', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: rebuild(),
-        signal: AbortSignal.timeout(timeoutMs),
-      })
-      if (!res.ok) throw new Error('VLM HTTP ' + res.status + '：vendor/ollama 没在跑（saperm_health 可查）')
-      const j = await res.json()
-      return { text: String((j && j.response) || '').trim(), tokens: j && j.eval_count, ms: Date.now() - t }
+      try {
+        const res = await fetch(OLLAMA_URL + '/api/generate', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: rebuild(),
+          signal: AbortSignal.timeout(timeoutMs),
+        })
+        if (!res.ok) return { text: '', tokens: 0, ms: Date.now() - t, err: 'HTTP ' + res.status }
+        const j = await res.json()
+        return { text: String((j && j.response) || '').trim(), tokens: j && j.eval_count, ms: Date.now() - t, err: (j && j.error) ? String(j.error) : null }
+      } catch (e) {
+        return { text: '', tokens: 0, ms: Date.now() - t, err: String((e && e.message) || e).slice(0, 80) }
+      }
     }
     // 传染性防守：一次退化之后 serve 会持续吐 @@@@，直到卸载模型。
     // 所以「上一次坏过」就先卸载一次（~4.5s，一次性），不要拿毒状态连着打后续请求。
@@ -3174,6 +3189,7 @@ export function apply(ctx) {
       const r = await vlmAsk({
         image: buf, prompt: args.prompt || '一句话描述这个画面里有什么',
         maxTokens: args.maxTokens, temperature: 0.2,
+        fresh: true,
         size: { w: ww, h: hh },
         // 退化时换一张更小的图重问（比卸载重载快一个数量级）
         retryImage: async () => {
@@ -3303,6 +3319,7 @@ export function apply(ctx) {
           image: jpeg,
           prompt: args.prompt || '一句话描述这个画面里有什么，只输出这一句',
           maxTokens: args.maxTokens, temperature: 0.2,
+          fresh: true,
           size: { w: imgW, h: imgH },
           retryImage: async () => {
             const w2 = Math.max(240, Math.round(maxW * 0.7))
@@ -3370,6 +3387,7 @@ export function apply(ctx) {
       const got = await vlmAsk({
         image: b64, prompt: args.prompt || '一句话描述这个画面里有什么',
         maxTokens: args.maxTokens, temperature: 0.2,
+        fresh: true,
         size: { w: ww, h: hh },
         retryImage: async () => {
           const w2 = Math.max(240, Math.round(VLM_SAFE_W * 0.7))
@@ -3481,7 +3499,8 @@ export function apply(ctx) {
   const narrate = {
     running: false, timer: null, startedAt: 0, lastText: '',
     count: 0, errs: 0, vlmMs: [], cycles: [],
-    secs: 60, periodMs: 2000, maxW: 546, prompt: '', speak: false, overlayWasOpen: false,
+    secs: 60, periodMs: 6000, maxW: 546, prompt: '', speak: false, overlayWasOpen: false,
+    lastCycleMs: 0, maxCycleMs: 0,
     // 预算起算点：首轮不计入时长。冷模型/退化重载的第一轮实测能吃掉 8 秒，
     // 若把它算进预算，seconds:8 这种短窗口会一条都出不来（实测 0 条 / 1 错误）。
     budgetStart: 0,
@@ -3527,9 +3546,8 @@ export function apply(ctx) {
       const shot = await helperCall('screenshot', { maxW: narrate.maxW }, 10000)
       if (!shot || !shot.jpegB64) throw new Error('capture empty')
       const sys = '用一句不超过25字的中文直接讲解画面主要内容，无前缀。'
-      const usr = narrate.lastText
-        ? '上次已讲：「' + narrate.lastText + '」。这次讲画面里不同内容或变化，禁止重复。'
-        : '讲'
+      // 不带"上次讲了什么"：每一帧都当作全新画面独立判断（避免模型被上一句锚住/复读）
+      const usr = '讲'
       // 实时讲解走共享入口：num_ctx 8192 是它不再「讲一阵就全 @@@@」的关键
       const r = await vlmAsk({
         image: shot.jpegB64, system: sys, prompt: usr, maxTokens: 40, temperature: 0.6, timeoutMs: 25000, keepAlive: '10m', noRestart: true,
@@ -3559,18 +3577,23 @@ export function apply(ctx) {
     // 首轮（含冷加载/退化重载）不计入预算：从这一轮结束开始算 seconds
     if (!narrate.budgetStart) narrate.budgetStart = Date.now()
     const spent = Date.now() - t0
+    // 逐轮耗时留痕：status 里能看到"到后面变慢"发生在第几轮
+    narrate.cycles.push(spent)
+    if (narrate.cycles.length > 10) narrate.cycles.shift()
+    narrate.lastCycleMs = spent
+    if (spent > (narrate.maxCycleMs || 0)) narrate.maxCycleMs = spent
     if (narrate.running) narrate.timer = setTimeout(() => { narrateStep().catch(() => {}) }, Math.max(50, narrate.periodMs - spent))
   }
 
   register({
     name: 'saperm_narrate',
-    description: '实时讲解（循环在插件内跑）：action=start 启动 | stop 停止 | status 查状态。期间自动开浮窗、按节奏抓最新帧→本地 VLM 讲解→字幕推到浮窗；停止或到期自动关窗消失。调用方只需一次调用，不产生逐帧工具流量。L0 观察',
+    description: '实时讲解（循环在插件内跑）：action=start 启动 | stop 停止 | status 查状态（含 lastCycleMs/recentCycleMs，能看出哪一轮变慢）。期间自动开浮窗、按节奏抓最新帧→本地 VLM 讲解→字幕推到浮窗；停止或到期自动关窗消失。调用方只需一次调用，不产生逐帧工具流量。L0 观察',
     parameters: {
       type: 'object',
       properties: {
         action: { type: 'string', enum: ['start', 'stop', 'status'], description: '操作类型' },
         seconds: { type: 'integer', description: 'start 用：持续秒数（默认 60，最大 1800）' },
-        periodMs: { type: 'integer', description: 'start 用：每条讲解间隔毫秒（默认 2000，最小 500）' },
+        periodMs: { type: 'integer', description: 'start 用：每条讲解间隔毫秒（默认 6000；7b 实测 1.5-8.3s/条）' },
         maxW: { type: 'integer', description: 'start 用：抓帧最大宽度（默认 546，越小越快）' },
         prompt: { type: 'string', description: 'start 用：讲解风格提示（可选）' },
       },
@@ -3589,12 +3612,17 @@ export function apply(ctx) {
           state.overlayOpen = true
         }
         holdHelper('narrate')
+        // 注意：不要用 keep_alive:0 去"请出"另一个模型 —— 那会先把该模型加载进显存再卸载，
+        // 实测把讲解首轮拖到 5.3s，还让 4b 常驻。两个模型的关系交给下面的"讲解期间共用模型"处理。
         narrate.running = true
         narrate.startedAt = Date.now()
         narrate.count = 0; narrate.errs = 0; narrate.vlmMs = []; narrate.lastText = ''
         narrate.budgetStart = 0
+        narrate.lastCycleMs = 0; narrate.maxCycleMs = 0; narrate.cycles = []
         narrate.secs = clampInt(args.seconds, 60, 5, 1800)
-        narrate.periodMs = clampInt(args.periodMs, 2000, 500, 60000)
+        // thinking 模型单条 6-13s：默认 8s 一条，别再按 2s 去追（追不上只会持续堆积）
+        // 7b 实测 1.5-8.3s/条（画面越复杂越慢）：默认 6s
+        narrate.periodMs = clampInt(args.periodMs, 6000, 500, 60000)
         narrate.maxW = clampInt(args.maxW, 546, 210, 1600)
         narrate.prompt = String(args.prompt || '')
         armAutoCleanup(narrate.secs + 30)
@@ -3606,7 +3634,12 @@ export function apply(ctx) {
         return { running: false, wasRunning: was, narrations: narrate.count }
       }
       if (act === 'status') {
-        return { running: narrate.running, narrations: narrate.count, errors: narrate.errs, elapsedMs: narrate.running ? Date.now() - narrate.startedAt : 0, lastText: narrate.lastText }
+        return {
+          running: narrate.running, narrations: narrate.count, errors: narrate.errs,
+          elapsedMs: narrate.running ? Date.now() - narrate.startedAt : 0, lastText: narrate.lastText,
+          lastCycleMs: narrate.lastCycleMs || 0, maxCycleMs: narrate.maxCycleMs || 0,
+          recentCycleMs: narrate.cycles.slice(-10), model: NARRATE_MODEL,
+        }
       }
       throw new Error('action 必须是: start | stop | status')
     },
@@ -3673,6 +3706,7 @@ export function apply(ctx) {
         observation: { mode: state.obsMode || null, holds: Number(observationHolds) || 0, overlayOpen: !!state.overlayOpen, autoCleanupTtlMs: state.obsTtlMs || 0 },
         models: (h && h.models) ? h.models : null,
         modelFor: { vision: OLLAMA_MODEL, narrate: NARRATE_MODEL },
+        vlmFresh: VLM_FRESH,
         clip: (h && h.clip) ? h.clip : null,
         faceModel: (h && typeof h.faceModel === 'boolean') ? h.faceModel : false,
         characters: (h && typeof h.characters === 'number') ? h.characters : 0,
