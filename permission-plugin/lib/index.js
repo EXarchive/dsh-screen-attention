@@ -1203,6 +1203,7 @@ export function apply(ctx) {
         observeTask: state.observeTask ? { startedAt: state.observeTask.startedAt, seconds: state.observeTask.seconds, elapsedMs: Date.now() - state.observeTask.startedAt } : null,
         injection: { interpret: injectSummary(state.interpretInject), infer: injectSummary(state.inferInject) },
         helper: { online: helperSingleton.online, pid: helperSingleton.pid, refs: helperSingleton.refs, holds: observationHolds },
+        lastSay: state.lastSay || null,
       }
     },
   })
@@ -1794,7 +1795,8 @@ export function apply(ctx) {
           if (t - task.lastReport >= task.reportEvery) {
             task.lastReport = t
             const snap = await helperCall('watch_snapshot')
-            const rect = (snap && snap.rect) || {}
+            const r0 = (snap && snap.rect) || {}
+            const rect = { x: Number(r0.x) || 0, y: Number(r0.y) || 0, w: Number(r0.w) || 0, h: Number(r0.h) || 0 }
             const text = String((snap && snap.text) || '').trim()
             const added = String((snap && snap.added) || '').trim()
             const note = '已防打断）'
@@ -1832,9 +1834,15 @@ export function apply(ctx) {
               await helperCall('overlay_set', {
                 region: (rect && rect.w > 0) ? { x: rect.x, y: rect.y, w: rect.w, h: rect.h } : undefined,
                 note: '观察 ' + elapsed + 's · ' + (task.shots ? task.shots.length : 0) + '帧',
-                say: report.replace(/^\[识图 [^\]]*\]\s*/, ''),
-                ms: Math.max(4000, task.reportEvery),
               })
+              // say 不是 overlay_set 的字段（helper 侧会被忽略）：要走独立的气泡命令，
+              // 否则这段文字永远不会出现在用户眼前 —— 以前一直是静默丢弃。
+              try {
+                const said = await helperCall('say', { text: report.replace(/^\[识图 [^\]]*\]\s*/, ''), speak: false, ms: Math.max(4000, task.reportEvery) }, 8000)
+                state.lastSay = { at: Date.now(), via: 'observe_task', ok: !!(said && said.sayVisible), ms: said && said.ms }
+              } catch (e) {
+                state.lastSay = { at: Date.now(), via: 'observe_task', ok: false, err: String((e && e.message) || e).slice(0, 80) }
+              }
             } catch {}
           }
           if (t - task.lastShot >= task.shotEvery) {
@@ -1974,9 +1982,11 @@ export function apply(ctx) {
     description: '恢复输入注入（每次调用都会弹出用户确认；AI 无法自行解除急停）',
     parameters: empty,
     execute: async () => {
+      // 先让 helper 解锁，成功后再改 JS 状态：原来顺序反了，helper 解锁失败时会留下
+      // 「JS 认为已恢复、helper 仍在锁」的错位状态（后续注入全被 helper 拒，报错还指错方向）。
+      try { await helperCall('resume') } catch (e) { throw new Error('helper 解锁失败：' + e.message) }
       state.paused = false
       state.pausedBy = null
-      try { await helperCall('resume') } catch (e) { throw new Error('helper 解锁失败：' + e.message) }
       return { paused: false }
     },
   })

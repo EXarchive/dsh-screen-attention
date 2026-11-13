@@ -1,6 +1,34 @@
 # Changelog (dsh-screen-attention)
 
-## v1.20.12 (2026-11-13) — 快档坐标空间、饱和度权重、JS 状态漂移与死代码（本轮清空清单）
+## v1.20.13 (2026-11-13) — 迁移投产自检套件、一键回归、气泡与急停状态修复
+
+### `tests/prod-readiness.mjs` 迁移到 47 工具 API（21 项全过）
+原来那份针对合并前的 61 工具（`saperm_infer_start` / `saperm_overlay_open` / `saperm_char_register` …），
+合并成 action 入口后整份直接抛 `undefined`，等于零覆盖。现已按新 API 重写并跑通：
+工具清单、helper 桥接、infer 幂等持有、首帧+场景+静止跳帧、understanding 带前台窗口名、
+**watchdog 崩溃自愈**（杀 helper → 新 pid + 模式/持有恢复 + 会话告警注入）、infer↔interpret 互斥与干净停止、
+`refs` 归零、审计日志 crash/recover、角色备注迁移、诊断字段（workingSetMB/providers/privacyKeywords/storage）、保留清理。
+旧的 `prod-readiness.legacy.mjs` 删除（内容已被完整覆盖）。
+
+### 新增 `tests/run-all.mjs`：一条命令跑全部回归
+7 个套件顺序执行并汇总（每个用例自己起 helper，必须串行）：
+`plugin-smoke` / `prod-readiness` / `state-drift-test` / `thread-gen-test` / `shared-buffer-smoke` / `narrate-budget` / `vision-probe`。
+实测：**7/7 PASS**（10s/14s/10s/9s/33s/20s/35s）。
+
+### 修：`observe_task` 的汇报文字一直被静默丢弃
+它把 `say` 塞进 `overlay_set` 的载荷，而 helper 的 `overlay_set` 只认 region/gaze/clear/note/subtitle —— 那段文字从来没出现过。
+改成显式调 `say` 命令，并把 helper 返回的 `sayVisible` 记到 `state.lastSay`、由 `saperm_status` 回读。
+实测：`lastSay: {"via":"observe_task","ok":true,"ms":4000}` → 气泡真实弹出。
+
+### 修：`saperm_resume` 先改状态后调 helper
+helper 解锁失败时留下「JS 认为已恢复、helper 仍在锁」的错位状态（后续注入全被拒且报错指错方向）。改成先解锁、成功再改状态。
+
+### 修：汇报里的 `区域(undefined,undefined undefinedxundefined)`
+`snap.rect` 在没有运动时不存在，模板直接拼字段。现在归零后再拼。
+
+### 新增 `docs/RESTART.md`
+说明 JS 改动为什么必须重启、怎么重启，以及两条**能判别新旧**的自检（`saperm_status` 是否有 `refs/holds`、`saperm_overlay({action:"status"})` 是否被接受）。
+
 
 ### M-5 快档采集（60fps，帧 0.4×）下运动区域/解读区域是「帧坐标」
 `FrameHub` 在 `intervalMs ≤ 20` 时走 `CaptureSmallParallel(0.4)`，帧是 0.4× 缩小图；
