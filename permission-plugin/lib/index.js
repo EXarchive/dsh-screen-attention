@@ -3018,11 +3018,17 @@ export function apply(ctx) {
     const maxTokens = clampInt(opts.maxTokens, 96, 8, 400)
     const temperature = Number.isFinite(opts.temperature) ? Number(opts.temperature) : 0.2
     const timeoutMs = opts.timeoutMs || 120000
-    const payload = JSON.stringify({
+    // 退化（全 @@@@）的第一诱因是送图宽度，不是 tokenizer：同一张密集截图 546 宽 3/3 正常、
+    // 672 起翻车、1000 宽 0/3。所以重试顺序是：
+    //   ① 换一张更小的图重问（~200ms，调用方提供 retryImage）→ ② 卸载重载（~4.5s）→ ③ 重启 serve（>10s）
+    let curImage = opts.image
+    let curSize = opts.size || null
+    let shrinks = 0
+    const rebuild = () => JSON.stringify({
       model: OLLAMA_MODEL,
       ...(opts.system ? { system: String(opts.system) } : {}),
       prompt: String(opts.prompt || '一句话描述这个画面里有什么'),
-      images: [opts.image],
+      images: [curImage],
       stream: false,
       ...(opts.keepAlive != null ? { keep_alive: opts.keepAlive } : {}),
       options: { num_predict: maxTokens, temperature, num_ctx: VLM_NUM_CTX },
@@ -3030,35 +3036,63 @@ export function apply(ctx) {
     const once = async () => {
       const t = Date.now()
       const res = await fetch(OLLAMA_URL + '/api/generate', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: payload,
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: rebuild(),
         signal: AbortSignal.timeout(timeoutMs),
       })
       if (!res.ok) throw new Error('VLM HTTP ' + res.status + '：vendor/ollama 没在跑（saperm_health 可查）')
       const j = await res.json()
       return { text: String((j && j.response) || '').trim(), tokens: j && j.eval_count, ms: Date.now() - t }
     }
+    // 传染性防守：一次退化之后 serve 会持续吐 @@@@，直到卸载模型。
+    // 所以「上一次坏过」就先卸载一次（~4.5s，一次性），不要拿毒状态连着打后续请求。
+    if (state.vlmPoisoned) {
+      await vlmUnload()
+      state.vlmPoisoned = false
+    }
     let r = await once()
-    // 坏态（全 @@@@ / 空串）的成因实测（2026-11-13）：
-    //   num_ctx=4096 时必然复现且永久持续；8192 后大幅收敛，但单张图仍会有概率翻车。
-    //   翻车后同一张图重问无效，**必须先卸载模型重载**（换一次采样），所以这里做两级重试。
     let attempts = 0
     let recovered = null
+    // 重试阶梯（最多 3 次请求，全部有上限，不再无限爬到 10s+）：
+    //   ② 换一张更小的图（~200ms。实测宽度只降低翻车概率，不保证修好 ——
+    //      同一张密集截图 546 宽曾 3/3 正常、329 宽照样坏，所以只试一次）
+    //   ③ 卸载重载（~4.5s，换一次采样；讲解这类循环场景跳过）
+    //   ④ 重启 serve 只在调用方明确 allowRestart 时才做（冷加载实测 30s+）
     while (looksBroken(r.text) && attempts < 2) {
       attempts++
-      if (attempts === 1) {
-        await vlmUnload()
-      } else {
-        // 讲解这类循环场景不要重启 serve：重启后模型要重新从磁盘加载（实测 30s+），
-        // 代价远大于丢掉一帧。只做卸载重载（~4.5s），失败就跳过这一帧。
+      let acted = false
+      if (typeof opts.retryImage === 'function') {
+        try {
+          const smaller = await opts.retryImage()
+          if (smaller && smaller.image) {
+            curImage = smaller.image
+            if (smaller.size) curSize = smaller.size
+            shrinks++; acted = true
+          }
+        } catch {}
+      }
+      if (!acted) {
         if (opts.noRestart) break
-        recovered = await restartOllama()
-        if (!(recovered && recovered.running)) break
+        await vlmUnload()
       }
       try { r = await once() } catch {}
     }
+    // 缩图后仍坏：卸载重载再给一次（换采样），并把状态标记为「毒」以便下次先卸载。
+    if (looksBroken(r.text) && !opts.noUnload) {
+      await vlmUnload()
+      try { r = await once() } catch {}
+    }
+    if (looksBroken(r.text) && opts.allowRestart === true) {
+      recovered = await restartOllama()
+      if (recovered && recovered.running) { try { r = await once() } catch {} }
+    }
     const broken = looksBroken(r.text)
-    if (broken) { try { state.vlmDegraded = (state.vlmDegraded || 0) + 1 } catch {} }
-    return { text: broken ? '' : r.text, rawText: r.text, tokens: r.tokens, vlmMs: r.ms, broken, attempts, recovered, totalMs: Date.now() - t0 }
+    if (broken) {
+      try { state.vlmDegraded = (state.vlmDegraded || 0) + 1 } catch {}
+      state.vlmPoisoned = true   // 下一次请求前先卸载，避免连环坏
+    } else {
+      state.vlmPoisoned = false
+    }
+    return { text: broken ? '' : r.text, rawText: r.text, tokens: r.tokens, vlmMs: r.ms, broken, attempts, shrinks, recovered, size: curSize, totalMs: Date.now() - t0 }
   }
 
   let _restartAt = 0
@@ -3119,6 +3153,19 @@ export function apply(ctx) {
       const r = await vlmAsk({
         image: buf, prompt: args.prompt || '一句话描述这个画面里有什么',
         maxTokens: args.maxTokens, temperature: 0.2,
+        size: { w: ww, h: hh },
+        // 退化时换一张更小的图重问（比卸载重载快一个数量级）
+        retryImage: async () => {
+          const w2 = Math.max(240, Math.round(VLM_SAFE_W * 0.7))
+          if (args.hwnd) {
+            const r2 = await helperCall('window_capture', { hwnd: args.hwnd, maxW: w2 })
+            return (r2 && r2.jpegB64) ? { image: r2.jpegB64, size: { w: r2.w, h: r2.h } } : null
+          }
+          const g2 = await helperCall('screenshot', args.x != null
+            ? { x: args.x, y: args.y, w: args.w, h: args.h, maxW: w2 }
+            : { maxW: w2 })
+          return (g2 && g2.jpegB64) ? { image: g2.jpegB64, size: { w: g2.bw || g2.w, h: g2.bh || g2.h } } : null
+        },
       })
       return {
         text: r.text,
@@ -3229,19 +3276,32 @@ export function apply(ctx) {
 
       // VLM（走共享入口：num_ctx 固定 8192 + 坏态自动重载）
       let text = null, vlmMs = 0, tokens = null, degraded = null
+      let vlmAttempts = 0, vlmShrinks = 0, vlmW = 0
       if (wantVlm) {
         const r = await vlmAsk({
           image: jpeg,
           prompt: args.prompt || '一句话描述这个画面里有什么，只输出这一句',
           maxTokens: args.maxTokens, temperature: 0.2,
+          size: { w: imgW, h: imgH },
+          retryImage: async () => {
+            const w2 = Math.max(240, Math.round(maxW * 0.7))
+            if (args.path) {
+              const emb = await helperCall('image_embed', { path, maxW: w2 })
+              return (emb && emb.jpegB64) ? { image: emb.jpegB64, size: { w: emb.w, h: emb.h, srcW: emb.srcW, srcH: emb.srcH } } : null
+            }
+            const g2 = await helperCall('screenshot', rect ? { ...rect, maxW: w2 } : { maxW: w2 })
+            return (g2 && g2.jpegB64) ? { image: g2.jpegB64, size: { w: g2.bw || g2.w, h: g2.bh || g2.h } } : null
+          },
         })
         text = r.text; vlmMs = r.vlmMs; tokens = r.tokens
+        vlmAttempts = r.attempts; vlmShrinks = r.shrinks; vlmW = (r.size && r.size.w) || imgW
         if (r.broken) degraded = true
       }
 
       const total = Date.now() - t0
       return {
         engine, text, ocr: ocrOut,
+        vlm: wantVlm ? { attempts: vlmAttempts, shrinks: vlmShrinks, effectiveW: vlmW } : null,
         size: { w: imgW, h: imgH, srcW, srcH },
         rect, path: path || null,
         ms: { ...stages, vlm: vlmMs || 0, total },
@@ -3289,6 +3349,16 @@ export function apply(ctx) {
       const got = await vlmAsk({
         image: b64, prompt: args.prompt || '一句话描述这个画面里有什么',
         maxTokens: args.maxTokens, temperature: 0.2,
+        size: { w: ww, h: hh },
+        retryImage: async () => {
+          const w2 = Math.max(240, Math.round(VLM_SAFE_W * 0.7))
+          if (args.hwnd) {
+            const r2 = await helperCall('window_capture', { hwnd: args.hwnd, maxW: w2 })
+            return (r2 && r2.jpegB64) ? { image: r2.jpegB64, size: { w: r2.w, h: r2.h } } : null
+          }
+          const g2 = await helperCall('screenshot', args.x != null ? { x: args.x, y: args.y, w: args.w, h: args.h, maxW: w2 } : { maxW: w2 })
+          return (g2 && g2.jpegB64) ? { image: g2.jpegB64, size: { w: g2.bw || g2.w, h: g2.bh || g2.h } } : null
+        },
       })
       const text = got.text
       const vlmMs = Date.now() - t0 - shotMs
@@ -3440,7 +3510,15 @@ export function apply(ctx) {
         ? '上次已讲：「' + narrate.lastText + '」。这次讲画面里不同内容或变化，禁止重复。'
         : '讲'
       // 实时讲解走共享入口：num_ctx 8192 是它不再「讲一阵就全 @@@@」的关键
-      const r = await vlmAsk({ image: shot.jpegB64, system: sys, prompt: usr, maxTokens: 40, temperature: 0.6, timeoutMs: 25000, keepAlive: '10m', noRestart: true })
+      const r = await vlmAsk({
+        image: shot.jpegB64, system: sys, prompt: usr, maxTokens: 40, temperature: 0.6, timeoutMs: 25000, keepAlive: '10m', noRestart: true,
+        // 讲解宁可多抓一张更小的图，也不要直接跳过这一帧
+        retryImage: async () => {
+          const w2 = Math.max(280, Math.round(narrate.maxW * 0.78))
+          const s2 = await helperCall('screenshot', { maxW: w2 }, 10000)
+          return (s2 && s2.jpegB64) ? { image: s2.jpegB64, size: { w: s2.bw || s2.w, h: s2.bh || s2.h } } : null
+        },
+      })
       narrate.vlmMs.push(Date.now() - t0)
       if (r.broken) { narrate.errs++; text = '' } else { text = r.text }
     } catch (e) {

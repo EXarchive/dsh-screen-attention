@@ -96,11 +96,25 @@ if (types.includes('helper_crash') && types.includes('helper_recover')) {
 
 // 8. 角色备注迁移
 const ch = tools.get('saperm_char')
-const sampleImg = 'C:/Users/Administrator/PycharmProjects/dsh-screen-attention/out/sa-view'
+const sampleDir = 'C:/Users/Administrator/PycharmProjects/dsh-screen-attention/out/sa-view'
 const fsx = await import('node:fs')
-const imgs = fsx.readdirSync(sampleImg).filter(n => /\.jpg$/i.test(n))
-const regRes = await ch.execute({ action: 'register', name: '__prod_tmp__', path: imgs.length ? sampleImg + '/' + imgs[0] : undefined, note: '临时测试角色备注' })
-ok('char register with note', regRes.ok === true && regRes.name === '__prod_tmp__', JSON.stringify(regRes).slice(0, 120))
+// 注册依赖「图里能自动检出人物」，而 sa-view 里的图会随清理轮换 —— 按候选依次试，
+// 都失败才算失败（之前写死 imgs[0]，图一变整份用例就假红）。
+const cands = [sampleDir + '/glance-1792733333431-3.jpg']
+try {
+  const imgs = fsx.readdirSync(sampleDir).filter(n => /\.jpg$/i.test(n)).slice(0, 4)
+  for (const n of imgs) cands.push(sampleDir + '/' + n)
+} catch {}
+let regRes = { ok: false, error: 'no candidate image' }
+const tried = []
+for (const c of cands) {
+  try {
+    const r = await ch.execute({ action: 'register', name: '__prod_tmp__', path: c, note: '临时测试角色备注' })
+    tried.push({ c: c.slice(-28), ok: !!r.ok, err: r.error })
+    if (r.ok) { regRes = r; break }
+  } catch (e) { tried.push({ c: c.slice(-28), err: String(e.message).slice(0, 40) }) }
+}
+ok('char register with note', regRes.ok === true && regRes.name === '__prod_tmp__', JSON.stringify({ reg: regRes, tried }).slice(0, 260))
 await ch.execute({ action: 'rename', from: '__prod_tmp__', to: '__prod_tmp_renamed__' })
 const listAfterRename = await ch.execute({ action: 'list' })
 const renamed = (listAfterRename.characters || []).find(c => c.name === '__prod_tmp_renamed__')
