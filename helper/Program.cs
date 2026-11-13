@@ -137,6 +137,32 @@ static class Gdi
     static IntPtr _capMem = IntPtr.Zero, _capBmp = IntPtr.Zero, _capOld = IntPtr.Zero;
     static int _capW, _capH;
     static byte[] _capBuf = Array.Empty<byte>();
+    // 快档采集（StretchBlt 小图）走的是独立缓冲，必须按 scale 映射后再遮蔽，
+    // 否则 overlay 预览与运动检测会看到未遮蔽的密码管理器画面（隐私承诺失效）。
+    static void ApplyPrivacyScaled(byte[] buf, int bw, int bh, int capX, int capY, double scale)
+    {
+        var privRects = GetPrivacyRects();
+        if (privRects.Count == 0) return;
+        for (int i = 0; i < privRects.Count; i++)
+        {
+            var r = privRects[i];
+            int x0 = (int)Math.Floor((r.X - capX) * scale), y0 = (int)Math.Floor((r.Y - capY) * scale);
+            int x1 = (int)Math.Ceiling((r.Right - capX) * scale), y1 = (int)Math.Ceiling((r.Bottom - capY) * scale);
+            x0 = Math.Max(0, x0); y0 = Math.Max(0, y0); x1 = Math.Min(bw, x1); y1 = Math.Min(bh, y1);
+            if (x1 <= x0 || y1 <= y0) continue;
+            for (int py = y0; py < y1; py++)
+            {
+                int rowOff = py * bw * 4;
+                for (int px = x0; px < x1; px++)
+                {
+                    int off = rowOff + px * 4;
+                    buf[off] = 24; buf[off + 1] = 24; buf[off + 2] = 24; buf[off + 3] = 255;
+                }
+            }
+            System.Threading.Interlocked.Increment(ref PrivacyRedactedCount);
+        }
+    }
+
 
     static readonly object CapLock = new object();
 
@@ -203,6 +229,7 @@ static class Gdi
             int lines = ok ? GetDIBits(_sMem, _sBmp, 0, (uint)dh, _sBuf, ref bi, 0) : 0;
             ReleaseDC(IntPtr.Zero, dc);
             LastSecureDesktop = !ok || lines <= 0;
+            if (!LastSecureDesktop) ApplyPrivacyScaled(_sBuf, dw, dh, x, y, scale);
             return (_sBuf, dw, dh);
         }
     }
@@ -241,6 +268,7 @@ static class Gdi
             int lines = ok ? GetDIBits(_slotMem[slot], _slotBmp[slot], 0, (uint)dh, _slotBuf[slot], ref bi, 0) : 0;
             ReleaseDC(IntPtr.Zero, dc);
             LastSecureDesktop = !ok || lines <= 0;
+            if (!LastSecureDesktop) ApplyPrivacyScaled(_slotBuf[slot], dw, dh, x, y, scale);
             return (_slotBuf[slot], dw, dh);
         }
     }
@@ -1515,7 +1543,9 @@ static class FrameHub
         lock (L)
         {
             refs++;
-            if (refs == 1 && !running)
+            // 不能绑 refs==1：frames_stop 之后 refs 若不为 0，Acquire 永远重启不了采集线程，
+            // 表现为「采集永久死亡 + 消费方 100% CPU 空转」。
+            if (!running)
             {
                 running = true;
                 thread = new Thread(Loop) { IsBackground = true };
@@ -1537,6 +1567,13 @@ static class FrameHub
     {
         lock (L)
         {
+            if (!running)
+            {
+                // 未运行时若立刻返回 null，Watch/Interpret/Infer 会无 sleep 死循环烧核
+                System.Threading.Monitor.Wait(L, Math.Min(50, Math.Max(1, timeoutMs)));
+                w = bw; h = bh; s = seq; ts = tsTicks;
+                return null;
+            }
             long deadline = Environment.TickCount64 + Math.Max(1, timeoutMs);
             while (running && seq == lastSeen)
             {
@@ -1583,8 +1620,9 @@ static class FrameHub
 
     public static void Stop()
     {
-        running = false;
-        lock (L) { System.Threading.Monitor.PulseAll(L); }
+        // 强制停：引用计数一并清零，否则下次 Acquire 只把 refs 加到 2，
+        // 「refs==1 && !running」永不成立 → 采集线程再也起不来。
+        lock (L) { running = false; refs = 0; System.Threading.Monitor.PulseAll(L); }
     }
 
     static void Loop()
@@ -3117,7 +3155,10 @@ class Program
                     string button = req.TryGetProperty("button", out var b) ? b.GetString() : "left";
                     int sw = Gdi.ScreenW(), sh = Gdi.ScreenH();
                     int px = Math.Max(0, Math.Min(sw - 96, x - 48)), py = Math.Max(0, Math.Min(sh - 64, y - 32));
-                    var (beforeBuf, pw, ph) = Gdi.Capture(px, py, 96, 64);
+                    // Capture 返回的是共享 _capBuf，不 Clone 的话 before/after 是同一块内存，
+                    // diff 恒 0 → verified 永远 false。
+                    var (beforeShared, pw, ph) = Gdi.Capture(px, py, 96, 64);
+                    var beforeBuf = (byte[])beforeShared.Clone();
                     Win.SetCursorPos(x, y);
                     uint down = button == "right" ? 0x0008u : button == "middle" ? 0x0020u : 0x0002u;
                     uint up = button == "right" ? 0x0010u : button == "middle" ? 0x0040u : 0x0004u;

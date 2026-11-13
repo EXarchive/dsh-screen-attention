@@ -1,5 +1,24 @@
 # Changelog (dsh-screen-attention)
 
+## v1.20.7 (2026-11-13) — C# 三个必修项
+
+### B-1 `frames_stop` 打死采集（工具组合可达）
+`Stop()` 只置 `running=false` 不清 `refs`；之后 `Acquire()` 把 refs 加到 2，`refs==1 && !running` 永不成立 → 采集线程永不重启；`WaitNext` 又秒返回 null，Watch/Interpret/Infer 无 sleep 死循环烧核。
+修：`Acquire` 与 refs 解耦、`Stop` 连 refs 一起清零、`WaitNext` 未运行时 `Monitor.Wait(50)` 兜底。
+实测：frames 28 帧 → stop → watch 2 秒 4 帧 / 1 次变化事件，采集正常重启。
+
+### M-1 `click.verified` 恒 false
+`Gdi.Capture` 返回共享 `_capBuf`，前后两次采集是同一块内存，diff 恒 0。修：before 缓冲先 `Clone()`。
+
+### M-2 快档采集绕过隐私遮蔽
+`CaptureSmall` / `CaptureSmallSlot` 走 StretchBlt 小图独立缓冲，没有调用 `RedactRect`——overlay 预览与运动检测会看到未遮蔽的密码管理器画面。
+修：新增 `ApplyPrivacyScaled`（按 scale 映射隐私矩形），两条小图路径均接入。
+
+### 同时（JS 侧）
+- helper 的 `stdin`/`proc` 补 `error` 监听：写入瞬间 helper 死亡的 EPIPE 是异步事件，无监听器 = uncaught exception，会连 DSH 宿主一起打崩。
+- `watch action=link` 补记 `watchConfig` + `holdHelper('watch')`，helper 崩溃后联动注入不再静默失效。
+- `interpret`/`infer` 的 `stop` 增加模式归属判断 + `try/finally`：不再抢对方模式的 obsConfig/hold，helper 抛错也会归位。
+
 ## v1.20.6 (2026-11-13) — 实时讲解下沉进插件（修 DSH 崩溃）
 
 ### 事故
