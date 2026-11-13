@@ -33,8 +33,11 @@ if (-not $alive) {
 }
 if (-not $alive) { throw 'ollama did not become ready' }
 
-$model = 'qwen2.5vl:3b'
-Write-Host "Pulling model $model into $modelsDir ..."
-& $exe pull $model
+# 两个模型分工：识图/看用新一代 qwen3-vl:4b；实时讲解用不带 thinking 的 qwen2.5vl:3b（快 6-10 倍）
+$models = @('qwen3-vl:4b', 'qwen2.5vl:3b')
+foreach ($model in $models) {
+  Write-Host "Pulling model $model into $modelsDir ..."
+  & $exe pull $model
+}
 Write-Host 'Done.'
 Write-Host "models: $modelsDir"

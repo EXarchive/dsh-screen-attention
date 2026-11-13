@@ -2872,7 +2872,12 @@ export function apply(ctx) {
   // 实测热启动 788-792ms、197 tok/s，满足「2 秒内看懂画面」；冷启动首次约 49s（加载模型）。
   // 这是唯一能给「画面内容」而非「文字/标签」的本地通道。
   const OLLAMA_URL = process.env.SA_OLLAMA_URL || 'http://127.0.0.1:11434'
-  const OLLAMA_MODEL = process.env.SA_VLM_MODEL || 'qwen2.5vl:3b'
+  // 默认 qwen3-vl:4b（2026-11-13 切换）：更新一代，同样支持图像输入；旧默认 qwen2.5vl:3b 保留可用
+  // （SA_VLM_MODEL=qwen2.5vl:3b 即可回退）。
+  const OLLAMA_MODEL = process.env.SA_VLM_MODEL || 'qwen3-vl:4b'
+  // 讲解是 1-2 秒一条的节奏，thinking 模型（qwen3-vl）单帧要吃 500-800 个推理 token（实测 6-12s），
+  // 结构上撑不住；所以讲解默认用旧的快模型，识图/看一律走新的 qwen3-vl。
+  const NARRATE_MODEL = process.env.SA_NARRATE_MODEL || 'qwen2.5vl:3b'
 
   // ===== 内置运行时（vendor/）：插件自带 ollama.exe + 模型，不依赖外部安装 =====
   const VENDOR_DIR = join(PACKAGE_ROOT, '..', 'vendor')
@@ -2992,7 +2997,7 @@ export function apply(ctx) {
   }
 
   // ===== 统一的 VLM 请求入口（四个工具共用） =====
-  // 2026-11-13 实测（RTX 5070 Ti / ollama 0.40.16 / qwen2.5vl:3b）：
+  // 2026-11-13 实测（RTX 5070 Ti / ollama 0.40.16；旧默认 qwen2.5vl:3b，现默认 qwen3-vl:4b）：
   //   默认 num_ctx=4096 时，一次带图请求之后 serve 会进入坏态，之后**每一次**都只输出 "@@"，
   //   直到重启 serve。显式请求 num_ctx=8192 后连续多轮全正常（第 2 轮起命中缓存 147ms）。
   //   卸载模型（keep_alive:0）后重载也能恢复，但每次多花 ~4.5s，只用作兜底。
@@ -3002,6 +3007,18 @@ export function apply(ctx) {
   // 672 是“够看清 + 稳定”的折中；超过 798 已多次复现退化，所以参数上限就压到 798。
   const VLM_SAFE_W = 672
   const VLM_MAX_W = 798
+
+  // qwen3 系列是 thinking 模型：不关掉会先吐一段推理（拖慢且污染字幕）。
+  // 非 thinking 模型传 think 会被 ollama 拒（does not support thinking），所以按模型名判断。
+  // 注意：ollama 0.40.16 对 qwen3-vl **不认** `think:false`（实测 generate/chat、顶层/options 全被忽略），
+  // 每帧都会先吐 400-700 字符推理再给结论。所以对 thinking 模型必须把 num_predict 抬到够用，
+  // 否则推理就把预算吃光，response 恒为空（这正是"新模型看起来不工作"的真正原因）。
+  function isThinkingModel(model) {
+    return /qwen3/i.test(String(model || OLLAMA_MODEL))
+  }
+  function thinkField(model) {
+    return isThinkingModel(model) ? { think: false } : {}
+  }
 
   async function vlmUnload() {
     try {
@@ -3015,7 +3032,10 @@ export function apply(ctx) {
 
   async function vlmAsk(opts) {
     const t0 = Date.now()
-    const maxTokens = clampInt(opts.maxTokens, 96, 8, 400)
+    const model = String(opts.model || OLLAMA_MODEL)
+    // thinking 模型：调用方给 40 也要抬到 900（推理 500-800 + 结论），否则永远是空回复
+    const wanted = clampInt(opts.maxTokens, 96, 8, 400)
+    const maxTokens = isThinkingModel(model) ? Math.max(wanted, 900) : wanted
     const temperature = Number.isFinite(opts.temperature) ? Number(opts.temperature) : 0.2
     const timeoutMs = opts.timeoutMs || 120000
     // 退化（全 @@@@）的第一诱因是送图宽度，不是 tokenizer：同一张密集截图 546 宽 3/3 正常、
@@ -3025,7 +3045,8 @@ export function apply(ctx) {
     let curSize = opts.size || null
     let shrinks = 0
     const rebuild = () => JSON.stringify({
-      model: OLLAMA_MODEL,
+      model,
+      ...thinkField(model),
       ...(opts.system ? { system: String(opts.system) } : {}),
       prompt: String(opts.prompt || '一句话描述这个画面里有什么'),
       images: [curImage],
@@ -3512,6 +3533,7 @@ export function apply(ctx) {
       // 实时讲解走共享入口：num_ctx 8192 是它不再「讲一阵就全 @@@@」的关键
       const r = await vlmAsk({
         image: shot.jpegB64, system: sys, prompt: usr, maxTokens: 40, temperature: 0.6, timeoutMs: 25000, keepAlive: '10m', noRestart: true,
+        model: NARRATE_MODEL,
         // 讲解宁可多抓一张更小的图，也不要直接跳过这一帧
         retryImage: async () => {
           const w2 = Math.max(280, Math.round(narrate.maxW * 0.78))
@@ -3650,6 +3672,7 @@ export function apply(ctx) {
         autoCleanupTtlMs: state.obsTtlMs || 0,
         observation: { mode: state.obsMode || null, holds: Number(observationHolds) || 0, overlayOpen: !!state.overlayOpen, autoCleanupTtlMs: state.obsTtlMs || 0 },
         models: (h && h.models) ? h.models : null,
+        modelFor: { vision: OLLAMA_MODEL, narrate: NARRATE_MODEL },
         clip: (h && h.clip) ? h.clip : null,
         faceModel: (h && typeof h.faceModel === 'boolean') ? h.faceModel : false,
         characters: (h && typeof h.characters === 'number') ? h.characters : 0,
