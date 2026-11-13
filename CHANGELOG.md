@@ -1,6 +1,54 @@
 # Changelog (dsh-screen-attention)
 
-## v1.20.11 (2026-11-13) — 采集线程世代号 + 共享缓冲独占（C# 两项正确性修复）
+## v1.20.12 (2026-11-13) — 快档坐标空间、饱和度权重、JS 状态漂移与死代码（本轮清空清单）
+
+### M-5 快档采集（60fps，帧 0.4×）下运动区域/解读区域是「帧坐标」
+`FrameHub` 在 `intervalMs ≤ 20` 时走 `CaptureSmallParallel(0.4)`，帧是 0.4× 缩小图；
+而 overlay 红框、`interpret` 抓取区、change 事件都按**屏幕坐标**用 → 框只有实面积 40%、贴在左上角。
+- `Watch.DetectMotion`：格网改建在屏幕坐标系（`cols/rows` 按屏幕算，采样点按 `kx/ky` 映射回帧），
+  切档时 `LastSamples` 索引含义不再错位（原来切快/慢档会凭空报一次大面积运动）。
+- `Interpret`：`DiffRect` 的帧坐标结果先过新增的 `Gdi.FrameRectToScreen` 再当抓取区域。
+- 顺带修一个由窗口累计触发的假框：`windowSum ≥ 12` 触发运动但本帧 0 格变化时，`minX/maxX` 还是哨兵
+  `int.MaxValue`，直接建矩形会得到 `{x:2147483647, y:2147483647, w:1, h:1}`（实测）。现在只在真有变化格时更新。
+
+### M-6 `Cuts.HsvDiff` 的饱和度权重写反
+`w = 1 - s/255*0.6` → 饱和度越高、色相权重越低，与注释「低饱和时色相不可靠，降权」正好相反：
+灰界面（桌面常态）色相噪声被放大，鲜艳画面真正变色反被压。改 `w = 0.4 + s/255*0.6`。
+影响 `saperm_sheet` 的选帧打分。
+
+### JS：helper 引用计数与空闲退出（原来整段是死代码）
+三处把 `refs` 钉在 ≥1，`armIdleShutdown` 永远等不到 `refs==0`：模块初始化 `acquireHelper()` 不归还、
+`ensureHelper` 里 `refs = max(1, refs)`、以及在飞请求不记账。结果 helper + 2.5GB 模型永驻。
+修：初始化处立刻 `releaseHelper()`；`ensureHelper` 不再钉；`helperCall` 前后 `acquire/release`；
+并给 `frames` / `observe_task` / `narrate` 补上持有（否则空闲退出会把还在跑的采集连根关掉）。
+`saperm_status` 现在回 `refs`/`holds`，可直接断言。
+
+### JS：`overlayOpen` 与真实浮窗对齐
+用户双击关掉浮窗后 JS 仍记 `true` → autoCleanup 不回收、health 说谎、`set` 把状态又写回 true。
+新增 helper 动作 `overlay_status`；`overlay_set` 回 `open`；`saperm_overlay` 增加 `action:"status"`；
+`set` 以 helper 返回的 `open` 为准；`health`/`status` 每次都校正一次。
+
+### JS：其余减法
+- `stream start` 只回摘要 —— 原来直接把内部 state 连同 Node `Timeout` 对象序列化给模型。
+- 删掉只写不读的 `state.lastLinkText`。
+- C# `Infer.latestChanges` 加 20 条上限（前台窗口每切换一次加一条，长会话里无限长）。
+
+### 元数据
+- 补 `LICENSE`（MIT，仓库根 + 插件目录），并加进 `files[]`（否则 npm 包里没有）。
+- `peerDependencies: @deepseek-ai/dsh >=0.1.0-rc.6` 核对：宿主实测 **0.2.2-rc.1**，满足；
+  此前记的「宿主 rc.5」是过时信息，已纠正。
+
+### 验收（新增 `tests/state-drift-test.mjs`）
+| 项 | 结果 |
+|---|---|
+| `refs`：控制调用前后 | **0 → 0**（空闲退出可达） |
+| 浮窗真值：open → helper 关窗 → `set` | `open:false / state:false`，`health.overlayOpen:false` |
+| 快档运动区域 | 样本 5 个，`maxRight 2224`、`maxBottom 1584`（0.4× 帧框只有 1024×640）→ 已是屏幕坐标 |
+| `plugin-smoke` / `thread-gen-test` / `shared-buffer-smoke` | 47 工具、loops 1→0、7/7 慢消费者 PASS |
+| `narrate-budget` | 7 条 / 0 错误，`firstCycleMs 1132`、`avgVlmMs 986` |
+| `vision-probe` | 47 工具、零副作用、文件识图正常 |
+| infer 变化列表 | 上限生效（历史条目 `changes` ≤ 20） |
+
 
 ### M-3 采集线程世代号：stop→立刻 start 会出现两条采集线程
 `Stop()` 只把 `running/watching` 置 false，`Start()` 又只看这个 bool，于是旧线程还没来得及看新标志，

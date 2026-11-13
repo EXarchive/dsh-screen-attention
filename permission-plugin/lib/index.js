@@ -324,7 +324,9 @@ function acquireHelper() {
 async function ensureHelper() {
   clearTimeout(helperSingleton.idleTimer)
   if (helperSingleton.proc && helperSingleton.online) return true
-  helperSingleton.refs = Math.max(1, helperSingleton.refs)
+  // 不能在这里把 refs 钉到 ≥1：钉住之后 releaseHelper 永远降不到 0，
+  // armIdleShutdown 的空闲退出就成了死代码（helper 永不回收，2.5GB 模型常驻）。
+  // 在飞请求的持有由 helperCall 的 acquire/release 负责。
   if (!helperSingleton.proc && !helperSingleton.restarting) spawnHelper()
   const t0 = Date.now()
   while (Date.now() - t0 < 4000) {
@@ -357,7 +359,11 @@ function releaseHelper() {
 }
 
 function helperCall(cmd, args = {}, timeoutMs = 35000) {
-  return ensureHelper().then((ok) => {
+  // 在飞请求也算持有：否则空闲计时器可能在请求途中把 helper 关掉；
+  // 结束后归还，refs 归 0 时重新武装空闲退出。
+  acquireHelper()
+  const release = () => { try { releaseHelper() } catch {} }
+  const p = ensureHelper().then((ok) => {
     if (!ok) throw new Error('helper 离线（SaHelper.exe 未运行；期望路径 ' + HELPER_EXE + '）')
     return new Promise((resolve, reject) => {
       if (!helperSingleton.proc || !helperSingleton.online) {
@@ -383,6 +389,7 @@ function helperCall(cmd, args = {}, timeoutMs = 35000) {
       helperSingleton.proc.stdin.write(JSON.stringify({ ...args, id, cmd }) + '\n')
     })
   })
+  return p.then((v) => { release(); return v }, (e) => { release(); throw e })
 }
 
 function friendlyHelperError(e) {
@@ -453,7 +460,6 @@ export function apply(ctx) {
     link: false,        // change 事件 → 自动注入摘要到会话（对话不中断）
     linkWake: false,    // 需要唤醒时用 steer 而非 inject
     lastLinkAt: 0,
-    lastLinkText: '',
     autoWatch: false,   // watch 是否随小窗自动启动（关闭小窗时停）
     overlayOpen: false,
     overlaySize: null,   // 浮窗当前尺寸 {w,h}：用于判断字幕加高是否需要 resize // 注意力小窗是否已打开
@@ -589,7 +595,7 @@ export function apply(ctx) {
       // 而它在这条回调链里会挂住（RPC 从 stdout reader 回调发起，响应回不来）。
       // 需要文本时用 saperm_observe 单独取，注入这条路径必须自给自足。
       const body = '[屏幕变化通知] 屏幕运动区域 (' + (evRect.x ?? 0) + ',' + (evRect.y ?? 0) + ' ' + (evRect.w ?? 0) + 'x' + (evRect.h ?? 0) + ')，变化率 ' + evRatio + '。若与当前任务相关可继续处理；无关则忽略。'
-      state.lastLinkText = ''
+      // （lastLinkText 已删除：只写不读的死状态）
       if (!linkBudgetOk()) { appendObservationLog({ type: 'inject-skip', reason: 'budget', count: state.linkBudget.count }); return }
       let shot = null
       if (state.linkShot) {
@@ -995,7 +1001,9 @@ export function apply(ctx) {
     st.timer = setInterval(() => { pollStream().catch(() => {}) }, intervalMs)
     if (st.timer.unref) st.timer.unref()
     pollStream().catch(() => {})
-    return st
+    // 只回摘要：st 里挂着 setInterval 的 Timeout 对象和内部 ring，
+    // 直接返回等于把进程内部对象序列化进模型上下文。
+    return { running: true, intervalMs: st.intervalMs, startedAt: st.startedAt }
   }
 
   function stopStream() {
@@ -1029,7 +1037,10 @@ export function apply(ctx) {
     }
   }
   helperSingleton.listeners.add(onHelperEvent)
+  // 启动时拉起 helper，但立刻归还这份持有：否则 refs 恒为 1，
+  // armIdleShutdown 的空闲退出永远不会触发（helper + 模型常驻不回收）。
   acquireHelper()
+  releaseHelper()
   ctx.effect(() => () => {
     try { stopNarrate(false) } catch {}
     try { stopStream() } catch {}
@@ -1181,6 +1192,7 @@ export function apply(ctx) {
       for (const k of state.l2.keys()) l2[k] = state.l2.get(k)
       const l3 = {}
       for (const k of state.l3.keys()) l3[k] = state.l3.get(k)
+      try { const ov = await helperCall('overlay_status'); if (ov && typeof ov.open === 'boolean') state.overlayOpen = ov.open } catch {}
       return {
         paused: state.paused,
         pausedBy: state.pausedBy,
@@ -1190,7 +1202,7 @@ export function apply(ctx) {
         interruptProtect: state.interruptProtect,
         observeTask: state.observeTask ? { startedAt: state.observeTask.startedAt, seconds: state.observeTask.seconds, elapsedMs: Date.now() - state.observeTask.startedAt } : null,
         injection: { interpret: injectSummary(state.interpretInject), infer: injectSummary(state.inferInject) },
-        helper: { online: helperSingleton.online, pid: helperSingleton.pid },
+        helper: { online: helperSingleton.online, pid: helperSingleton.pid, refs: helperSingleton.refs, holds: observationHolds },
       }
     },
   })
@@ -1642,7 +1654,7 @@ export function apply(ctx) {
     parameters: {
       type: 'object',
       properties: {
-        action: { type: 'string', enum: ['open', 'close', 'set'], description: '操作类型' },
+        action: { type: 'string', enum: ['open', 'close', 'set', 'status'], description: '操作类型（status=查真实开/关与帧状态）' },
         x: { type: 'integer' }, y: { type: 'integer' }, w: { type: 'integer' }, h: { type: 'integer' },
         aspect: { type: 'string', description: 'open/set 用：auto/landscape/portrait/square/custom' },
         ttlSec: { type: 'integer', description: 'open 用：无操作自动关闭秒数' },
@@ -1688,10 +1700,18 @@ export function apply(ctx) {
         clearAutoCleanupIfIdle()
         return { ...(r || {}), autoWatchStopped: true }
       }
+      if (act === 'status') {
+        const st = await helperCall('overlay_status')
+        if (st && typeof st.open === 'boolean') state.overlayOpen = st.open
+        return { ...(st || {}), stateOverlayOpen: !!state.overlayOpen }
+      }
       if (act === 'set') {
-        state.overlayOpen = true
-        refreshAutoCleanup()
-        const out = await helperCall('overlay_set', { region: args.region, gaze: args.gaze, clearRegion: args.clearRegion, clearGaze: args.clearGaze, note: args.note, subtitle: args.subtitle })
+        // 浮窗可能已被用户双击关掉：先调 helper，再按它回来的 open 校正 state，
+        // 否则 overlayOpen 会一直说谎（autoCleanup 不回收、health 显示还在开）。
+        const pre = await helperCall('overlay_set', { region: args.region, gaze: args.gaze, clearRegion: args.clearRegion, clearGaze: args.clearGaze, note: args.note, subtitle: args.subtitle })
+        state.overlayOpen = (pre && typeof pre.open === 'boolean') ? pre.open : true
+        if (state.overlayOpen) refreshAutoCleanup()
+        const out = pre
         let sayResult = null
         if (args.say) {
           const sayMs = Number(args.ms) > 0 ? Number(args.ms) : 6000
@@ -1703,11 +1723,11 @@ export function apply(ctx) {
         if (args.aspect || (args.w && args.h)) {
           const box = resolveAspect(args.aspect || 'custom', args.w, args.h)
           const rz = await helperCall('overlay_resize', { w: box.w, h: box.h })
-          return { ...(out || {}), size: { ...box, resized: !!(rz && rz.resized) }, say: sayResult }
+          return { ...(out || {}), stateOverlayOpen: !!state.overlayOpen, size: { ...box, resized: !!(rz && rz.resized) }, say: sayResult }
         }
-        return { ...(out || {}), say: sayResult }
+        return { ...(out || {}), stateOverlayOpen: !!state.overlayOpen, say: sayResult }
       }
-      throw new Error('action 必须是: open | close | set')
+      throw new Error('action 必须是: open | close | set | status')
     },
   })
 
@@ -1757,6 +1777,7 @@ export function apply(ctx) {
         try { await helperCall('watch_focus', focusRect) } catch {}
       }
       try { await helperCall('watch_start', { intervalMs: interval }) } catch {}
+      holdHelper('observe')
       try { await helperCall('overlay_open', {}) } catch {}
       const idleStopMin = Number.isFinite(Number(args.idleStopMin)) ? Math.max(0, Number(args.idleStopMin)) : 3
       const maxReports = Math.max(0, Number(args.maxReports) || 0)
@@ -1861,6 +1882,7 @@ export function apply(ctx) {
       state.link = false
       try { await helperCall('watch_stop') } catch {}
       try { await helperCall('overlay_close') } catch {}
+      releaseHold('observe')
       const shots = (task && task.shots) || state.lastObserveShots || []
       if (task) state.lastObserveShots = task.shots || []
       return { stopped: true, interruptProtect: false, shots, shotCount: shots.length, hint: shots.length ? '用 read_image 依次读 shots 里的路径即可描述这段时间的画面变化' : '本次任务没有抓到帧（检查 shotEveryMs）' }
@@ -2289,10 +2311,12 @@ export function apply(ctx) {
         try { mkdirSync(LOGS_DIR, { recursive: true }) } catch {}
         const path = args.path || join(LOGS_DIR, 'frames-' + Date.now() + '.jsonl')
         const r = await helperCall('frames_start', { fps, path })
+        holdHelper('frames')   // 采集在 helper 进程里跑：不持有的话空闲退出会把它连根关掉
         return { ...(r || {}), action, fps, path, hint: '用 action=stats 查看进度，action=stop 结束' }
       }
       if (action === 'stop') {
         const r = await helperCall('frames_stop')
+        releaseHold('frames')
         return { ...(r || {}), action }
       }
       const s = await helperCall('frames_stats')
@@ -3365,6 +3389,7 @@ export function apply(ctx) {
   function stopNarrate(closeOverlay) {
     const was = narrate.running
     narrate.running = false
+    releaseHold('narrate')
     if (narrate.timer) { clearTimeout(narrate.timer); narrate.timer = null }
     ;(async () => {
       if (closeOverlay && !narrate.overlayWasOpen) {
@@ -3453,6 +3478,7 @@ export function apply(ctx) {
           try { await helperCall('overlay_open', {}) } catch {}
           state.overlayOpen = true
         }
+        holdHelper('narrate')
         narrate.running = true
         narrate.startedAt = Date.now()
         narrate.count = 0; narrate.errs = 0; narrate.vlmMs = []; narrate.lastText = ''
@@ -3517,6 +3543,8 @@ export function apply(ctx) {
     execute: async () => {
       let h = null
       try { h = await helperCall('health', {}) } catch (e) { h = { ok: false, error: e.message } }
+      // 以 helper 为准校正浮窗状态（用户可能双击关掉了窗，JS 这边布尔值会漂）
+      try { const ov = await helperCall('overlay_status'); if (ov && typeof ov.open === 'boolean') state.overlayOpen = ov.open } catch {}
       const prof = await getProfile(false).catch(() => null)
       return { ollama: ollamaRuntimeInfo(), 
         scheme: prof ? {

@@ -164,6 +164,22 @@ static class Gdi
     }
 
 
+    /// <summary>
+    /// 把「帧坐标」矩形映射回「屏幕坐标」。
+    /// 快档采集（intervalMs ≤ 20）走 CaptureSmallParallel(0.4)：帧是 0.4× 缩小图，
+    /// 但所有消费者（overlay 红框、interpret 抓取区、change 事件）都按屏幕坐标用。
+    /// 不映射的表现：报出来的变化框只有实面积的 40%，还贴在左上角。
+    /// </summary>
+    public static Rectangle FrameRectToScreen(Rectangle r, int frameW, int frameH)
+    {
+        int sw = ScreenW(), sh = ScreenH();
+        if (frameW <= 0 || frameH <= 0 || (frameW == sw && frameH == sh)) return r;
+        double kx = (double)sw / frameW, ky = (double)sh / frameH;
+        return new Rectangle(
+            (int)Math.Round(r.X * kx), (int)Math.Round(r.Y * ky),
+            Math.Max(1, (int)Math.Round(r.Width * kx)), Math.Max(1, (int)Math.Round(r.Height * ky)));
+    }
+
     static readonly object CapLock = new object();
 
     public static (byte[] buf, int w, int h) Capture(int x, int y, int w, int h)
@@ -1864,23 +1880,32 @@ static class Watch
     // 返回本帧变化点数；运动判定在 Loop 里用窗口累计 + 单帧比例
     static int DetectMotion(byte[] buf, int w, int h)
     {
-        const int step = 16;
+        const int step = 16;             // 屏幕坐标下的格宽（固定，不随帧缩放变）
         const int chTh = 20;             // 通道差阈值
         const double ratioTh = 0.0008;   // 变化格比例阈值（0.08%）
-        int cols = (w + step - 1) / step, rows = (h + step - 1) / step;
+        // 格网固定建在「屏幕坐标」上：快档帧是 0.4× 缩小图，若按帧坐标建格，
+        // 切档时格点位置整体错位（LastSamples 的索引含义变了）→ 凭空报一次大面积运动。
+        if (w <= 0 || h <= 0) return 0;
+        int scrW = Gdi.ScreenW(), scrH = Gdi.ScreenH();
+        double kx = (double)w / scrW, ky = (double)h / scrH;   // 帧像素 / 屏幕像素
+        int cols = scrW / step + 1, rows = scrH / step + 1;
         int changes = 0, total = 0;
         int minX = int.MaxValue, minY = int.MaxValue, maxX = -1, maxY = -1;
         for (int gy = 0; gy < rows; gy++)
         {
-            int y = gy * step;
-            if (y >= h) break;
+            int sy = gy * step;
+            int fy = (int)Math.Round((sy + step / 2.0) * ky);
+            if (fy >= h) fy = h - 1;
+            if (fy < 0) fy = 0;
             for (int gx = 0; gx < cols; gx++)
             {
-                int x = gx * step;
-                if (x >= w) break;
+                int sx = gx * step;
+                int fx = (int)Math.Round((sx + step / 2.0) * kx);
+                if (fx >= w) fx = w - 1;
+                if (fx < 0) fx = 0;
                 int idx = gy * cols + gx;
                 if (idx >= LastSamples.Length) continue;
-                int off = (y * w + x) * 4;
+                int off = (fy * w + fx) * 4;
                 int b = buf[off], g = buf[off + 1], r = buf[off + 2];
                 int cur = (r << 16) | (g << 8) | b;
                 if (SampleValid[idx])
@@ -1889,8 +1914,8 @@ static class Watch
                     if (Math.Abs(r - pr) > chTh || Math.Abs(g - pg) > chTh || Math.Abs(b - pb) > chTh)
                     {
                         changes++;
-                        if (x < minX) minX = x; if (y < minY) minY = y;
-                        if (x > maxX) maxX = x; if (y > maxY) maxY = y;
+                        if (sx < minX) minX = sx; if (sy < minY) minY = sy;
+                        if (sx > maxX) maxX = sx; if (sy > maxY) maxY = sy;
                     }
                 }
                 LastSamples[idx] = cur;
@@ -1910,7 +1935,11 @@ static class Watch
             bool m = ratio > ratioTh || windowSum >= 12;
             if (m)
             {
-                motionRect = new Rectangle(Math.Max(0, minX), Math.Max(0, minY), Math.Max(1, maxX - minX + step), Math.Max(1, maxY - minY + step));
+                // 运动可能由滑动窗口（windowSum ≥ 12）触发，而本帧一个格子都没变 ——
+                // 这时 min/max 还是哨兵值 int.MaxValue，直接建矩形会得到
+                // {{x:2147483647, w:1, h:1}} 这种垃圾框（overlay 红框/观察汇报都会显示它）。
+                if (changes > 0 && minX != int.MaxValue && maxX >= minX)
+                    motionRect = new Rectangle(Math.Max(0, minX), Math.Max(0, minY), Math.Max(1, maxX - minX + step), Math.Max(1, maxY - minY + step));
                 if (!motion) motionSince = DateTime.UtcNow.Ticks;
                 motion = true;
             }
@@ -2158,7 +2187,8 @@ static class Interpret
                 {
                     var dr = DiffRect(frame, w, h);
                     if (dr.IsEmpty) { lock (L) lastKind = "idle"; }
-                    rect = dr;
+                    // 帧可能是快档缩略图：这里拿到的 dr 是帧坐标，直接当屏幕坐标去截屏会截错区域
+                    rect = dr.IsEmpty ? dr : Gdi.FrameRectToScreen(dr, w, h);
                 }
                 long diffMs = d0.ElapsedMilliseconds;
                 if (!rect.IsEmpty)
@@ -2767,6 +2797,9 @@ static class Infer
                         {
                             string swMsg = "窗口切换 -> " + fgNow;
                             latestChanges.Add(swMsg);
+                            // 这个列表是"本帧变化"的快照，Add 之后没人清 ⇒ 长会话里会一直长
+                            // （每切一次前台窗口加一条）。跟 changeLog 一样留最近 20 条即可。
+                            while (latestChanges.Count > 20) latestChanges.RemoveAt(0);
                             changeLog.Add(DateTime.Now.ToString("HH:mm:ss") + " " + swMsg);
                             while (changeLog.Count > 100) changeLog.RemoveAt(0);
                         }
@@ -3524,10 +3557,18 @@ class Program
                     {
                         hasRect = Overlay.hasRect, hasGaze = Overlay.hasGaze,
                         note = Overlay.note, subtitle = Overlay.subtitle, subtitleLen = (Overlay.subtitle ?? "").Length,
+                        open = Overlay.IsOpen,   // JS 侧据此校正 overlayOpen（用户双击关窗后状态会漂）
                         frame = new { present = Overlay.frame != null, w = Overlay.fw, h = Overlay.fh, stamp = Overlay.frameStamp, fps = Math.Round(Overlay.fps, 1) },
                         captureExcluded = true,
                     };
                 }
+            case "overlay_status":
+                return new
+                {
+                    open = Overlay.IsOpen,
+                    note = Overlay.note, subtitle = Overlay.subtitle,
+                    frame = new { present = Overlay.frame != null, w = Overlay.fw, h = Overlay.fh, stamp = Overlay.frameStamp, fps = Math.Round(Overlay.fps, 1) },
+                };
             case "watch_start":
                 {
                     int iv = req.TryGetProperty("intervalMs", out var pi) ? pi.GetInt32() : 1000;
