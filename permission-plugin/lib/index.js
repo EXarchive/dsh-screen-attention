@@ -286,6 +286,10 @@ function spawnHelper() {
       if (p) { helperSingleton.pending.delete(msg.id); p.resolve(msg) }
     }
   })
+  // helper 死亡瞬间的 stdin 写入会以异步 stream 'error'(EPIPE) 抛出；没有监听器 =
+  // uncaught exception，Node 默认直接终止进程 —— 实测会连 DSH 宿主一起打崩。
+  proc.stdin.on('error', () => {})
+  proc.on('error', (e) => console.log('[sa-perm] helper spawn/运行错误: ' + ((e && e.message) || e)))
   proc.stderr.on('data', (d) => console.log(`[sa-helper] ${d.toString('utf8').trim()}`))
   proc.on('exit', (code) => {
     const unexpected = !helperSingleton.expectedShutdown
@@ -2624,12 +2628,17 @@ export function apply(ctx) {
       }
       if (act === 'stop') {
         stopInject('interpret')
-        state.obsConfig = null
-        const r = await helperCall('interpret_stop', {})
-        releaseHold('obs')
-        state.obsMode = null
-        clearAutoCleanupIfIdle()
-        return { ...r, injection: injectSummary(state.interpretInject), }
+        const owning = state.obsMode !== 'infer'   // infer 在跑时不许抢它的 obsConfig/hold
+        if (owning) state.obsConfig = null
+        let r = null
+        try {
+          r = await helperCall('interpret_stop', {})
+        } finally {
+          // helper 抛错也必须归位，否则 obsMode/hold 残留、三方状态不一致
+          if (owning) { releaseHold('obs'); state.obsMode = null }
+          clearAutoCleanupIfIdle()
+        }
+        return { ...(r || {}), injection: injectSummary(state.interpretInject) }
       }
       throw new Error('action 必须是: start | status | stop')
     },
@@ -2689,12 +2698,16 @@ export function apply(ctx) {
       if (act === 'stop') {
         stopInject('infer')
         stopStream()
-        state.obsConfig = null
-        const r = await helperCall('infer_stop', {})
-        releaseHold('obs')
-        state.obsMode = null
-        clearAutoCleanupIfIdle()
-        return { ...r, injection: injectSummary(state.inferInject), }
+        const owning = state.obsMode !== 'interpret'   // interpret 在跑时不许抢它的 obsConfig/hold
+        if (owning) state.obsConfig = null
+        let r = null
+        try {
+          r = await helperCall('infer_stop', {})
+        } finally {
+          if (owning) { releaseHold('obs'); state.obsMode = null }
+          clearAutoCleanupIfIdle()
+        }
+        return { ...(r || {}), injection: injectSummary(state.inferInject) }
       }
       throw new Error('action 必须是: start | status | stop')
     },
@@ -3168,6 +3181,12 @@ export function apply(ctx) {
         state.autoWatch = false
         if (args.focus && Number.isFinite(args.focus.x)) { await helperCall('watch_focus', args.focus) }
         const r = await helperCall('watch_start', { intervalMs: iv })
+        if (r && r.watching) {
+          // 与 action=start 对齐：不登记 watchConfig/hold 的话，onHelperExit 与
+          // onHelperReady 都不认这条 watch —— helper 崩溃后联动注入会静默失效。
+          holdHelper('watch')
+          state.watchConfig = { active: true, intervalMs: iv, focus: (args.focus && Number.isFinite(args.focus.x)) ? args.focus : null }
+        }
         const st = await helperCall('watch_status')
         return { ...r, linked: true, wake: state.linkWake, ...(st || {}) }
       }
