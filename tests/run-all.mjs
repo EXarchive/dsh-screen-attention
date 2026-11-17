@@ -6,13 +6,16 @@ import { fileURLToPath } from 'node:url'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const SUITE = [
-  ['plugin-smoke', '47 工具注册 / health / infer↔interpret 互斥'],
+  ['plugin-smoke', '48 工具注册 / health / infer↔interpret 互斥'],
   ['prod-readiness', '投产自检 21 项（watchdog 自愈、角色备注迁移、诊断字段、保留清理）'],
   ['state-drift-test', 'refs 归零 / overlay 状态对齐 / 快档屏幕坐标'],
   ['thread-gen-test', '采集线程世代号（停后立刻启不双线程）'],
   ['shared-buffer-smoke', '60fps 采集下 7 个慢消费者'],
   ['narrate-budget', '短窗口讲解（首轮不计入预算）'],
   ['vision-probe', 'saperm_vision 识图（零副作用）'],
+  ['browser-bg', '后台无头浏览器（复用 / 文本 / 截图 / cookie 端到端）'],
+  ['cookies-readonly', '本地 cookie 只读：v10 解密注入 / v20 标记受阻'],
+  ['web-tools', '工具级 saperm_web + saperm_cookies'],
 ]
 if (process.argv.includes('--list')) {
   for (const [n, d] of SUITE) console.log(n.padEnd(22) + d)

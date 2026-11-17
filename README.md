@@ -77,12 +77,30 @@ powershell -ExecutionPolicy Bypass -File vendor/setup-runtime.ps1
 | `recognize` | OCR 文字 + UIA 控件一次返回（带坐标） |
 | `locate` | 按关键字找屏幕元素坐标（"哔哩哔哩"按钮在哪） |
 | `window` | `list` 列窗口 / `shot` 抓**后台被遮挡**窗口（PrintWindow，不靠屏幕） |
-| `web` | 无头浏览器渲染网页截图，不建窗口不抢焦点 |
+| `web` | **后台网页（常驻无头浏览器）**：CDP over pipe，不监听端口、不建窗口、不抢焦点；出截图 + 页面文本，支持整页截图、SPA 等待、页内 JS。常驻实例二次调用 <400ms |
+| `cookies` | **本地 cookie 只读复用**：`scan` 统计各 profile 的加密版本 / `import` 解密 v10 并注入后台浏览器 / `list` / `clear` / `close`。只读，不碰真实浏览器与它的库 |
 | `animeface` | 动漫脸检测（框+置信度） |
 | `audio` | 听系统输出/麦克风：电平、是否人声（判断"有没有人在说话"） |
 
 > 只想读图、不要任何副作用：`vision({ path })`（看图说话）/ `vision({ path, engine:'ocr' })`（只要文字）。
 > 旧版 scan/detect/scene/ocr_file 均已并入 `see`。
+
+### 后台网页与本地 cookie（实测边界，2026-11-18）
+
+`saperm_web` 用的是**插件自己的隔离 profile**（`out/web-iso`）+ `--remote-debugging-pipe`：
+不监听 TCP、不建窗口、不抢焦点，和一个常驻实例复用（冷启 ~300ms，二次 <400ms）。
+
+要让它带上登录态，用 `saperm_cookies action=import`。能不能复用取决于 cookie 的加密方式：
+
+| 加密 | 谁在用 | 用户态能解吗 | 做法 |
+|---|---|---|---|
+| `v10` | Chrome、老版 Edge | ✅ 能（DPAPI 取主密钥 + AES-256-GCM） | 只读解密 → CDP 注入隔离 profile |
+| `v20`（App-Bound） | Edge 157 等 | ❌ 不能 | 只能在该隔离 profile 里**登录一次**，之后长期复用 |
+
+两条实测事实，别重走弯路：
+1. v20 的主密钥被 **SYSTEM DPAPI + elevation_service.exe 内置密钥**双重锁住，COM `IElevator::DecryptData` 还校验调用方路径（非浏览器路径 → 事件 257、不给数据）。
+2. **把 profile 复制到别的路径、让浏览器自己解也不行**：实测复制 1073 条 v20 cookie 的无头实例访问站点仍是未登录，浏览器启动时把解不开的行**直接删了**（DB 行数 1073 → 0）。
+3. Chrome 130+ 的 v10 明文前 32 字节是 `SHA256(host_key)`（域绑定），不剥掉会得到"解密成功但全是乱码"。
 
 ### 持续观察（L0）
 

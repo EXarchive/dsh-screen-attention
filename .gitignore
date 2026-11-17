@@ -12,6 +12,10 @@ out/*.png
 out/*.json
 out/full-suite-screenshot.jpg
 
+# 后台浏览器隔离 profile（运行期状态，含登录态，绝不入库）
+out/web-iso/
+out/web-iso-edge/
+
 # Runtime logs and dynamic view captures (keep pinned test fixtures)
 out/logs/
 out/sa-view/*

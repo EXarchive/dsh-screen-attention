@@ -1,5 +1,48 @@
 # Changelog (dsh-screen-attention)
 
+## v1.23.0 (2026-11-18) — saperm_web 改常驻后台浏览器 + saperm_cookies 只读复用登录态
+
+### 用户指令
+> 改造浏览器相关的工具，`saperm_web` 不要使用本地浏览器相关，使用后台静默浏览器，并研究只读本地 cookie
+
+### 改了什么
+
+**`saperm_web`：CLI `--screenshot` → 常驻 headless + CDP over pipe**
+
+旧实现每次 `spawn(msedge --headless=new --screenshot=...)`：冷启 ~1s、只能抓视口、拿不到 DOM 文本、不能注入 cookie、不能续登录态。
+新实现在 `permission-plugin/lib/browser.mjs`：
+
+| 项 | 旧 | 新（实测） |
+|---|---|---|
+| 进程模型 | 每次调用新起一个 | 常驻单例，复用 |
+| 传输 | 无（一次性 CLI） | `--remote-debugging-pipe`（NUL 分隔 JSON，走 fd 3/4），**不监听任何 TCP** |
+| 冷启 / 二次 | ~1000ms / ~1000ms | **307ms / 308ms** |
+| 输出 | 只有 PNG（视口） | PNG（视口或整页 ≤12000px）+ 页面文本 + `js` 表达式结果 |
+| 等待 | 固定 `--virtual-time-budget` | 先轮询 `readyState=complete`，再补 waitMs |
+| UA | 含 `Headless` 字样 | 剥离 `Headless`（减少反爬误判） |
+
+新增参数：`fullPage` / `text` / `screenshot` / `maxText` / `js`。回滚：把 `saperm_web.execute` 换回旧的 spawn 分支即可。
+
+**`saperm_cookies`：只读复用本地登录态**
+
+`action=scan` 统计各 Chromium profile 的 cookie 库（行数 / v10 / v20 / 主要域）；
+`action=import` 解密后经 CDP `Storage.setCookies` 注入**插件自己的隔离 profile**；另有 `list` / `clear` / `close`。
+DPAPI 侧新增 helper 命令 `crypto_dpapi`（`helper/Dpapi.cs`，P/Invoke `CryptUnprotectData`，批量）。
+
+### 研究结论（都是实测，不是推测）
+
+1. **v10 可解**：Chrome profile 73/73 全部解出。链路 = `Local State.os_crypt.encrypted_key` → 剥 `DPAPI` 前缀 → 当前用户 DPAPI → 32 字节 AES 密钥 → `AES-256-GCM(iv|ct|tag)`。
+2. **v20 用户态无解**：Edge 157 的 1073 条全是 v20。密钥被 SYSTEM DPAPI + `elevation_service.exe` 内置密钥双重锁住，且 COM `IElevator::DecryptData` 校验调用方路径（非浏览器路径 → 事件 257、不返回数据）。
+3. **「复制 profile 让浏览器自己解」也不行**：复制 `Local State` + `Network/Cookies` 到隔离目录后无头启动，访问 bilibili 仍然显示「登录」；运行后 DB 行数 **1073 → 0**，浏览器把解不开的行直接删掉了。
+4. **Chrome 130+ 的域绑定**：v10 明文前 32 字节是 `SHA256(host_key)`，不剥会得到"解密成功但全是乱码"（这条一度让我误判成二进制 cookie）。
+
+→ v20 的唯一可行路径：在该隔离 profile 里由用户登录一次，之后长期复用。
+
+### 回归
+
+`node tests/run-all.mjs` 新增三套：`browser-bg`（17 项）、`cookies-readonly`（11 项）、`web-tools`（16 项）。
+`browser-bg` 用本地回环服务器验证注入的 cookie **真的随请求发出**（`Cookie: sa_e2e=yes`），不是只看内存计数。
+
 ## v1.22.1 (2026-11-13) — OCR 召回修复（det 限幅 320 → 自适应 736/512）
 
 ### 起因：文件识别只认出 3 条
