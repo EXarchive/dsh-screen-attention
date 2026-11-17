@@ -7,7 +7,7 @@ import { spawn, execFile, execFileSync } from 'node:child_process'
 import { existsSync, writeFileSync, mkdirSync, readdirSync, readFileSync, unlinkSync, appendFileSync, statSync } from 'node:fs'
 import { join, dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { openPage, runInPage, browserStatus, closeBrowser, ensureBrowser, setCookies, listCookies, clearCookies } from './browser.mjs'
+import { openPage, browserStatus, closeBrowser, ensureBrowser, setCookies, listCookies, clearCookies } from './browser.mjs'
 import { chromiumProfiles, scanProfile, readCookies, toCdpCookies } from './cookies.mjs'
 
 export const name = 'dsh-screen-attention-perm'
@@ -1344,7 +1344,6 @@ export function apply(ctx) {
         fullPage: { type: 'boolean', description: 'true = 整页截图（长页面不被截断，上限 12000px）' },
         text: { type: 'boolean', description: '是否取页面文本（默认 true）' },
         screenshot: { type: 'boolean', description: '是否截图（默认 true）' },
-        quality: { type: 'string', description: '输出清晰度 low/standard/high/ultra（影响截图后的缩放上限）' },
         maxText: { type: 'integer', description: '文本最多返回多少字符（默认 4000）' },
         js: { type: 'string', description: '可选：页面加载后在这页里执行的 JS 表达式（同源内，返回值一并返回）' },
       },
@@ -1363,17 +1362,15 @@ export function apply(ctx) {
         screenshot: args.screenshot !== false,
         outDir: VIEW_DIR,
         maxText: clampInt(args.maxText, 4000, 200, 20000),
+        js: args.js ? String(args.js) : null,
       })
-      if (!r.ok) return { ok: false, error: r.error || '后台渲染失败' }
+      if (!r.ok) return { ok: false, error: r.error || '后台渲染失败', navError: r.navError }
       const out = {
         ok: true, url: r.url, title: r.title, path: r.path, bytes: r.bytes,
-        viewport: r.viewport, readyState: r.readyState, text: r.text,
+        viewport: r.viewport, readyState: r.readyState, text: r.text, textError: r.textError,
+        screenshotError: r.screenshotError, js: r.js,
         bootMs: r.bootMs, reused: r.reused, product: r.product,
         hint: '常驻无头浏览器渲染：没有窗口出现、不抢焦点。截图用 read_image / saperm_view 看',
-      }
-      if (args.js) {
-        const j = await runInPage({ url, expression: String(args.js), w, h, waitMs: wait })
-        out.js = j.ok ? j.value : { error: j.error }
       }
       if (r.path) out.tokens = imageTokens(w, h)
       return out

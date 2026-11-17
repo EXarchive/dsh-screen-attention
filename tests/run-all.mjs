@@ -14,6 +14,7 @@ const SUITE = [
   ['narrate-budget', '短窗口讲解（首轮不计入预算）'],
   ['vision-probe', 'saperm_vision 识图（零副作用）'],
   ['browser-bg', '后台无头浏览器（复用 / 文本 / 截图 / cookie 端到端）'],
+  ['browser-hardening', '并发冷启 / 在飞关停 / 失败路径 / 标签页泄漏 / 隔离目录护栏'],
   ['cookies-readonly', '本地 cookie 只读：v10 解密注入 / v20 标记受阻'],
   ['web-tools', '工具级 saperm_web + saperm_cookies'],
 ]

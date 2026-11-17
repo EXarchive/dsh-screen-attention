@@ -8,7 +8,7 @@
 //
 // 因此：v10 走"只读解密 + 注入后台浏览器"；v20 只能在该隔离 profile 里由用户登录一次。
 import { DatabaseSync } from 'node:sqlite'
-import { existsSync, readFileSync, readdirSync, copyFileSync, mkdtempSync, statSync } from 'node:fs'
+import { existsSync, readFileSync, readdirSync, copyFileSync, mkdtempSync, statSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { createDecipheriv, createHash } from 'node:crypto'
@@ -45,16 +45,23 @@ export function chromiumProfiles() {
 }
 
 // 正在运行的浏览器会独占锁 DB；先试只读打开，失败再复制一份到临时目录开副本。
+// copy 分支必须在用完后把临时目录删掉 —— 那是一份完整的加密 cookie 库，别留在 %TEMP%。
 function openCookies(dbPath) {
   try {
     return { db: new DatabaseSync(dbPath, { readOnly: true }), mode: 'readonly', cleanup: () => {} }
   } catch (e1) {
+    let dir = null
     try {
-      const dir = mkdtempSync(join(tmpdir(), 'sa-cookie-'))
+      dir = mkdtempSync(join(tmpdir(), 'sa-cookie-'))
       const dst = join(dir, 'Cookies')
       copyFileSync(dbPath, dst)
-      return { db: new DatabaseSync(dst, { readOnly: true }), mode: 'copy', cleanup: () => {} }
+      const db = new DatabaseSync(dst, { readOnly: true })
+      return {
+        db, mode: 'copy',
+        cleanup: () => { try { db.close() } catch {}; try { rmSync(dir, { recursive: true, force: true }) } catch {} },
+      }
     } catch (e2) {
+      if (dir) { try { rmSync(dir, { recursive: true, force: true }) } catch {} }
       return { error: '打不开 cookie 库: ' + (e1.message || e1) + ' / ' + (e2.message || e2) }
     }
   }
@@ -84,11 +91,11 @@ export function scanProfile(profile) {
       browser: profile.browser, profile: profile.profile, dbPath: profile.dbPath,
       bytes: profile.size, rows: rows.length, versions,
       topHosts: [...hosts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 10).map(([h, n]) => ({ host: h, n })),
-      readable: versions.v10 > 0, blocked: versions.v20,
+      readable: versions.v10 + versions.raw > 0, blocked: versions.v20,
     }
   } catch (e) {
     return { browser: profile.browser, profile: profile.profile, dbPath: profile.dbPath, error: e.message || String(e) }
-  } finally { try { o.db.close() } catch {} }
+  } finally { try { o.cleanup() } catch {} }
 }
 
 async function dpapiKeyFromLocalState(localStatePath, dpapi) {
@@ -155,7 +162,8 @@ export async function readCookies(profile, { dpapi, hostFilter = null, limit = 0
       CAST(expires_utc AS TEXT) AS exp, is_secure, is_httponly, samesite, has_expires
       FROM cookies`).all()
     const cookies = []
-    const stats = { total: rows.length, decrypted: 0, blockedV20: 0, failed: 0, plain: 0, filtered: 0 }
+    const stats = { total: rows.length, decrypted: 0, blockedV20: 0, failed: 0, plain: 0, filtered: 0, expired: 0 }
+    const nowSec = Math.floor(Date.now() / 1000)
     for (const r of rows) {
       if (hostFilter && !String(r.host_key).includes(hostFilter)) { stats.filtered++; continue }
       const enc = Buffer.from(r.encrypted_value || [])
@@ -170,16 +178,21 @@ export async function readCookies(profile, { dpapi, hostFilter = null, limit = 0
           stats.decrypted++
         } catch { stats.failed++; continue }
       } else if (ver === 'raw') {
-        try {
-          const p = await dpapi(enc.toString('base64'))
-          if (p) {
-            val = stripHostDigest(Buffer.from(p, 'base64'), r.host_key).toString('utf8')
-            stats.decrypted++
-          } else { stats.failed++; continue }
-        } catch { stats.failed++; continue }
+        let p = null
+        try { p = await dpapi(enc.toString('base64')) } catch (e) {
+          // 吞掉就会被误读成"坏数据"；helper 掉线要能在诊断里看出来
+          stats.failed++
+          stats.lastDpapiError = String((e && e.message) || e)
+          continue
+        }
+        if (!p) { stats.failed++; continue }
+        val = stripHostDigest(Buffer.from(p, 'base64'), r.host_key).toString('utf8')
+        stats.decrypted++
       } else { stats.failed++; continue }
 
       const expires = expiresToUnixSec(r.exp, Number(r.has_expires) === 1)
+      // 过期 cookie 不注入：同域同名会把隔离 profile 里还有效的会话 cookie 覆盖掉
+      if (expires && expires < nowSec) { stats.expired++; continue }
       const cookie = {
         name: String(r.name), value: val, domain: String(r.host_key), path: String(r.path || '/'),
         secure: Number(r.is_secure) === 1, httpOnly: Number(r.is_httponly) === 1,
@@ -192,7 +205,7 @@ export async function readCookies(profile, { dpapi, hostFilter = null, limit = 0
     return { ok: true, cookies, stats, keyLen: k.key.length }
   } catch (e) {
     return { ok: false, error: '读表失败: ' + (e.message || e) }
-  } finally { try { o.db.close() } catch {} }
+  } finally { try { o.cleanup() } catch {} }
 }
 
 /** 转成 CDP Storage.setCookies 需要的形状（去掉 undefined 字段，URL 由域推导） */

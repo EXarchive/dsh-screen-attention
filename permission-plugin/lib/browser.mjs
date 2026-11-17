@@ -9,8 +9,8 @@
 //   - 端口会撞（控制口占用 / 策略拦截），pipe 不会。
 //
 // 铁律：user-data-dir 永远是插件自己的隔离目录，绝不指向用户真实 profile。
-import { spawn } from 'node:child_process'
-import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
+import { spawn, execFileSync } from 'node:child_process'
+import { existsSync, mkdirSync, writeFileSync, unlinkSync } from 'node:fs'
 import { join } from 'node:path'
 
 const CANDIDATES = [
@@ -29,14 +29,39 @@ export function findBrowserExe() {
 // 跨模块实例共享：热加载会造新实例，但子进程和它的管道 reader 属于旧实例。
 const S = globalThis.__saPermBrowser || (globalThis.__saPermBrowser = {
   child: null, toChild: null, fromChild: null, seq: 0, pending: new Map(), buf: '',
-  bootMs: 0, product: '', ua: '', isoDir: '', exe: '', lastError: '',
+  bootMs: 0, product: '', ua: '', isoDir: '', exe: '', lastError: '', booting: null,
 })
+
+const REAL_PROFILE_HINTS = ['\\user data', '/user data', '\\appdata\\local\\microsoft\\edge', '\\appdata\\local\\google\\chrome']
+
+/**
+ * 隔离 profile 目录护栏：这个目录会被 --headless 打开，指到用户真实 profile 上等于
+ * 用无头实例去动真实 cookie 库 —— 实测那样会把解不开的 v20 行直接删光（1073→0）。
+ */
+function assertSafeIsoDir(dir) {
+  const lower = String(dir || '').toLowerCase().replace(/\//g, '\\')
+  for (const hint of REAL_PROFILE_HINTS) {
+    if (lower.includes(hint.replace(/\//g, '\\'))) {
+      throw new Error('拒绝把后台浏览器指向真实浏览器 profile：' + dir + '（SA_WEB_ISO 请指到插件自己的目录）')
+    }
+  }
+  return dir
+}
 
 function pickIsoDir(isoDir) {
   if (isoDir) return isoDir
   if (process.env.SA_WEB_ISO) return process.env.SA_WEB_ISO
   if (S.isoDir) return S.isoDir
   return join(process.env.TEMP || '.', 'sa-web-iso')
+}
+
+/** 把所有在飞请求落地：只 clear 不 settle 会让调用方永久挂住（实测 HUNG>12s）。 */
+function failAllPending(reason) {
+  for (const [, p] of S.pending) {
+    try { clearTimeout(p.timer) } catch {}
+    try { p.res({ error: { message: reason } }) } catch {}
+  }
+  S.pending.clear()
 }
 
 function attachReader(fromChild) {
@@ -78,19 +103,30 @@ function send(method, params = {}, sessionId, timeoutMs = 20000) {
   })
 }
 
-/** 起（或复用）常驻后台浏览器。返回 { ok, product, bootMs, reused, isoDir } */
-export async function ensureBrowser({ isoDir, exe } = {}) {
+/**
+ * 起（或复用）常驻后台浏览器。返回 { ok, product, bootMs, reused, isoDir }
+ * 冷启动必须串行：两个调用同时进来会各自 spawn，后者覆盖 S.child 并清掉前者的握手请求，
+ * 实测结果两边全失败且拖到 21.9s。用单个在飞 promise 收口。
+ */
+export async function ensureBrowser(opts = {}) {
   if (S.child && !S.child.killed && S.fromChild) {
     return { ok: true, product: S.product, ua: S.ua, bootMs: S.bootMs, reused: true, isoDir: S.isoDir }
   }
+  if (S.booting) return S.booting
+  S.booting = doBoot(opts).finally(() => { S.booting = null })
+  return S.booting
+}
+
+async function doBoot({ isoDir, exe, bootRetried = false } = {}) {
   const bin = exe || findBrowserExe()
   if (!bin) return { ok: false, error: '没找到 Edge/Chrome（可用 SA_BROWSER_EXE 指定路径）' }
-  const iso = pickIsoDir(isoDir)
+  let iso
+  try { iso = assertSafeIsoDir(pickIsoDir(isoDir)) } catch (e) { return { ok: false, error: String(e.message || e) } }
   try { mkdirSync(iso, { recursive: true }) } catch {}
   S.isoDir = iso
   S.exe = bin
   S.buf = ''
-  S.pending.clear()
+  failAllPending('浏览器重启中，先前请求已失效')
 
   const t0 = Date.now()
   let child
@@ -112,18 +148,20 @@ export async function ensureBrowser({ isoDir, exe } = {}) {
   }
 
   S.child = child
+  S.childPid = child.pid || 0
   S.toChild = child.stdio[3]
   attachReader(child.stdio[4])
   child.on('exit', () => {
     S.child = null; S.toChild = null; S.fromChild = null; S.product = ''
-    for (const [, p] of S.pending) { clearTimeout(p.timer); p.res({ error: { message: '浏览器已退出' } }) }
-    S.pending.clear()
+    failAllPending('浏览器已退出')
   })
   child.on('error', (e) => { S.lastError = String(e.message || e) })
 
   // 等握手：不停重试 Browser.getVersion，直到管道就绪
   let lastErr = null
   for (let i = 0; i < 40; i++) {
+    // 子进程一退出就立刻收手：不检查这一条会白等满 10s 才进重试（实测冷启并发 12.1s 就是这么来的）
+    if (S.child !== child) { lastErr = '浏览器启动后立刻退出'; break }
     try {
       const r = await send('Browser.getVersion', {}, undefined, 4000)
       if (r && r.result) {
@@ -136,8 +174,17 @@ export async function ensureBrowser({ isoDir, exe } = {}) {
     } catch (e) { lastErr = String(e.message || e) }
     await new Promise((r) => setTimeout(r, 250))
   }
-  try { child.kill() } catch {}
-  S.child = null
+  // 握手失败十有八九是上一代的子进程还攥着 profile 锁：杀掉整棵树再试一次
+  try {
+    if (child.pid) execFileSync('taskkill', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true, timeout: 10000, stdio: 'ignore' })
+  } catch {}
+  S.child = null; S.toChild = null; S.fromChild = null
+  if (!bootRetried) {
+    clearStaleProfileLock(iso)
+    await new Promise((r) => setTimeout(r, 700))
+    // 直接走 doBoot：再进 ensureBrowser 会撞上自己这个在飞 promise 而自锁
+    return doBoot({ isoDir: iso, exe: bin, bootRetried: true })
+  }
   return { ok: false, error: '后台浏览器起不来：' + (lastErr || '超时') }
 }
 
@@ -146,23 +193,64 @@ export function browserStatus() {
   return { running, product: S.product, bootMs: S.bootMs, isoDir: S.isoDir, exe: S.exe, lastError: S.lastError }
 }
 
+/**
+ * 关掉常驻浏览器。必须 /T 杀进程树：Edge 根进程下面还有 renderer/GPU/utility 一堆子进程，
+ * 只 kill 根进程会把 profile 的 SingletonLock 留给下一次启动 —— 实测重启握手直接超时。
+ */
 export function closeBrowser() {
   const c = S.child
-  S.child = null; S.toChild = null; S.fromChild = null; S.product = ''; S.pending.clear()
-  try { if (c && !c.killed) c.kill() } catch {}
-  return { closed: !!c }
+  S.child = null; S.toChild = null; S.fromChild = null; S.product = ''
+  // 在飞请求必须落地（resolve 带 error），否则调用方永远等下去
+  failAllPending('浏览器已关闭')
+  if (!c) return { closed: false }
+  try {
+    if (c.pid) execFileSync('taskkill', ['/PID', String(c.pid), '/T', '/F'], { windowsHide: true, timeout: 10000, stdio: 'ignore' })
+  } catch {}
+  try { if (!c.killed) c.kill() } catch {}
+  // 根进程要真死透：否则下一次 spawn 会被 profile 锁挡回来（实测表现为握手成功后立刻退出）。
+  // closeBrowser 必须保持同步（dispose / killAllRuntime 路径都是同步调用），所以用 Atomics.wait 睡。
+  if (c.pid) {
+    const deadline = Date.now() + 2500
+    while (Date.now() < deadline) {
+      let alive = false
+      try { process.kill(c.pid, 0); alive = true } catch {}
+      if (!alive) break
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 60)
+    }
+  }
+  clearStaleProfileLock(S.isoDir)
+  return { closed: true }
 }
 
-async function withPage(fn, { w = 1400, h = 900, url = 'about:blank', timeoutMs = 30000 } = {}) {
+/**
+ * 清掉上一代留下的 profile 锁。Chromium 的 SingletonLock 在进程被杀后不会自己消失，
+ * 下一个实例看到它就以为"已有实例在跑"，自己退出 —— 实测表现为新建标签页时报"浏览器已退出"。
+ * 只在确认根进程确实不存在时才删，避免误伤真在跑的实例。
+ */
+function clearStaleProfileLock(iso) {
+  if (!iso) return false
+  const pid = S.childPid
+  S.childPid = 0
+  if (pid) {
+    try { process.kill(pid, 0); return false } catch {}
+  }
+  let removed = false
+  for (const f of ['SingletonLock', 'SingletonCookie', 'SingletonSocket']) {
+    try { if (existsSync(join(iso, f))) { unlinkSync(join(iso, f)); removed = true } } catch {}
+  }
+  return removed
+}
+
+async function withPageOnce(fn, { w = 1400, h = 900, url = 'about:blank', timeoutMs = 30000 } = {}) {
   const boot = await ensureBrowser({})
   if (!boot.ok) return { ok: false, error: boot.error }
   let targetId = null
   try {
     const t = await send('Target.createTarget', { url: 'about:blank' }, undefined, 10000)
-    if (!t.result) return { ok: false, error: '建标签页失败: ' + JSON.stringify(t.error || {}) }
+    if (!t.result) return { ok: false, error: '建标签页失败: ' + JSON.stringify(t.error || {}), browserGone: !S.child }
     targetId = t.result.targetId
     const at = await send('Target.attachToTarget', { targetId, flatten: true }, undefined, 10000)
-    if (!at.result) return { ok: false, error: '挂载标签页失败: ' + JSON.stringify(at.error || {}) }
+    if (!at.result) return { ok: false, error: '挂载标签页失败: ' + JSON.stringify(at.error || {}), browserGone: !S.child }
     const ss = at.result.sessionId
     await send('Page.enable', {}, ss)
     await send('Runtime.enable', {}, ss)
@@ -171,15 +259,32 @@ async function withPage(fn, { w = 1400, h = 900, url = 'about:blank', timeoutMs 
     try { await send('Emulation.setDeviceMetricsOverride', { width: w, height: h, deviceScaleFactor: 1, mobile: false }, ss) } catch {}
     if (url && url !== 'about:blank') {
       const nav = await send('Page.navigate', { url }, ss, timeoutMs)
-      if (nav.error) return { ok: false, error: '导航失败: ' + (nav.error.message || '') }
+      if (nav.error) return { ok: false, error: '导航失败: ' + (nav.error.message || ''), browserGone: !S.child }
+      // 连不上/被拦截时 CDP 不报协议错，而是把 errorText 放进 result（页面变成错误页）。
+      // 不取这个字段，调用方会把"DNS 挂了"当成"页面看完了"（实测 127.0.0.1:9 返回 ok=true）。
+      if (nav.result && nav.result.errorText) return { ok: false, error: '导航失败: ' + nav.result.errorText, navError: true, url }
     }
     const out = await fn(ss, boot)
     return { ...out, bootMs: boot.bootMs, reused: boot.reused }
   } catch (e) {
-    return { ok: false, error: String(e.message || e) }
+    return { ok: false, error: String(e.message || e), browserGone: !S.child }
   } finally {
     if (targetId) { try { await send('Target.closeTarget', { targetId }, undefined, 5000) } catch {} }
   }
+}
+
+/**
+ * 带一次自愈重试：上一代浏览器刚被杀、新实例又被 profile 锁挡下时，
+ * 会出现"握手成功但立刻退出"，此时 createTarget 拿到「浏览器已退出」。
+ * 这不是页面问题，重起一次就好，不该把错误抛给调用方。
+ */
+async function withPage(fn, opts = {}) {
+  const first = await withPageOnce(fn, opts)
+  if (first.ok || !first.browserGone) return first
+  closeBrowser()
+  await new Promise((r) => setTimeout(r, 500))
+  const second = await withPageOnce(fn, opts)
+  return second.ok ? { ...second, retried: true } : second
 }
 
 async function evalJs(sessionId, expression, timeoutMs = 15000) {
@@ -194,7 +299,7 @@ async function evalJs(sessionId, expression, timeoutMs = 15000) {
  * 打开网页：后台渲染 → 取标题/文本 → 截图（视口或整页）。
  * waitMs 是给 SPA 的额外等待；readyState 先到 complete 再等网络静默，能省下大半等待时间。
  */
-export async function openPage({ url, w = 1400, h = 900, waitMs = 2000, fullPage = false, text = true, screenshot = true, outDir, maxText = 4000 }) {
+export async function openPage({ url, w = 1400, h = 900, waitMs = 2000, fullPage = false, text = true, screenshot = true, outDir, maxText = 4000, js = null }) {
   return withPage(async (ss, boot) => {
     // 等 readyState：轮询比"死等固定毫秒"快，长页面也不用盲猜
     const deadline = Date.now() + Math.max(1000, waitMs)
@@ -211,9 +316,11 @@ export async function openPage({ url, w = 1400, h = 900, waitMs = 2000, fullPage
     try { meta = JSON.parse(info.value || '{}') } catch {}
 
     let bodyText = null
+    let textError = null
     if (text) {
       const t = await evalJs(ss, `(() => { const b = document.body; if (!b) return ''; return b.innerText.replace(/\\n{3,}/g, '\\n\\n').slice(0, ${Math.max(200, Math.min(20000, maxText))}) })()`)
-      bodyText = (t.value || '').toString()
+      if (t.error) textError = t.error
+      else bodyText = (t.value || '').toString()
     }
 
     const out = {
@@ -221,6 +328,7 @@ export async function openPage({ url, w = 1400, h = 900, waitMs = 2000, fullPage
       readyState: meta.ready || '', ready,
       viewport: { w, h }, product: boot.product, text: bodyText,
     }
+    if (textError) { out.text = null; out.textError = textError }
     if (screenshot) {
       const params = { format: 'png' }
       if (fullPage) {
@@ -242,6 +350,11 @@ export async function openPage({ url, w = 1400, h = 900, waitMs = 2000, fullPage
       } else {
         out.screenshotError = JSON.stringify(shot.error || {})
       }
+    }
+    // js 必须在**同一个页面会话**里跑：另起一页等于重新导航一次，返回值与截图不同源
+    if (js) {
+      const j = await evalJs(ss, String(js), 20000)
+      out.js = j.error ? { error: j.error } : j.value
     }
     return out
   }, { w, h, url, timeoutMs: Math.max(15000, waitMs + 12000) })
@@ -273,6 +386,7 @@ export async function setCookies(cookies) {
     else set++
   }
   const g = await send('Storage.getCookies', {}, undefined, 15000)
+  if (g.error) return { ok: false, error: '读取 cookie 失败: ' + g.error.message, set, rejected: rejected.slice(0, 8), rejectedCount: rejected.length }
   return { ok: set > 0 || cookies.length === 0, set, rejected: rejected.slice(0, 8), rejectedCount: rejected.length, total: ((g.result && g.result.cookies) || []).length }
 }
 
@@ -280,6 +394,8 @@ export async function listCookies(filterHost) {
   const boot = await ensureBrowser({})
   if (!boot.ok) return { ok: false, error: boot.error }
   const g = await send('Storage.getCookies', {}, undefined, 15000)
+  // 浏览器已死时 send 会以 {error} 回来；不判这个字段就会把"故障"报成"0 条 cookie"
+  if (g.error) return { ok: false, error: '读取 cookie 失败: ' + g.error.message }
   let list = (g.result && g.result.cookies) || []
   if (filterHost) list = list.filter((c) => String(c.domain || '').includes(filterHost))
   return {
