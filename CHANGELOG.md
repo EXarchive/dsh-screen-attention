@@ -1,5 +1,24 @@
 # Changelog (dsh-screen-attention)
 
+## v1.23.1 (2026-11-18) — 独立复核后的硬化（两个 blocker / 一个 high / 三个 medium）
+
+复核用独立 subagent 审 v1.23.0，逐条给复现证据，按严重度修：
+
+| 级别 | 缺陷 | 复现 | 修法 |
+|---|---|---|---|
+| blocker | 冷启动并发互踩：两个 `openPage` 同时进来各 spawn 一次，后者覆盖 `S.child` 并清掉前者的握手请求 | 两边全失败、21.9s | `S.booting` 单例 promise 收口；重试走 `doBoot` 避免自锁；握手循环发现子进程已退出立刻收手 → **12175ms → 2108ms** |
+| blocker | 在飞请求永不落地：`closeBrowser` 只 `pending.clear()`，不清 timer 也不 settle，而超时回调要求 `pending.has(id)` 已为 false | HUNG>12s | `failAllPending(reason)` 统一 `clearTimeout` + `resolve({error})` |
+| high | `SA_WEB_ISO` 零校验，可指到真实 `Edge\User Data`，等于用无头实例动真实 cookie 库（实测会删光 1073 条 v20） | 代码路径 | `assertSafeIsoDir` 命中 User Data / 浏览器目录直接拒绝 |
+| medium | `openCookies` 的 copy 回落 `mkdtempSync` 目录永不删（`cleanup` 空壳） | `grep .cleanup` 仅定义处 | 真删临时目录 |
+| medium | `js` 参数另起一页重新导航，返回值与截图不同源 | 代码路径 | 改在同一 page session 内执行 |
+| medium | `quality` 参数声明未实现却写进描述 | 全文无使用点 | 移除 |
+
+low 一并修：`listCookies`/`setCookies` 把 `{error}` 当成功（浏览器已死时报"0 条"）；`openPage` 读文本失败仍 `ok:true`（补 `textError`）；过期 cookie 不再注入（避免覆盖隔离 profile 里仍有效的同名会话）；`raw` 支把 helper 掉线吞成 `failed`（补 `lastDpapiError`）；`scanProfile.readable` 不计 raw。
+
+新增 `tests/browser-hardening.mjs`（16 项）并并入 `run-all`：
+并发冷启 / close 时在飞落地 / 标签页数不增长 / `ERR_CONNECTION_REFUSED` 快失败（3059ms）/ 关闭后自愈 / 隔离目录护栏。
+四套浏览器与 cookie 回归连跑两次全绿：browser-bg 17、browser-hardening 16、cookies-readonly 11、web-tools 16。
+
 ## v1.23.0 (2026-11-18) — saperm_web 改常驻后台浏览器 + saperm_cookies 只读复用登录态
 
 ### 用户指令
