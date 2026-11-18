@@ -131,6 +131,11 @@ async function doBoot({ isoDir, exe, bootRetried = false } = {}) {
 
   const t0 = Date.now()
   let child
+  const extraArgs = []
+  // 可选代理（内置 mihomo 7891）：境外站点直连会 ERR_HTTP2_PROTOCOL_ERROR / 超时
+  if (process.env.SA_WEB_PROXY) extraArgs.push('--proxy-server=' + process.env.SA_WEB_PROXY)
+  // 逃生口：某些站经代理会 ERR_HTTP2_PROTOCOL_ERROR，可用 SA_WEB_ARGS="--disable-http2" 绕
+  if (process.env.SA_WEB_ARGS) extraArgs.push(...String(process.env.SA_WEB_ARGS).split(/\s+/).filter(Boolean))
   try {
     child = spawn(bin, [
       '--headless=new',
@@ -140,6 +145,7 @@ async function doBoot({ isoDir, exe, bootRetried = false } = {}) {
       '--no-default-browser-check',
       '--disable-features=Translate,MediaRouter',
       '--mute-audio',
+      ...extraArgs,
       '--user-data-dir=' + iso,   // 隔离 profile（铁律：绝不指向真实浏览器 profile）
       '--remote-debugging-pipe',  // CDP over stdio，不监听端口
       'about:blank',
