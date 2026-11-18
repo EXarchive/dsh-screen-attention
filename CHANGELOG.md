@@ -1,5 +1,43 @@
 # Changelog (dsh-screen-attention)
 
+## v1.23.2 (2026-11-18) — 活体验收揪出的两个真缺陷（浏览器运行时锁库 / scan 说假话）
+
+上一轮的 62 项回归全绿，但那些是 mock ctx + 独立 profile 跑的。直接调活体实例（DSH 12:53 重启后已在跑 v1.23.1）立刻暴露两条：
+
+### 1. Edge 在跑时 cookie 库彻底读不到（真缺陷）
+
+```
+saperm_cookies scan →
+  edge/Default: 打不开 cookie 库: unable to open database file
+                / EBUSY: resource busy or locked, copyfile '...\Cookies' -> '%TEMP%\sa-cookie-XXX\Cookies'
+```
+
+浏览器运行时会独占锁 DB：`readOnly` 打开报 `SQLITE_CANTOPEN`，`copyFileSync` 报 EBUSY，连 `file:...?mode=ro&immutable=1` 也打不开（都实测过）。
+修法：三级回落 **只读 → 直接复制 → 卷影快照（VSS）**，实测 VSS 能稳定拿到 1075 行（耗时 ~3.0s，仅回落路径）。
+
+### 2. `scan` 在失败时说假话
+
+Edge 读失败 → 它的 1073 条 v20 不计入统计 → `totalBlocked:0` → note 输出「本机没有遇到 v20 cookie」。
+把失败当成结论，正是本项目最忌讳的假阳性。修法：
+- `ok` 改为「至少一个 profile 读到」，另给 `complete` / `profilesErrored`；
+- note 只在**没有任何 profile 读失败**时才说"没有 v20"，否则明说有 N 个没读到；
+- 错误路径补 `hint`（关浏览器再扫 / 以管理员身份运行），字段统一 `bytes`（原来错误分支给 `size`）。
+
+### 事故与修正（必须记下来）
+
+VSS 快照清理最初写成 `vssadmin delete shadows /shadow=$id /quiet`（无引号插值）。
+实测它退化成"删掉全部影子卷"，把我机器上一个 **2026-11-17 的系统还原点**一起删了（`vssadmin list shadowstorage` 归零可证）。
+修正为三条护栏：`$id` 必须匹配 `^\{[0-9A-Fa-f-]{36}\}$` + `/shadow="$id"` 带引号 + 只针对本 id；
+另加 `copied=` 输出校验，复制没产出就报错而不是静默返回空库。修完实测：扫描前后影子卷数不变（0→0）。
+
+### 测试隔离
+
+四条浏览器回归原来共用 `out/web-iso`，而活着的 DSH 常驻实例正占着它 → 测试里起第二个实例被 SingletonLock 挡回（`浏览器启动后立刻退出`）。
+改为测试自带 `SA_WEB_ISO=%TEMP%\sa-web-iso-test`。
+`cookies-readonly` 补两条判据：**每个 profile 都必须读到（含被浏览器锁住的）**、**扫描不留影子卷**。
+
+最终：browser-bg 17 / browser-hardening 16 / cookies-readonly 13 / web-tools 16 = 62 项全通过，残留影子卷 0、测试浏览器进程 0。
+
 ## v1.23.1 (2026-11-18) — 独立复核后的硬化（两个 blocker / 一个 high / 三个 medium）
 
 复核用独立 subagent 审 v1.23.0，逐条给复现证据，按严重度修：

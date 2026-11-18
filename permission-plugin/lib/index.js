@@ -1401,13 +1401,22 @@ export function apply(ctx) {
 
       if (action === 'scan') {
         const rows = chromiumProfiles().map((p) => scanProfile(p))
+        const okRows = rows.filter((r) => !r.error)
+        const errRows = rows.filter((r) => r.error)
         const totalBlocked = rows.reduce((a, r) => a + ((r.versions && r.versions.v20) || 0), 0)
-        const totalReadable = rows.reduce((a, r) => a + ((r.versions && r.versions.v10) || 0), 0)
+        const totalReadable = rows.reduce((a, r) => a + (((r.versions && r.versions.v10) || 0) + ((r.versions && r.versions.raw) || 0)), 0)
+        const notes = []
+        if (totalBlocked) notes.push('v20 是 App-Bound 加密（密钥在 SYSTEM + elevation_service 里，用户态解不开）；这些 cookie 用不了，只能在该隔离 profile 里由你登录一次')
+        // 有 profile 读失败时不能说"本机没有 v20" —— 那是把失败当结论（实测踩过）
+        if (errRows.length) notes.push(`${errRows.length} 个 profile 读失败（浏览器在跑且卷影复制失败），它们的 cookie 未计入统计`)
+        if (!totalBlocked && !errRows.length) notes.push('本机没有遇到 v20 cookie')
         return {
-          ok: true, profiles: rows, totalReadable, totalBlocked,
-          note: totalBlocked
-            ? 'v20 是 App-Bound 加密（密钥在 SYSTEM + elevation_service 里，用户态解不开）；这些 cookie 用不了，只能在该隔离 profile 里由你登录一次'
-            : '本机没有遇到 v20 cookie',
+          // 部分成功也算成功；完整性单独用 complete 表达，避免"一个 profile 读失败就整单报错"，
+          // 也避免把失败当结论（note 里会点明有几个没读到）
+          ok: okRows.length > 0, complete: errRows.length === 0,
+          profiles: rows, totalReadable, totalBlocked,
+          profilesOk: okRows.length, profilesErrored: errRows.length,
+          note: notes.join('；') || undefined,
         }
       }
 

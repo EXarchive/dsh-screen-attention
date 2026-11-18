@@ -1,6 +1,9 @@
 // 工具级回归：走真实注册表调用 saperm_web / saperm_cookies（mock ctx + 真 helper + 真无头浏览器）
 import { existsSync } from 'node:fs'
 
+// 独立隔离 profile：活着的 DSH 常驻实例占着 out/web-iso
+process.env.SA_WEB_ISO = (process.env.TEMP || '.') + '\\sa-web-iso-test'
+
 const mod = await import('file:///C:/Users/Administrator/PycharmProjects/dsh-screen-attention/permission-plugin/lib/index.js')
 const tools = new Map()
 const ctx = {

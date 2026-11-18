@@ -12,6 +12,7 @@ import { existsSync, readFileSync, readdirSync, copyFileSync, mkdtempSync, statS
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { createDecipheriv, createHash } from 'node:crypto'
+import { execFileSync } from 'node:child_process'
 
 const EPOCH_DELTA_SEC = 11644473600n  // 1601-01-01 → 1970-01-01
 
@@ -44,25 +45,70 @@ export function chromiumProfiles() {
   return out
 }
 
-// 正在运行的浏览器会独占锁 DB；先试只读打开，失败再复制一份到临时目录开副本。
-// copy 分支必须在用完后把临时目录删掉 —— 那是一份完整的加密 cookie 库，别留在 %TEMP%。
+/**
+ * 从卷影快照里复制一份 DB。Edge 正在运行时它会独占锁住 Cookies 库：
+ * readOnly 打开报 SQLITE_CANTOPEN，copyFileSync 报 EBUSY（实测 2026-11-18），
+ * 只有 VSS 快照能绕过 —— 快照读的是块层，跟进程锁无关。
+ * 快照用完必须删，否则每扫一次就留一个 100MB 级的影子卷。
+ */
+function vssCopy(dbPath, dir) {
+  const m = /^([A-Za-z]:)\\(.*)$/.exec(dbPath)
+  if (!m) throw new Error('不支持的路径: ' + dbPath)
+  const drive = m[1]
+  const rel = m[2]
+  const dst = join(dir, 'Cookies')
+  const ps = [
+    "$ErrorActionPreference='Stop'",
+    `$cls = [wmiclass]'Win32_ShadowCopy'`,
+    `$r = $cls.Create('${drive}\\','ClientAccessible')`,
+    `if ($r.ReturnValue -ne 0) { throw "shadow create rc=$($r.ReturnValue)" }`,
+    `$id = $r.ShadowID`,
+    'try {',
+    `  $sc = Get-CimInstance Win32_ShadowCopy | Where-Object { $_.ID -eq $id }`,
+    `  $src = $sc.DeviceObject + '\\${rel}'`,
+    `  Copy-Item -LiteralPath $src -Destination '${dst}' -Force`,
+    `  Write-Output ('copied=' + (Get-Item -LiteralPath '${dst}').Length)`,
+    '} finally {',
+    // 只能删自己这一个（实测 2026-11-18：不带引号插值时 /shadow=$id 会退化，
+    // 变成"删掉全部影子卷"，把系统还原点一起干掉）。三条护栏：格式校验 + 引号 + 只删本 id。
+    "  if ($id -match '^\\{[0-9A-Fa-f-]{36}\\}$') { $null = & vssadmin delete shadows /shadow=\"$id\" /quiet 2>&1 }",
+    '}',
+  ].join('\n')
+  const out = execFileSync('pwsh', ['-NoProfile', '-NonInteractive', '-Command', ps], { encoding: 'utf8', timeout: 90000, windowsHide: true })
+  const text = String(out).trim()
+  if (!/copied=\d+/.test(text)) throw new Error('卷影复制没有产出副本: ' + text.slice(0, 120))
+  return { dst, out: text }
+}
+
+// 正在运行的浏览器会独占锁 DB；三级回落：只读打开 → 直接复制 → 卷影快照。
+// 每级用完都要清临时目录 —— 那是一份完整的加密 cookie 库，别留在 %TEMP%。
 function openCookies(dbPath) {
   try {
     return { db: new DatabaseSync(dbPath, { readOnly: true }), mode: 'readonly', cleanup: () => {} }
   } catch (e1) {
     let dir = null
+    const mkCleanup = (db) => () => { try { db.close() } catch {}; try { if (dir) rmSync(dir, { recursive: true, force: true }) } catch {} }
+    const openCopy = (dst, mode, extra = '') => {
+      const db = new DatabaseSync(dst, { readOnly: true })
+      return { db, mode, cleanup: mkCleanup(db) }
+    }
     try {
       dir = mkdtempSync(join(tmpdir(), 'sa-cookie-'))
-      const dst = join(dir, 'Cookies')
-      copyFileSync(dbPath, dst)
-      const db = new DatabaseSync(dst, { readOnly: true })
-      return {
-        db, mode: 'copy',
-        cleanup: () => { try { db.close() } catch {}; try { rmSync(dir, { recursive: true, force: true }) } catch {} },
+      try {
+        const dst = join(dir, 'Cookies')
+        copyFileSync(dbPath, dst)
+        return openCopy(dst, 'copy')
+      } catch (e2) {
+        // EBUSY / 共享冲突 → 只能靠卷影快照
+        const v = vssCopy(dbPath, dir)
+        return openCopy(v.dst, 'vss')
       }
-    } catch (e2) {
-      if (dir) { try { rmSync(dir, { recursive: true, force: true }) } catch {} }
-      return { error: '打不开 cookie 库: ' + (e1.message || e1) + ' / ' + (e2.message || e2) }
+    } catch (e3) {
+      try { if (dir) rmSync(dir, { recursive: true, force: true }) } catch {}
+      return {
+        error: '打不开 cookie 库（浏览器在跑且卷影复制也失败）: ' + (e1.message || e1) + ' / ' + (e3.message || e3),
+        hint: '关掉该浏览器再 scan，或以管理员身份运行 dsh',
+      }
     }
   }
 }
@@ -78,7 +124,7 @@ function rowVersion(encBuf) {
 /** 只读统计：行数 / 加密版本分布 / 主要域（不解密、不外泄值） */
 export function scanProfile(profile) {
   const o = openCookies(profile.dbPath)
-  if (o.error) return { ...profile, error: o.error }
+  if (o.error) return { browser: profile.browser, profile: profile.profile, dbPath: profile.dbPath, bytes: profile.size, error: o.error, hint: o.hint }
   try {
     const rows = o.db.prepare('SELECT host_key, encrypted_value FROM cookies').all()
     const versions = { v10: 0, v20: 0, raw: 0, empty: 0 }
@@ -89,12 +135,12 @@ export function scanProfile(profile) {
     }
     return {
       browser: profile.browser, profile: profile.profile, dbPath: profile.dbPath,
-      bytes: profile.size, rows: rows.length, versions,
+      bytes: profile.size, rows: rows.length, versions, readMode: o.mode,
       topHosts: [...hosts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 10).map(([h, n]) => ({ host: h, n })),
       readable: versions.v10 + versions.raw > 0, blocked: versions.v20,
     }
   } catch (e) {
-    return { browser: profile.browser, profile: profile.profile, dbPath: profile.dbPath, error: e.message || String(e) }
+    return { browser: profile.browser, profile: profile.profile, dbPath: profile.dbPath, bytes: profile.size, error: e.message || String(e) }
   } finally { try { o.cleanup() } catch {} }
 }
 

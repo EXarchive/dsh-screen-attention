@@ -3,6 +3,10 @@
 //       第二次调用 reused=true 且 wall < 1.5s、文本非空、截图字节 > 5KB。
 import { openPage, browserStatus, setCookies, listCookies, clearCookies, closeBrowser } from '../permission-plugin/lib/browser.mjs'
 
+// 测试必须用自己的隔离 profile：活着的 DSH 常驻实例占着 out/web-iso，
+// 同 profile 起第二个实例会被 SingletonLock 挡回（表现为"启动后立刻退出"）。
+process.env.SA_WEB_ISO = (process.env.TEMP || '.') + '\\sa-web-iso-test'
+
 let pass = 0, fail = 0
 const ok = (name, cond, extra = '') => {
   if (cond) { pass++; console.log('  ✓', name, extra) } else { fail++; console.log('  ✗', name, extra) }

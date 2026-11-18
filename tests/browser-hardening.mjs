@@ -1,5 +1,7 @@
 // 交付后检查：并发 / 泄漏 / 失败路径 / 超时，全部针对 v1.23.0 新实现
 const REPO = 'file:///C:/Users/Administrator/PycharmProjects/dsh-screen-attention/permission-plugin/lib/'
+// 独立隔离 profile：活着的 DSH 常驻实例占着 out/web-iso
+process.env.SA_WEB_ISO = (process.env.TEMP || '.') + '\\sa-web-iso-test'
 const { openPage, browserStatus, closeBrowser, ensureBrowser } = await import(REPO + 'browser.mjs')
 
 const results = []
