@@ -565,3 +565,58 @@ export async function closeTab(tabKey) {
   S.tabs.delete(tabKey)
   return { ok: true, closed: tabKey, remain: S.tabs.size }
 }
+
+/**
+ * 在保持的标签页里"真敲字"：先 focus，再用 CDP Input.insertText。
+ * 为什么不用 DOM setter：微软登录页这类 React/Polymer 页面会忽略合成 value 赋值（实测填了不生效）。
+ */
+export async function tabType(tabKey, selector, text) {
+  const t = S.tabs && S.tabs.get(tabKey)
+  if (!t) return { ok: false, error: '没有这个标签页: ' + tabKey }
+  const sel = JSON.stringify(String(selector))
+  const f = await evalJs(t.ss, `(() => {
+    const el = document.querySelector(${sel});
+    if (!el) return 'no-el';
+    el.focus();
+    if (el.select) { try { el.select() } catch {} }
+    return 'focused';
+  })()`)
+  if (f.error) return { ok: false, error: f.error }
+  if (f.value === 'no-el') return { ok: false, error: '找不到输入框: ' + selector }
+  await send('Input.insertText', { text: String(text) }, t.ss, 10000)
+  const v = await evalJs(t.ss, `(() => { const a = document.activeElement; return { len: a && typeof a.value === 'string' ? a.value.length : -1, tag: a ? a.tagName : '' } })()`)
+  return { ok: true, valueLen: (v.value && v.value.len) ?? -1, activeTag: (v.value && v.value.tag) }
+}
+
+/** 点一个元素：先试 JS click（多数表单可用），点不到再报错。 */
+export async function tabClick(tabKey, selector) {
+  const t = S.tabs && S.tabs.get(tabKey)
+  if (!t) return { ok: false, error: '没有这个标签页: ' + tabKey }
+  const sel = JSON.stringify(String(selector))
+  const r = await evalJs(t.ss, `(() => {
+    const el = document.querySelector(${sel});
+    if (!el) return 'no-el';
+    el.click();
+    return 'clicked';
+  })()`)
+  if (r.error) return { ok: false, error: r.error }
+  if (r.value === 'no-el') return { ok: false, error: '找不到元素: ' + selector }
+  return { ok: true }
+}
+
+/** 页面里有哪些可填/可点的东西（诊断用，避免又拿老选择器猜） */
+export async function tabFormInfo(tabKey) {
+  const t = S.tabs && S.tabs.get(tabKey)
+  if (!t) return { ok: false, error: '没有这个标签页: ' + tabKey }
+  const r = await evalJs(t.ss, `(() => {
+    const inputs = [...document.querySelectorAll('input')].map((e, i) => ({
+      i, type: e.type, name: e.name || '', id: e.id || '', placeholder: e.placeholder || '', autocomplete: e.autocomplete || '', visible: !!(e.offsetWidth || e.offsetHeight),
+    }));
+    const buttons = [...document.querySelectorAll('button, input[type=submit]')].map((e) => ({
+      text: (e.innerText || e.value || '').trim().slice(0, 20), id: e.id || '', type: e.type || '', visible: !!(e.offsetWidth || e.offsetHeight),
+    }));
+    return JSON.stringify({ url: location.href, title: document.title, inputs, buttons, text: (document.body.innerText || '').replace(/\\s+/g, ' ').slice(0, 240) });
+  })()`)
+  if (r.error) return { ok: false, error: r.error }
+  try { return { ok: true, ...JSON.parse(r.value || '{}') } } catch { return { ok: false, error: '解析失败' } }
+}

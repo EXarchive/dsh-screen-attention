@@ -35,3 +35,5 @@ vendor/*
 # embedded VLM runtime (ollama.exe + models, ~3GB) - rebuild via vendor/setup-runtime.ps1
 # 实验备份（cookie 重定向探针用，含 profile 状态）
 out/backup-before-redirect/
+# DSH 侧 cookie jar（DPAPI 加密的登录态，绝不入库）
+out/cookie-jars/
