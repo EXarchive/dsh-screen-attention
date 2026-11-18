@@ -405,6 +405,26 @@ export async function listCookies(filterHost) {
   }
 }
 
+/** 取后台浏览器里 cookie 的**完整值**（保存 jar 用；listCookies 只给长度，避免误把值打进对话） */
+export async function getCookiesFull(filterHost) {
+  const boot = await ensureBrowser({})
+  if (!boot.ok) return { ok: false, error: boot.error }
+  const g = await send('Storage.getCookies', {}, undefined, 15000)
+  if (g.error) return { ok: false, error: '读取 cookie 失败: ' + g.error.message }
+  let list = (g.result && g.result.cookies) || []
+  if (filterHost) list = list.filter((c) => String(c.domain || '').includes(filterHost))
+  const cookies = list.map((c) => {
+    const o = {
+      name: c.name, value: c.value, domain: c.domain, path: c.path || '/',
+      secure: !!c.secure, httpOnly: !!c.httpOnly, sameSite: c.sameSite || undefined,
+    }
+    if (c.expires && c.expires > 0) o.expires = Math.floor(c.expires)
+    if (c.partitionKey && c.partitionKey.topLevelSite) o.partitionKey = c.partitionKey
+    return o
+  })
+  return { ok: true, count: cookies.length, cookies }
+}
+
 export async function clearCookies() {
   const boot = await ensureBrowser({})
   if (!boot.ok) return { ok: false, error: boot.error }

@@ -17,6 +17,7 @@ const SUITE = [
   ['browser-hardening', '并发冷启 / 在飞关停 / 失败路径 / 标签页泄漏 / 隔离目录护栏'],
   ['cookies-readonly', '本地 cookie 只读：v10 解密注入 / v20 标记受阻'],
   ['tab-keep', '跨调用保持标签页（扫码登录类流程的地基）'],
+  ['cookie-jar', '为 DSH 保存 cookie：DPAPI 加密 jar / 盘上无明文 / clear→restore 往返'],
   ['web-tools', '工具级 saperm_web + saperm_cookies'],
 ]
 if (process.argv.includes('--list')) {

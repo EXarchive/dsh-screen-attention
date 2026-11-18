@@ -8,7 +8,7 @@
 //
 // 因此：v10 走"只读解密 + 注入后台浏览器"；v20 只能在该隔离 profile 里由用户登录一次。
 import { DatabaseSync } from 'node:sqlite'
-import { existsSync, readFileSync, readdirSync, copyFileSync, mkdtempSync, statSync, rmSync } from 'node:fs'
+import { existsSync, readFileSync, readdirSync, copyFileSync, mkdtempSync, statSync, rmSync, mkdirSync, writeFileSync, unlinkSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { createDecipheriv, createHash } from 'node:crypto'
@@ -207,7 +207,8 @@ export async function readCookies(profile, { dpapi, hostFilter = null, limit = 0
   if (o.error) return { ok: false, error: o.error }
   try {
     const rows = o.db.prepare(`SELECT host_key, name, value, encrypted_value, path,
-      CAST(expires_utc AS TEXT) AS exp, is_secure, is_httponly, samesite, has_expires
+      CAST(expires_utc AS TEXT) AS exp, is_secure, is_httponly, samesite, has_expires,
+      top_frame_site_key, has_cross_site_ancestor
       FROM cookies`).all()
     const cookies = []
     const stats = { total: rows.length, decrypted: 0, blockedV20: 0, failed: 0, plain: 0, filtered: 0, expired: 0 }
@@ -246,6 +247,12 @@ export async function readCookies(profile, { dpapi, hostFilter = null, limit = 0
         secure: Number(r.is_secure) === 1, httpOnly: Number(r.is_httponly) === 1,
         sameSite: SAMESITE[Number(r.samesite)] || undefined,
       }
+      // CHIPS：top_frame_site_key 非空 = 分区 cookie，丢了这层域语义就不对
+      const tfsk = r.top_frame_site_key ? String(r.top_frame_site_key) : ''
+      if (tfsk) {
+        cookie.partitionKey = { topLevelSite: tfsk, hasCrossSiteAncestor: Number(r.has_cross_site_ancestor) === 1 }
+        stats.partitioned = (stats.partitioned || 0) + 1
+      }
       if (expires) cookie.expires = expires
       cookies.push(cookie)
       if (limit && cookies.length >= limit) break
@@ -262,6 +269,79 @@ export function toCdpCookies(cookies) {
     const o = { name: c.name, value: c.value, domain: c.domain, path: c.path || '/', secure: !!c.secure, httpOnly: !!c.httpOnly }
     if (c.expires) o.expires = c.expires
     if (c.sameSite) o.sameSite = c.sameSite
+    // CHIPS 分区 cookie：丢了 partitionKey 会变成普通 cookie（Chrome 自 124 起按分区隔离）
+    if (c.partitionKey && c.partitionKey.topLevelSite) o.partitionKey = c.partitionKey
     return o
   })
+}
+
+// ============ 为 DSH 保存 cookie jar ============
+// 为什么要单独存：登录态只活在隔离 profile 的 SQLite（Chromium 自己用 DPAPI 加密），
+// profile 一清、换机器、重建就全丢。这里把后台浏览器里的 cookie 导出成一枚
+// **DPAPI 加密** 的 jar 放在插件目录，随时可 restore 回浏览器。
+// 不存明文：jar 里是活会话凭证，明文落盘等于给同机任何进程开后门。
+
+const JAR_MAGIC = 'sa-cookie-jar/1'
+
+export function jarDir(packageRoot) {
+  return join(packageRoot, '..', 'out', 'cookie-jars')
+}
+
+function jarPath(dir, name) {
+  const safe = String(name || 'default').replace(/[^A-Za-z0-9_.-]/g, '_').slice(0, 60)
+  return join(dir, safe + '.jar')
+}
+
+/** 保存：cookies 来自后台浏览器（listCookies 的完整值），dpapi 为加密函数 */
+export async function saveJar({ dir, name, cookies, dpapi, meta = {} }) {
+  if (typeof dpapi !== 'function') return { ok: false, error: '缺少 dpapi(加密) 注入' }
+  const payload = {
+    magic: JAR_MAGIC,
+    savedAt: new Date().toISOString(),
+    name: String(name || 'default'),
+    meta,
+    count: cookies.length,
+    cookies,
+  }
+  const b64 = await dpapi(Buffer.from(JSON.stringify(payload), 'utf8').toString('base64'))
+  if (!b64) return { ok: false, error: 'DPAPI 加密失败' }
+  try { mkdirSync(dir, { recursive: true }) } catch {}
+  const p = jarPath(dir, name)
+  try { writeFileSync(p, b64, 'utf8') } catch (e) { return { ok: false, error: '写 jar 失败: ' + (e.message || e) } }
+  return { ok: true, path: p, count: cookies.length, bytes: b64.length, savedAt: payload.savedAt }
+}
+
+/** 读取：dpapi 为解密函数（返回 base64 明文或 null） */
+export async function loadJar({ dir, name, dpapi }) {
+  const p = jarPath(dir, name)
+  if (!existsSync(p)) return { ok: false, error: '没有这个 jar: ' + p }
+  let b64
+  try { b64 = readFileSync(p, 'utf8').trim() } catch (e) { return { ok: false, error: '读 jar 失败: ' + (e.message || e) } }
+  const plain = await dpapi(b64)
+  if (!plain) return { ok: false, error: 'DPAPI 解密失败（jar 可能由别的用户/机器创建）' }
+  let payload
+  try { payload = JSON.parse(Buffer.from(plain, 'base64').toString('utf8')) } catch (e) { return { ok: false, error: 'jar 内容损坏: ' + (e.message || e) } }
+  if (payload.magic !== JAR_MAGIC) return { ok: false, error: 'jar 版本不认: ' + payload.magic }
+  return { ok: true, path: p, name: payload.name, savedAt: payload.savedAt, meta: payload.meta, cookies: payload.cookies || [], count: payload.count || 0 }
+}
+
+/** 列表：只看摘要（名字/时间/大小/条数），不解密、不外泄值 */
+export function listJars(dir) {
+  if (!existsSync(dir)) return { ok: true, count: 0, jars: [] }
+  const jars = []
+  for (const f of readdirSync(dir)) {
+    if (!f.endsWith('.jar')) continue
+    const full = join(dir, f)
+    let st
+    try { st = statSync(full) } catch { continue }
+    jars.push({ name: f.slice(0, -4), path: full, bytes: st.size, mtime: st.mtime.toISOString() })
+  }
+  jars.sort((a, b) => (a.mtime < b.mtime ? 1 : -1))
+  return { ok: true, count: jars.length, jars }
+}
+
+export function removeJar({ dir, name }) {
+  const p = jarPath(dir, name)
+  if (!existsSync(p)) return { ok: false, error: '没有这个 jar: ' + p }
+  try { unlinkSync(p); return { ok: true, removed: p } } catch (e) { return { ok: false, error: String(e.message || e) } }
 }

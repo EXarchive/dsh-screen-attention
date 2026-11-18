@@ -18,8 +18,40 @@ static class Dpapi
         ref DATA_BLOB pDataIn, IntPtr ppszDataDescr, IntPtr pOptionalEntropy,
         IntPtr pvReserved, IntPtr pPromptStruct, int dwFlags, ref DATA_BLOB pDataOut);
 
+    [DllImport("crypt32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern bool CryptProtectData(
+        ref DATA_BLOB pDataIn, string szDataDescr, IntPtr pOptionalEntropy,
+        IntPtr pvReserved, IntPtr pPromptStruct, int dwFlags, ref DATA_BLOB pDataOut);
+
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern IntPtr LocalFree(IntPtr hMem);
+
+    /// <summary>当前用户上下文加密（给 DSH 侧保存 cookie jar 用，避免落明文）。</summary>
+    public static byte[] Protect(byte[] data, out int lastError)
+    {
+        lastError = 0;
+        if (data == null || data.Length == 0) { lastError = -1; return null; }
+        IntPtr inPtr = Marshal.AllocHGlobal(data.Length);
+        try
+        {
+            Marshal.Copy(data, 0, inPtr, data.Length);
+            var inBlob = new DATA_BLOB { cbData = data.Length, pbData = inPtr };
+            var outBlob = new DATA_BLOB();
+            if (!CryptProtectData(ref inBlob, "dsh-screen-attention cookie jar", IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, 0x1, ref outBlob))
+            {
+                lastError = Marshal.GetLastWin32Error();
+                return null;
+            }
+            try
+            {
+                var outp = new byte[outBlob.cbData];
+                Marshal.Copy(outBlob.pbData, outp, 0, outBlob.cbData);
+                return outp;
+            }
+            finally { LocalFree(outBlob.pbData); }
+        }
+        finally { Marshal.FreeHGlobal(inPtr); }
+    }
 
     /// <summary>当前用户上下文解封一条 DPAPI blob；失败返回 null，lastError 带 Win32 码。</summary>
     public static byte[] Unprotect(byte[] blob, out int lastError)

@@ -2949,6 +2949,28 @@ class Program
                     }
                     return new { results = blobs };
                 }
+            case "crypto_protect":
+                {
+                    // 保存 cookie jar 用：当前用户 DPAPI 加密，落盘也不怕被别的进程直接读走
+                    var outs = new List<object>();
+                    if (req.TryGetProperty("blobs", out var pb2) && pb2.ValueKind == JsonValueKind.Array)
+                    {
+                        foreach (var it in pb2.EnumerateArray())
+                        {
+                            string b64 = it.ValueKind == JsonValueKind.String ? it.GetString() : null;
+                            if (string.IsNullOrEmpty(b64)) { outs.Add(new { ok = false, error = "empty" }); continue; }
+                            try
+                            {
+                                byte[] raw = Convert.FromBase64String(b64);
+                                byte[] enc = Dpapi.Protect(raw, out int werr);
+                                if (enc == null) outs.Add(new { ok = false, error = "CryptProtectData failed", win32 = werr });
+                                else outs.Add(new { ok = true, b64 = Convert.ToBase64String(enc) });
+                            }
+                            catch (Exception ex) { outs.Add(new { ok = false, error = ex.Message }); }
+                        }
+                    }
+                    return new { results = outs };
+                }
             case "screen_bounds": return new { x = 0, y = 0, w = Gdi.ScreenW(), h = Gdi.ScreenH() };
             case "windows": return new { windows = Win.ListWindows() };
             case "window_capture":

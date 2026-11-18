@@ -7,8 +7,8 @@ import { spawn, execFile, execFileSync } from 'node:child_process'
 import { existsSync, writeFileSync, mkdirSync, readdirSync, readFileSync, unlinkSync, appendFileSync, statSync } from 'node:fs'
 import { join, dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { openPage, openTab, readTab, closeTab, browserStatus, closeBrowser, ensureBrowser, setCookies, listCookies, clearCookies } from './browser.mjs'
-import { chromiumProfiles, scanProfile, readCookies, toCdpCookies } from './cookies.mjs'
+import { openPage, openTab, readTab, closeTab, browserStatus, closeBrowser, ensureBrowser, setCookies, listCookies, getCookiesFull, clearCookies } from './browser.mjs'
+import { chromiumProfiles, scanProfile, readCookies, toCdpCookies, jarDir, saveJar, loadJar, listJars, removeJar } from './cookies.mjs'
 
 export const name = 'dsh-screen-attention-perm'
 export const inject = ['tools', 'agents']
@@ -1416,15 +1416,16 @@ export function apply(ctx) {
   //   这类只能在该隔离 profile 里由用户登录一次。
   register({
     name: 'saperm_cookies',
-    description: '本地 cookie 只读复用：扫描本机 Chromium 系（Edge/Chrome/Brave）各 profile 的 cookie 库并统计加密版本；把可解（v10）的 cookie 注入后台浏览器，让 saperm_web 能看到登录态。**只读，不改动真实浏览器与它的库**。action: scan（默认，只统计）/ import（解密并注入）/ list（看后台浏览器里已有 cookie）/ clear（清空后台浏览器 cookie）/ close（关掉后台浏览器）。L0 观察，无需审批',
+    description: '本地 cookie 只读复用 + 为 DSH 存登录态：scan 统计本机 Chromium 各 profile 的 cookie 库（加密版本/条数）；import 把可解（v10）的 cookie 注入后台浏览器；save 把后台浏览器里的 cookie 存成 **DPAPI 加密** 的 jar（profile 被清/换机器后能 restore）；restore 把 jar 灌回后台浏览器；jars 列已存 jar；forget 删 jar；list 看后台浏览器现有 cookie；clear 清空；close 关浏览器。**扫描只读、不改动真实浏览器与它的库**。L0 观察，无需审批',
     parameters: {
       type: 'object',
       properties: {
-        action: { type: 'string', description: 'scan（默认）/ import / list / clear / close' },
+        action: { type: 'string', description: 'scan（默认）/ import / save / restore / jars / forget / list / clear / close' },
         browser: { type: 'string', description: 'import 用：只导某个浏览器（edge / chrome / brave / chrome-beta）' },
         profile: { type: 'string', description: 'import 用：只导某个 profile（如 Default / Profile 1）' },
-        host: { type: 'string', description: 'import/list 用：只处理域名含该子串的 cookie（如 bilibili）' },
+        host: { type: 'string', description: 'import/list/save/restore 用：只处理域名含该子串的 cookie（如 bilibili）' },
         limit: { type: 'integer', description: 'import 用：最多解码多少条（默认全部）' },
+        name: { type: 'string', description: 'save/restore/forget 用：jar 名字（默认取 host，如 bilibili）' },
       },
     },
     execute: async (args) => {
@@ -1464,14 +1465,49 @@ export function apply(ctx) {
         return { ok: r.ok, error: r.error }
       }
 
-      if (action !== 'import') return { ok: false, error: '未知 action: ' + action }
-
       // dpapi：批一次交给 helper（node 没有 FFI，逐条走 pwsh 太慢）
       const dpapi = async (b64) => {
         const d = await helperCall('crypto_dpapi', { blobs: [b64] }, 15000)
         const first = ((d && d.results) || [])[0]
         return first && first.ok ? first.b64 : null
       }
+      const dpapiProtect = async (b64) => {
+        const d = await helperCall('crypto_protect', { blobs: [b64] }, 15000)
+        const first = ((d && d.results) || [])[0]
+        return first && first.ok ? first.b64 : null
+      }
+      const dir = jarDir(PACKAGE_ROOT)
+      const jarName = args.name ? String(args.name) : (host || 'default')
+
+      // 把后台浏览器里的 cookie 存成 DSH 侧 jar（DPAPI 加密，不落明文）
+      if (action === 'save') {
+        const full = await getCookiesFull(host)
+        if (!full.ok) return { ok: false, error: full.error || '读不到后台浏览器的 cookie' }
+        if (!full.cookies.length) return { ok: false, error: '后台浏览器里没有可保存的 cookie', hint: '先 import 或在该隔离 profile 里登录一次' }
+        const saved = await saveJar({ dir, name: jarName, cookies: full.cookies, dpapi: dpapiProtect, meta: { host: host || null, source: 'web-iso', browser: browserStatus().product } })
+        if (!saved.ok) return saved
+        return { ...saved, hint: '已加密保存；恢复用 saperm_cookies {action:"restore", name:"' + jarName + '"}' }
+      }
+
+      if (action === 'restore') {
+        const jar = await loadJar({ dir, name: jarName, dpapi })
+        if (!jar.ok) return { ok: false, ...jar, available: listJars(dir).jars.map((j) => j.name) }
+        let list = jar.cookies
+        if (host) list = list.filter((c) => String(c.domain || '').includes(host))
+        if (!list.length) return { ok: false, error: 'jar 里没有匹配 host 的 cookie', name: jar.name, count: jar.count }
+        const s = await setCookies(toCdpCookies(list))
+        return {
+          ok: s.ok, name: jar.name, savedAt: jar.savedAt, fromJar: list.length,
+          injected: s.set, rejected: s.rejectedCount, rejectedSample: s.rejected,
+          hint: '已恢复到后台浏览器；接着 saperm_web 打开站点即可',
+        }
+      }
+
+      if (action === 'jars') return { ...listJars(dir), dir }
+
+      if (action === 'forget') return removeJar({ dir, name: jarName })
+
+      if (action !== 'import') return { ok: false, error: '未知 action: ' + action }
 
       const all = chromiumProfiles()
       const picked = all.filter((p) =>
