@@ -7,7 +7,7 @@ import { spawn, execFile, execFileSync } from 'node:child_process'
 import { existsSync, writeFileSync, mkdirSync, readdirSync, readFileSync, unlinkSync, appendFileSync, statSync } from 'node:fs'
 import { join, dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { openPage, browserStatus, closeBrowser, ensureBrowser, setCookies, listCookies, clearCookies } from './browser.mjs'
+import { openPage, openTab, readTab, closeTab, browserStatus, closeBrowser, ensureBrowser, setCookies, listCookies, clearCookies } from './browser.mjs'
 import { chromiumProfiles, scanProfile, readCookies, toCdpCookies } from './cookies.mjs'
 
 export const name = 'dsh-screen-attention-perm'
@@ -1346,15 +1346,47 @@ export function apply(ctx) {
         screenshot: { type: 'boolean', description: '是否截图（默认 true）' },
         maxText: { type: 'integer', description: '文本最多返回多少字符（默认 4000）' },
         js: { type: 'string', description: '可选：页面加载后在这页里执行的 JS 表达式（同源内，返回值一并返回）' },
+        keep: { type: 'boolean', description: 'true = 标签页不关闭，返回 tabKey，之后用 tab=tabKey 继续看同一页（扫码登录这类跨调用流程必需）' },
+        tab: { type: 'string', description: '读之前 keep 下来的标签页（tabKey）；配合 waitFor 可等页面状态变化' },
+        waitFor: { type: 'string', description: 'waitFor 表达式：轮询到它返回真值就返回（如登录完成后 document.cookie.includes("SESSDATA")）' },
+        waitForMs: { type: 'integer', description: 'waitFor 最长等待毫秒（默认 60000）' },
+        close: { type: 'boolean', description: '配合 tab：关掉这个标签页' },
       },
     },
     execute: async (args) => {
+      // 读/关一个已 keep 的标签页
+      if (args.tab) {
+        const key = String(args.tab)
+        if (args.close === true) return { ok: true, ...(await closeTab(key)) }
+        const r = await readTab(key, {
+          screenshot: args.screenshot !== false,
+          fullPage: args.fullPage === true,
+          text: args.text !== false,
+          maxText: clampInt(args.maxText, 4000, 200, 20000),
+          waitFor: args.waitFor ? String(args.waitFor) : null,
+          waitForMs: clampInt(args.waitForMs, 60000, 1000, 600000),
+          js: args.js ? String(args.js) : null,
+        })
+        return { ...r, hint: '同一标签页仍然开着；要关掉传 close:true' }
+      }
       const url = String(args.url || '').trim()
       if (!/^https?:\/\//i.test(url)) return { ok: false, error: '需要 http/https 地址' }
       const w = clampInt(args.w, 1400, 320, 3000)
       const h = clampInt(args.h, 900, 240, 3000)
       const wait = clampInt(args.waitMs, 2000, 0, 30000)
       try { mkdirSync(VIEW_DIR, { recursive: true }) } catch {}
+      if (args.keep === true) {
+        const t = await openTab({
+          url, w, h, waitMs: wait,
+          fullPage: args.fullPage === true,
+          text: args.text !== false,
+          screenshot: args.screenshot !== false,
+          outDir: VIEW_DIR,
+          maxText: clampInt(args.maxText, 4000, 200, 20000),
+          js: args.js ? String(args.js) : null,
+        })
+        return { ...t, hint: '标签页保持打开；用 saperm_web {tab:"' + (t.tabKey || '') + '"} 继续看，close:true 关闭' }
+      }
       const r = await openPage({
         url, w, h, waitMs: wait,
         fullPage: args.fullPage === true,

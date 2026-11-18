@@ -30,6 +30,7 @@ export function findBrowserExe() {
 const S = globalThis.__saPermBrowser || (globalThis.__saPermBrowser = {
   child: null, toChild: null, fromChild: null, seq: 0, pending: new Map(), buf: '',
   bootMs: 0, product: '', ua: '', isoDir: '', exe: '', lastError: '', booting: null,
+  tabs: new Map(), tabSeq: 0,
 })
 
 const REAL_PROFILE_HINTS = ['\\user data', '/user data', '\\appdata\\local\\microsoft\\edge', '\\appdata\\local\\google\\chrome']
@@ -409,4 +410,132 @@ export async function clearCookies() {
   if (!boot.ok) return { ok: false, error: boot.error }
   const r = await send('Storage.clearCookies', {}, undefined, 15000)
   return { ok: !r.error, error: r.error && r.error.message }
+}
+
+// ============ 常驻标签页：跨调用保持同一个页面 ============
+// 为什么需要：扫码登录这类流程，页面一关链路就断（二维码 key 由页面持有、轮询也由页面发起）。
+// openPage 每次都会关标签页，所以另开一套「开着不放」的 API，由 tabKey 引用。
+
+async function prepareSession(ss, boot, w, h) {
+  await send('Page.enable', {}, ss)
+  await send('Runtime.enable', {}, ss)
+  try { await send('Network.enable', {}, ss) } catch {}
+  if (boot.ua) { try { await send('Emulation.setUserAgentOverride', { userAgent: boot.ua }, ss) } catch {} }
+  try { await send('Emulation.setDeviceMetricsOverride', { width: w, height: h, deviceScaleFactor: 1, mobile: false }, ss) } catch {}
+}
+
+async function waitReady(ss, waitMs) {
+  const deadline = Date.now() + Math.max(600, waitMs)
+  let ready = false
+  while (Date.now() < deadline) {
+    const r = await evalJs(ss, 'document.readyState', 5000)
+    if (r.value === 'complete') { ready = true; break }
+    await new Promise((res) => setTimeout(res, 120))
+  }
+  return ready
+}
+
+async function snapshot(ss, { text = true, maxText = 4000, screenshot = true, fullPage = false, outDir, w, h } = {}) {
+  const info = await evalJs(ss, 'JSON.stringify({url:location.href,title:document.title,ready:document.readyState})')
+  let meta = {}
+  try { meta = JSON.parse(info.value || '{}') } catch {}
+  const out = { url: meta.url || '', title: meta.title || '', readyState: meta.ready || '', viewport: { w, h } }
+  if (text) {
+    const t = await evalJs(ss, `(() => { const b = document.body; if (!b) return ''; return b.innerText.replace(/\\n{3,}/g, '\\n\\n').slice(0, ${Math.max(200, Math.min(20000, maxText))}) })()`)
+    if (t.error) { out.text = null; out.textError = t.error } else out.text = (t.value || '').toString()
+  }
+  if (screenshot) {
+    const params = { format: 'png' }
+    if (fullPage) {
+      const lm = await send('Page.getLayoutMetrics', {}, ss)
+      const cs = lm.result && (lm.result.cssContentSize || lm.result.contentSize)
+      if (cs) {
+        params.captureBeyondViewport = true
+        params.clip = { x: 0, y: 0, width: Math.ceil(cs.width), height: Math.min(Math.ceil(cs.height), 12000), scale: 1 }
+      }
+    }
+    const shot = await send('Page.captureScreenshot', params, ss, 30000)
+    if (shot.result && shot.result.data) {
+      const dir = outDir || join(process.env.TEMP || '.', 'sa-web-shot')
+      try { mkdirSync(dir, { recursive: true }) } catch {}
+      const p = join(dir, 'web-' + Date.now() + '.png')
+      writeFileSync(p, Buffer.from(shot.result.data, 'base64'))
+      out.path = p
+      out.bytes = Math.round(shot.result.data.length * 0.75)
+    } else {
+      out.screenshotError = JSON.stringify(shot.error || {})
+    }
+  }
+  return out
+}
+
+/** 开一个**不关闭**的标签页，返回 tabKey；后续用 readTab 反复看同一页 */
+export async function openTab({ url, w = 1400, h = 900, waitMs = 2000, fullPage = false, text = true, screenshot = true, outDir, maxText = 4000, js = null }) {
+  const boot = await ensureBrowser({})
+  if (!boot.ok) return { ok: false, error: boot.error }
+  let targetId = null
+  try {
+    const t = await send('Target.createTarget', { url: 'about:blank' }, undefined, 10000)
+    if (!t.result) return { ok: false, error: '建标签页失败: ' + JSON.stringify(t.error || {}) }
+    targetId = t.result.targetId
+    const at = await send('Target.attachToTarget', { targetId, flatten: true }, undefined, 10000)
+    if (!at.result) { try { await send('Target.closeTarget', { targetId }) } catch {} ; return { ok: false, error: '挂载标签页失败: ' + JSON.stringify(at.error || {}) } }
+    const ss = at.result.sessionId
+    await prepareSession(ss, boot, w, h)
+    if (url && url !== 'about:blank') {
+      const nav = await send('Page.navigate', { url }, ss, Math.max(15000, waitMs + 12000))
+      if (nav.error) { try { await send('Target.closeTarget', { targetId }) } catch {} ; return { ok: false, error: '导航失败: ' + (nav.error.message || '') } }
+      if (nav.result && nav.result.errorText) { try { await send('Target.closeTarget', { targetId }) } catch {} ; return { ok: false, error: '导航失败: ' + nav.result.errorText, navError: true } }
+    }
+    const ready = await waitReady(ss, waitMs)
+    if (ready && waitMs > 0) await new Promise((res) => setTimeout(res, Math.min(waitMs, 2500)))
+    const snap = await snapshot(ss, { text, maxText, screenshot, fullPage, outDir, w, h })
+    const key = 't' + (S.tabSeq = (S.tabSeq || 0) + 1)
+    S.tabs = S.tabs || new Map()
+    S.tabs.set(key, { targetId, ss, url: snap.url || url, w, h, outDir, openedAt: Date.now() })
+    const out = { ok: true, tabKey: key, kept: true, product: boot.product, ...snap }
+    if (js) { const j = await evalJs(ss, String(js), 20000); out.js = j.error ? { error: j.error } : j.value }
+    return out
+  } catch (e) {
+    if (targetId) { try { await send('Target.closeTarget', { targetId }) } catch {} }
+    return { ok: false, error: String(e.message || e) }
+  }
+}
+
+/** 读同一个标签页：可带 waitFor 表达式轮询（如等登录完成），超时也返回当时画面 */
+export async function readTab(tabKey, { screenshot = true, fullPage = false, text = true, maxText = 4000, waitFor = null, waitForMs = 60000, js = null } = {}) {
+  const t = S.tabs && S.tabs.get(tabKey)
+  if (!t) return { ok: false, error: '没有这个标签页（可能已关闭）: ' + tabKey, tabs: [...((S.tabs && S.tabs.keys()) || [])] }
+  if (waitFor) {
+    const deadline = Date.now() + Math.max(1000, waitForMs)
+    let hit = null
+    while (Date.now() < deadline) {
+      const r = await evalJs(t.ss, String(waitFor), 8000)
+      if (r.error) return { ok: false, error: 'waitFor 表达式出错: ' + r.error, tabKey }
+      if (r.value) { hit = r.value; break }
+      await new Promise((res) => setTimeout(res, 1200))
+    }
+    if (!hit) {
+      const snap = await snapshot(t.ss, { text, maxText, screenshot, fullPage, outDir: t.outDir, w: t.w, h: t.h })
+      return { ok: false, error: '等待超时（waitFor 一直是假）', tabKey, ...snap }
+    }
+  }
+  const snap = await snapshot(t.ss, { text, maxText, screenshot, fullPage, outDir: t.outDir, w: t.w, h: t.h })
+  const out = { ok: true, tabKey, ...snap }
+  if (js) { const j = await evalJs(t.ss, String(js), 20000); out.js = j.error ? { error: j.error } : j.value }
+  return out
+}
+
+export function listTabs() {
+  const tabs = []
+  for (const [k, v] of (S.tabs || new Map())) tabs.push({ tabKey: k, url: v.url, w: v.w, h: v.h, ageMs: Date.now() - v.openedAt })
+  return { ok: true, count: tabs.length, tabs }
+}
+
+export async function closeTab(tabKey) {
+  const t = S.tabs && S.tabs.get(tabKey)
+  if (!t) return { ok: false, error: '没有这个标签页: ' + tabKey }
+  try { await send('Target.closeTarget', { targetId: t.targetId }, undefined, 5000) } catch {}
+  S.tabs.delete(tabKey)
+  return { ok: true, closed: tabKey, remain: S.tabs.size }
 }

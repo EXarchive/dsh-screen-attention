@@ -16,6 +16,7 @@ const SUITE = [
   ['browser-bg', '后台无头浏览器（复用 / 文本 / 截图 / cookie 端到端）'],
   ['browser-hardening', '并发冷启 / 在飞关停 / 失败路径 / 标签页泄漏 / 隔离目录护栏'],
   ['cookies-readonly', '本地 cookie 只读：v10 解密注入 / v20 标记受阻'],
+  ['tab-keep', '跨调用保持标签页（扫码登录类流程的地基）'],
   ['web-tools', '工具级 saperm_web + saperm_cookies'],
 ]
 if (process.argv.includes('--list')) {
